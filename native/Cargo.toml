@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 # ⚠️ 每次改动后都要递增（与 module/src/module.prop 的 version/versionCode 同步）
 #    否则用户在 KernelSU 里看不出模块已更新。规则见 docs/08 的发布检查表。
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 # 工具链由 rust-toolchain.toml 钉在 1.99.0。
 # 此处声明 MSRV 为 1.82：这是本项目用到的最新特性的稳定版本

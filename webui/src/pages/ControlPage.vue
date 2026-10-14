@@ -65,7 +65,7 @@ import {
 
 import InfoRow from "../components/InfoRow.vue";
 import * as api from "../api";
-import { f0, thermalPairValid } from "../format";
+import { f0, f1, thermalPairValid } from "../format";
 import { perfMark } from "../perf";
 import { refresh, sysState } from "../stores/sys";
 import type { AddonStatus, ModeInfo, ThermalSection } from "../types";
@@ -134,6 +134,12 @@ const hwMax = ref(45);
 /** 本地待提交值；`null` = 与后端一致（沿用 ThermalPage 的写法） */
 const pendingTighten = ref<number | null>(null);
 const pendingRelax = ref<number | null>(null);
+/**
+ * 待提交的「过渡区间」（℃）
+ *
+ * ⚠️ 是**温度跨度**不是温度点：「37℃ 开始降速 + 过渡 1℃」= 38℃ 到达终点。
+ */
+const pendingRamp = ref<number | null>(null);
 /**
  * 待提交的「降到多少」（W）
  *
@@ -290,6 +296,7 @@ async function pickMode(m: ModeInfo): Promise<void> {
     // 本地未提交的改动作废：新模式的存档值才是"当前状态"
     pendingTighten.value = null;
     pendingRelax.value = null;
+    pendingRamp.value = null;
     pendingPower.value = null;
     await Promise.all([loadModes(), loadThermal(), refresh()]);
     void showSnackbar({ message: `已切到「${m.label}」`, duration: "short" });
@@ -336,12 +343,62 @@ function onRelaxMove(v: number): void {
 }
 
 /**
+ * 过渡区间的步进（℃）
+ *
+ * 0.5℃ 一格：范围只有 0.5~5.0，1℃ 一格太粗（用户想要"从 3℃ 缩到 1℃"
+ * 这种调整就做不到）。
+ */
+const RAMP_STEP_C = 0.5;
+
+/** 过渡区间下限（℃）—— 与后端 `thermal.ramp_span` 的 min 一致 */
+const RAMP_MIN_C = 0.5;
+
+/** 过渡区间上限（℃）—— 与后端 `thermal.ramp_span` 的 max 一致 */
+const RAMP_MAX_C = 5.0;
+
+/**
+ * 过渡区间（℃）—— 从「开始降速的温度」到「降到多少」之间走多长
+ *
+ * # 为什么要把它暴露出来（2026-10-14 用户报告后新增）
+ *
+ * 这个参数**一直都在起作用**，但界面上从来没有它 —— 于是用户设了
+ * 「37℃ 开始降速、降到 10W」，在 38℃ 看到功率还是很高，就以为失效了。
+ *
+ * 实际上那 3℃（保守模式的出厂值）的过渡区间意味着：
+ *
+ * ```text
+ * 37℃ → 开始降速
+ * 38℃ → 才走了 1/3，功率仍在半路
+ * 40℃ → 才到达用户设的 10W
+ * ```
+ *
+ * ⇒ 「到 37℃ 就该变成 10W」是用户的合理预期，但 `ramp` 律的设计是**渐变**。
+ *    看不见这个参数，用户就无法理解为什么"设了没效果"。
+ *
+ * 用户要求（2026-10-14）：「过渡区间调整为 1 度」—— 想让降速直接一点。
+ */
+const rampSpan = computed(
+  () => pendingRamp.value ?? thermal.value?.ramp_span ?? 2,
+);
+
+/**
+ * 过渡区间的终点温度（℃）= 开始降速温度 + 过渡区间
+ *
+ * ⚠️ 会被硬件保护温度夹住（与后端 `ramp_end()` 一致）—— 否则界面会显示
+ * 一个后端永远不会到达的温度。
+ */
+const rampEndTemp = computed(() =>
+  Math.min(tighten.value + rampSpan.value, hwMax.value),
+);
+
+/**
  * 降速目标功率的步进（W）
  *
  * 1 W 足够细（本机上限 100 W ⇒ 100 个档位），而且瓦数本身就是整数语义，
  * 不像旧版的电流那样需要 `0.1 A` 的步进才够用。
  */
 const POWER_STEP_W = 1;
+
 
 /** 温度超过收紧点后，把充电功率压到的值（W）；0 = 停止充电 */
 const power = computed(
@@ -401,7 +458,7 @@ const powerLabel = computed(() => {
   return `${v} W`;
 });
 
-/** 三项改动标记 */
+/** 四项改动标记 */
 const dirtyTighten = computed(
   () =>
     pendingTighten.value !== null &&
@@ -411,19 +468,28 @@ const dirtyRelax = computed(
   () =>
     pendingRelax.value !== null && pendingRelax.value !== thermal.value?.relax_temp,
 );
+const dirtyRamp = computed(
+  () =>
+    pendingRamp.value !== null && pendingRamp.value !== thermal.value?.ramp_span,
+);
 const dirtyPower = computed(
   () =>
     pendingPower.value !== null &&
     pendingPower.value !== thermal.value?.tighten_power_w,
 );
 const anyDirty = computed(
-  () => dirtyTighten.value || dirtyRelax.value || dirtyPower.value,
+  () =>
+    dirtyTighten.value ||
+    dirtyRelax.value ||
+    dirtyRamp.value ||
+    dirtyPower.value,
 );
 
 /** 取消本地改动 */
 function cancelThermal(): void {
   pendingTighten.value = null;
   pendingRelax.value = null;
+  pendingRamp.value = null;
   pendingPower.value = null;
 }
 
@@ -439,6 +505,7 @@ async function applyThermal(): Promise<void> {
   }
   const t = tighten.value;
   const r = relax.value;
+  const rs = rampSpan.value;
   const p = power.value;
 
   const check = thermalPairValid(t, r);
@@ -451,6 +518,9 @@ async function applyThermal(): Promise<void> {
   if (t !== thermal.value?.tighten_temp || r !== thermal.value?.relax_temp) {
     pairs.push(["thermal.tighten_temp", String(t)]);
     pairs.push(["thermal.relax_temp", String(r)]);
+  }
+  if (rs !== thermal.value?.ramp_span) {
+    pairs.push(["thermal.ramp_span", String(rs)]);
   }
   if (p !== thermal.value?.tighten_power_w) {
     pairs.push(["thermal.tighten_power_w", String(Math.round(p))]);
@@ -821,6 +891,72 @@ async function applySoc(): Promise<void> {
             最高 {{ f0(relaxMax) }}℃（至少比降速点低 1℃）
           </MiuixText>
         </div>
+      </div>
+
+      <!--
+        过渡区间
+
+        🔴 2026-10-14 新增（用户报告「降速好像失效了」之后）
+
+        这一段解释的是：从「开始降速的温度」到「降到多少」**不是瞬间完成**，
+        而是用一段温度区间平滑滑过去。用户看不见它，就无法理解为什么
+        "设了 37℃ 降速、38℃ 却还没降到位"。
+
+        用 0.5℃ 步进：范围只有 0.5~5.0，1℃ 一格太粗。
+      -->
+      <div class="field">
+        <div class="field__head">
+          <div class="field__text">
+            <MiuixText type="body1">过渡区间</MiuixText>
+            <MiuixText
+              type="footnote1"
+              color="var(--m-color-on-surface-secondary)"
+            >
+              从开始降速到降到目标，用多长温度走完 ——
+              设 {{ f1(RAMP_MIN_C) }}℃ 就几乎立刻降到位
+            </MiuixText>
+          </div>
+          <MiuixText type="title3" color="var(--m-color-primary)">
+            {{ f1(rampSpan) }}℃
+          </MiuixText>
+        </div>
+        <MiuixSlider
+          :model-value="rampSpan"
+          :min="RAMP_MIN_C"
+          :max="RAMP_MAX_C"
+          :step="RAMP_STEP_C"
+          :disabled="loading || busy"
+          @update:model-value="pendingRamp = $event"
+        />
+        <div class="scale">
+          <MiuixText
+            type="footnote2"
+            color="var(--m-color-on-surface-secondary)"
+          >
+            更快降到位
+          </MiuixText>
+          <MiuixText
+            type="footnote2"
+            color="var(--m-color-on-surface-secondary)"
+          >
+            更平缓
+          </MiuixText>
+        </div>
+
+        <!--
+          把"这段区间到哪个温度结束"直接算给用户看
+
+          「37℃ + 1℃ = 38℃ 到达目标」比「过渡区间 1℃」好懂得多 ——
+          用户真正想知道的是"我几度能看到降速完成"。
+        -->
+        <MiuixText
+          type="footnote2"
+          color="var(--m-color-on-surface-secondary)"
+          class="hint"
+        >
+          实际过程：{{ f0(tighten) }}℃ 开始降速 →
+          <b>{{ f1(rampEndTemp) }}℃</b> 降到 {{ powerLabel }}
+        </MiuixText>
       </div>
 
       <!--

@@ -493,11 +493,25 @@ pub fn evaluate_with(
         });
     }
 
+    // ---------- 功率上限先算 ----------
+    //
+    // ⚠️ **顺序很重要**：它在下面有两个用途 ——
+    //
+    // | 用途 | 说明 |
+    // |---|---|
+    // | 与温度诉求**取更严** | 见下方注释 |
+    // | **温度斜坡的起点** | `ramp` 律要知道"不收紧时能充多快"，那就是它 |
+    //
+    // 初版把它放在控制律**之后**，于是斜坡只能用 `b.curr_max` 当起点 ——
+    // 功率上限设得比硬件上限低时，斜坡整段被上限盖住，温度设置看起来失效。
+    // 详见 [`ramp_target`] 的文档。
+    let (pcap, power_limited) = power_cap_curr(sample, config, state, b);
+
     // ---------- 按控制律计算目标电流 ----------
     let target_curr = match config.control_law {
         ControlLaw::Curve => curve_target(sample, temp, config, b),
         ControlLaw::Switch => tighten_curr_ua(sample, config, b),
-        ControlLaw::Ramp => ramp_target(sample, temp, config, b),
+        ControlLaw::Ramp => ramp_target(sample, temp, config, b, pcap),
     };
 
     // ---------- 与功率上限取更严 ----------
@@ -510,7 +524,6 @@ pub fn evaluate_with(
     // | 温度限制更严（温度要求 ≤2.5A，功率允许 11A） | 2.5A ← 温度生效 |
     //
     // 温度优先是安全的，且"不超过 N W"这个约束**始终成立**。
-    let (pcap, power_limited) = power_cap_curr(sample, config, state, b);
     let final_curr = clamp_curr(target_curr.min(pcap), b);
 
     // ⚠️ 档位**保持放开**，温度收紧只走电流通道
@@ -648,19 +661,61 @@ fn tighten_curr_ua(sample: &Sample, config: &Config, b: Bounds) -> i32 {
 ///
 /// `sample` 是必需的：终点值要把用户的**功率**目标换算成电流
 /// （见 [`tighten_curr_ua`]）。
-fn ramp_target(sample: &Sample, temp: f32, config: &Config, b: Bounds) -> i32 {
+///
+/// `ceiling` 是**不收紧时实际能充到的电流**（= 功率上限换算值，
+/// 由 [`power_cap_curr`] 给出）。斜坡从它往下走。
+///
+/// # 🔴 斜坡起点为什么必须是 `ceiling` 而不是 `b.curr_max`
+///
+/// 初版这里写的是 `let hi = b.curr_max`，即**硬件**电流上限。真机暴露了缺陷：
+///
+/// 用户设「功率上限 30W」（≈7.3A）与「降到 10W」（≈2.4A），
+/// 而本机 `b.curr_max` 是 30A（≈123W）—— 斜坡就从 30A 起算：
+///
+/// | 温度 | 温度要求 | 功率上限 | 最终 | 用户看到 |
+/// |---|---|---|---|---|
+/// | 37.0℃ | 30.00 A | 7.32 A | 7.32 A | **30 W** |
+/// | 38.0℃ | 20.81 A | 7.32 A | 7.32 A | **30 W** ← 用户测的就是这里 |
+/// | 39.0℃ | 11.63 A | 7.32 A | 7.32 A | **30 W** |
+/// | 39.5℃ | 7.03 A | 7.32 A | 7.03 A | 28.8 W ← 才开始动 |
+/// | 40.0℃ | 2.44 A | 7.32 A | 2.44 A | 10 W |
+///
+/// ⇒ **37~39.4℃ 这段（2.4℃，占整个过渡区间的 80%）温度设置在界面上
+///    完全看不出效果** —— 因为斜坡要求的电流一直高于功率上限。
+///
+/// 用户在 38℃ 观察、发现"还是 30W"，得出的结论自然是"降速失效了"。
+/// 事件日志却显示收紧**确实触发了**（`Normal → Tightening @ 37.4℃`）——
+/// 失效的不是触发，是**幅度**：它被功率上限整段盖住了。
+///
+/// 起点改成 `min(硬件上限, 功率上限)` 后，同一配置变成：
+///
+/// | 温度 | 最终功率 |
+/// |---|---|
+/// | 37.0℃ | 30.0 W（= 用户设的上限，符合预期） |
+/// | 38.0℃ | **23.3 W**（能看到在降） |
+/// | 39.0℃ | **16.7 W** |
+/// | 40.0℃ | 10.0 W（= 用户设的终点） |
+///
+/// 语义也更对：「从你现在充的速度开始，降到我要的目标」——
+/// 而"现在充的速度"就是功率上限（或硬件上限，取更小的那个）。
+fn ramp_target(sample: &Sample, temp: f32, config: &Config, b: Bounds, ceiling: i32) -> i32 {
     let start = config.tighten_temp;
     let end = ramp_end(config, b);
-    if temp <= start {
-        return b.curr_max;
-    }
-    // 终点：用户设的「降到多少」（功率 → 电流）
+
     let lo_curr = tighten_curr_ua(sample, config, b);
+
+    // 起点 = 不收紧时实际能达到的电流；再夹到不小于终点，
+    // 否则（功率上限低于「降到多少」时）斜坡会"越降越高" —— 语义反了。
+    let hi_curr = b.curr_max.min(ceiling).max(lo_curr);
+
+    if temp <= start {
+        return clamp_curr(hi_curr, b);
+    }
     if temp >= end || (end - start).abs() < f32::EPSILON {
         return clamp_curr(lo_curr, b);
     }
     let ratio = (temp - start) / (end - start);
-    let hi = b.curr_max as f32;
+    let hi = hi_curr as f32;
     let lo = lo_curr as f32;
     let v = hi - (hi - lo) * ratio;
     clamp_curr(v as i32, b)
