@@ -1,0 +1,40 @@
+# Rust
+native/target/
+xtask/target/
+**/*.rs.bk
+
+# WebUI
+webui/node_modules/
+webui/dist/
+webui/.vite/
+# 调试用构建目录（`vite build --minify false --outDir dist-dev`）
+webui/dist-dev/
+
+# 临时文件（调试产物，别入库）
+#   ⚠️ 这次发布前就差点把 `webui/_extracted.txt` 之类的调试残留提交上去 ——
+#      它们是"按前缀找文件"时容易漏掉的（我在根目录清过，webui/ 下漏了）。
+_*
+
+# 构建产物
+dist/
+module/src/webroot/
+
+# 内部开发文档（本地保留，不随开源发布）
+#
+# 用户决定（2026-10-14）：仓库只放可构建的源码，设计文档不上传。
+#
+# ⚠️ 这些文档里含**本机特定信息**（USB 序列号、曾用的无线调试端口、
+#    个人绝对路径），发布前专门核查过 —— 用 .gitignore 排除是最可靠的
+#    防线（比"记得别 git add"可靠得多）。
+docs/
+
+# 环境脚本（本机专用，不入库）
+.setup-*.ps1
+.setup-log.txt
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

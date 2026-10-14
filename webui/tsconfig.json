@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": [],
+    "jsx": "preserve",
+    "verbatimModuleSyntax": true,
+
+    // ⚠️ miuix-vue 0.1.1 的打包 bug：package.json 里的 `types` 指向
+    //    ./dist/index.d.ts 与 ./dist/icons/extended/index.d.ts，
+    //    但实际文件都在 ./dist/src/ 下 —— 少了一层 `src/`。
+    //
+    //    `moduleResolution: "bundler"` 严格跟随 exports 字段，因此会报
+    //    TS7016（找不到声明文件）。这里用 paths 把类型入口**重定向**到
+    //    真实位置。
+    //
+    //    为什么不用 `declare module "miuix-vue"`：
+    //    那会把整个包声明成 any，**组件 props 与 v-model 全部失去类型检查** ——
+    //    等于放弃 vue-tsc 的核心价值。重定向则保留了完整类型。
+    //
+    //    升级 miuix-vue 后如果上游修好了，删掉这段即可（不影响构建）。
+    "paths": {
+      "miuix-vue": ["./node_modules/miuix-vue/dist/src/index.d.ts"],
+      "miuix-vue/icons": ["./node_modules/miuix-vue/dist/src/icons/extended/icons.d.ts"],
+      "miuix-vue/style.css": ["./node_modules/miuix-vue/dist/miuix-vue.css"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.vue"]
+}
+

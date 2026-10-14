@@ -1,0 +1,5 @@
+[toolchain]
+# 钉住精确版本 —— 本地与 CI 必须一致
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-linux-android"]

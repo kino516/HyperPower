@@ -1,0 +1,20 @@
+[package]
+name = "thermo-addons"
+description = "附加功能框架：与温控核心完全隔离的可插拔小功能"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# ⚠️ 刻意**不依赖** `thermo-core`：
+#    附加功能与温控决策内核在编译期就互不相识（见 docs/09-设计-附加功能架构.md §3）。
+#    只依赖契约层 `thermo-ipc`（协议 / 错误码），复用既有设施而不引入耦合。
+[dependencies]
+thermo-ipc = { path = "../thermo-ipc" }
+
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

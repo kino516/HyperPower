@@ -1,0 +1,24 @@
+[package]
+name = "thermo-core"
+description = "纯决策内核 —— 不依赖文件系统、进程、时钟与 sysfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+# ⚠️ 属性测试仅在非 Windows 平台启用。
+#
+# 原因：proptest 依赖 windows-sys，而在 Windows GNU 工具链下编译 windows-sys
+# 需要 dlltool 生成导入库；rustup 自带的精简版 dlltool 执行失败
+# （CreateProcess 错误）。CI 主 runner 为 ubuntu-24.04，属性测试在那里跑全量。
+#
+# 本机（Windows）仍可运行：cargo test -p thermo-core --test decision
+[target.'cfg(not(windows))'.dev-dependencies]
+proptest.workspace = true

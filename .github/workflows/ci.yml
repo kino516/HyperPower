@@ -1,0 +1,193 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------- Rust 引擎 ----------
+  native:
+    name: Native (Rust)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
+          components: rustfmt, clippy
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Format check
+        working-directory: native
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        working-directory: native
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: native
+        run: cargo test --workspace
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          add-to-path: true
+
+      - name: Cross-compile (aarch64)
+        working-directory: native
+        env:
+          # CI 上的路径与本地不同，用环境变量让 config.toml 可被覆盖
+          THERMO_NDK: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          # 在 CI 上直接指定 linker（避免本机绝对路径）
+          mkdir -p .cargo
+          cat > .cargo/config-ci.toml <<'EOF'
+          [target.aarch64-linux-android]
+          linker = "aarch64-linux-android31-clang"
+          rustflags = [
+              "-C", "link-arg=-Wl,-z,max-page-size=16384",
+              "-C", "link-arg=-Wl,-z,relro,-z,now",
+          ]
+          EOF
+          cargo build --release --target aarch64-linux-android -p thermo-cli
+
+      - name: Verify 16 KB alignment (release gate)
+        run: |
+          BIN=native/target/aarch64-linux-android/release/thermo
+          echo "=== LOAD segments ==="
+          readelf -l "$BIN" | grep LOAD
+          if readelf -l "$BIN" | grep LOAD | grep -qv '0x4000$'; then
+            echo "::error::存在未按 16 KB 对齐的 LOAD 段，禁止发布"
+            exit 1
+          fi
+          echo "✓ 全部 LOAD 段对齐 0x4000"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: thermo-aarch64
+          path: native/target/aarch64-linux-android/release/thermo
+          if-no-files-found: error
+
+  # ---------- WebUI ----------
+  webui:
+    name: WebUI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: webui
+        run: pnpm install --frozen-lockfile || pnpm install
+
+      - name: Build
+        working-directory: webui
+        run: pnpm build
+
+      - name: Upload webroot
+        uses: actions/upload-artifact@v4
+        with:
+          name: webroot
+          path: webui/dist
+          if-no-files-found: warn
+
+  # ---------- 模块组装 ----------
+  module:
+    name: Module zip
+    runs-on: ubuntu-24.04
+    needs: [native]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: thermo-aarch64
+          path: module/src/bin
+
+      - name: Download webroot
+        uses: actions/download-artifact@v4
+        with:
+          name: webroot
+          path: module/src/webroot
+        continue-on-error: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          add-to-path: true
+
+      # ⚠️ 打包（含 checksum.sha256 生成、反向断言、16 KB 检查）**只有一个实现**：
+      #    `cargo xtask pack`。CI 不再用 shell 重复一遍规则
+      #    （见 docs/08-交接摘要.md §3.2 —— 两套实现会静默分叉）。
+      #
+      #    THERMO_SKIP_BUILD=1：二进制已由 native job 构建并下载，无需重复编译。
+      - name: Pack module (single source of truth)
+        env:
+          THERMO_SKIP_BUILD: "1"
+          # CI 上的 linker 由 setup-ndk 提供，无需本机绝对路径
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android31-clang
+        run: |
+          chmod +x module/src/bin/thermo module/src/bin/ctl module/src/bin/daemon module/src/*.sh || true
+          cargo run --release --manifest-path xtask/Cargo.toml -- pack
+
+      - name: Verify zip contents
+        run: |
+          set -e
+          ZIP=dist/thermo_charge.zip
+          echo "=== zip 内容 ==="
+          unzip -l "$ZIP"
+
+          # 反向断言（双保险：xtask 已断言过一次）
+          if unzip -l "$ZIP" | grep -qi '\.apk$'; then
+            echo "::error::模块内出现 APK —— 违反模块/APP 分离约定"
+            exit 1
+          fi
+          echo "✓ 未含 APK"
+
+          # 出厂档案与默认配置必须**真的在包里**（历史上曾因目录位置错误而缺失）
+          unzip -l "$ZIP" | grep -q 'defaults/config.json' \
+            || { echo "::error::缺少 defaults/config.json"; exit 1; }
+          unzip -l "$ZIP" | grep -q 'profiles/' \
+            || { echo "::error::缺少 profiles/ 目录"; exit 1; }
+          echo "✓ defaults/ 与 profiles/ 均在包内"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: thermo-charge-module
+          path: dist/thermo_charge.zip
+          if-no-files-found: error

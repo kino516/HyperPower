@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN" class="miuix-monet">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="format-detection" content="telephone=no" />
+    <title>温控充</title>
+    <link rel="icon" href="./favicon.svg" />
+
+    <link
+      rel="stylesheet"
+      href="https://mui.kernelsu.org/internal/colors.css"
+    />
+    <link
+      rel="stylesheet"
+      href="https://mui.kernelsu.org/internal/insets.css"
+    />
+
+    <style>
+      #app > .boot {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+      }
+      .boot__ring {
+        width: 34px;
+        height: 34px;
+        border: 3px solid rgba(128, 128, 128, 0.28);
+        border-top-color: #6750a4;
+        border-radius: 50%;
+        animation: boot-spin 0.8s linear infinite;
+      }
+      @keyframes boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @media (prefers-color-scheme: dark) {
+        .boot__ring {
+          border-top-color: #d0bcff;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .boot__ring {
+          animation-duration: 2s;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div class="boot"><div class="boot__ring"></div></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

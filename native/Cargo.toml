@@ -1,0 +1,88 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/thermo-core",
+    "crates/thermo-ipc",
+    "crates/thermo-addons",
+    "crates/thermo-cli",
+]
+
+[workspace.package]
+# ⚠️ 每次改动后都要递增（与 module/src/module.prop 的 version/versionCode 同步）
+#    否则用户在 KernelSU 里看不出模块已更新。规则见 docs/08 的发布检查表。
+version = "0.3.6"
+edition = "2021"
+# 工具链由 rust-toolchain.toml 钉在 1.99.0。
+# 此处声明 MSRV 为 1.82：这是本项目用到的最新特性的稳定版本
+# （`Option::is_none_or`），低于它会让 clippy 误报。
+rust-version = "1.82"
+license = "GPL-3.0-only"
+repository = ""
+
+[workspace.dependencies]
+# 错误处理
+anyhow = "1"
+thiserror = "2"
+
+# 序列化（配置与契约）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+#
+# ⚠️ 刻意**关闭默认特性**：clap 的 `color` 特性会拉入 `anstream`/`anstyle-wincon`
+#    → `windows-sys`，而本机 GNU 工具链的 `dlltool` 无法为 `windows-sys`
+#    生成导入库（见 docs/08-交接摘要.md §6.3 坑 2）。
+#    关掉它后，`thermo-cli` 在 Windows 上也能编译与跑测试 ——
+#    代价仅是帮助信息没有彩色，对功能无影响。
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
+
+# 系统调用 / epoll / timerfd / UDS
+rustix = { version = "1", features = ["fs", "time", "event", "net", "process", "stdio"] }
+libc = "0.2"
+
+# 事件（netlink uevent）
+neli = "0.6"
+
+# 信号
+signal-hook = "0.3"
+
+# 日志
+log = "0.4"
+
+# 原子写
+tempfile = "3"
+
+# 测试
+proptest = "1"
+insta = { version = "1", features = ["json"] }
+assert_cmd = "2"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+overflow-checks = true
+incremental = false
+
+[profile.release.package."*"]
+opt-level = "z"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

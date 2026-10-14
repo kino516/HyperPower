@@ -1,0 +1,49 @@
+[package]
+name = "thermo-cli"
+description = "单二进制：supervisor / worker / ctl / watch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "thermo"
+path = "src/main.rs"
+
+[dependencies]
+thermo-core = { path = "../thermo-core" }
+thermo-ipc = { path = "../thermo-ipc" }
+# ★ 附加功能框架：与温控内核**编译期隔离**（thermo-addons 不依赖 thermo-core）
+thermo-addons = { path = "../thermo-addons" }
+
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+libc.workspace = true
+log.workspace = true
+# ⚠️ 刻意**不用 rustix**：worker 与 server 需要的那几处系统调用
+#    （timerfd / poll / flock / netlink / getsockopt）在 libc 里更直接，
+#    少一个依赖也少一层版本耦合。
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+
+# Linux / 其他类 Unix：用成熟的 env_logger
+[target.'cfg(all(not(target_os = "android"), not(windows)))'.dependencies]
+env_logger = "0.11"
+
+# ⚠️ Windows 上刻意**不引入 env_logger**：它会拉入 `anstream` → `windows-sys`，
+#    而本机 GNU 工具链的 dlltool 无法为其生成导入库（见交接摘要 §6.3 坑 2）。
+#    Windows 只用于开发与跑测试，日志走 `logging.rs` 里的内置简易实现即可。
+
+# ⚠️ 仅在非 Windows 平台启用 CLI 集成测试：
+#    · 本模块的 CLI 测试需要 Unix domain socket
+#    · `assert_cmd` 引入 windows-sys，在本机 GNU 工具链下编译失败（dlltool 缺陷）
+#    CI 主 runner 为 ubuntu-24.04，在那里跑全量测试
+[target.'cfg(not(windows))'.dev-dependencies]
+assert_cmd.workspace = true
+
+[lints]
+workspace = true

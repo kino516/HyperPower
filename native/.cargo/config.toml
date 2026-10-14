@@ -1,0 +1,23 @@
+# 交叉编译配置（本机实测可用，见 docs/02-真机实验报告.md §8）
+#
+# 目标：aarch64-linux-android
+# 说明：
+#   · 直接使用 NDK 自带的 clang，不依赖 cargo-ndk
+#   · minSdk = 31（Android 12），与安装脚本门禁、module.yaml 保持一致
+#   · 16 KB 页对齐为发布硬门槛（NDK r29 默认已满足，此处显式声明以防未来变更）
+#   · RELRO + NOW 加固
+
+[target.aarch64-linux-android]
+linker = "D:/Android/android-ndk-r29/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android31-clang.cmd"
+rustflags = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "-C", "link-arg=-Wl,-z,relro,-z,now",
+]
+
+[build]
+# 交叉编译时不落在本机 target 目录，便于产物收集
+target-dir = "target"
+
+[alias]
+# 常用别名（与 xtask 呼应）
+x = "xtask"

@@ -1,0 +1,45 @@
+# 依赖审计配置（cargo-deny）
+#
+# 目标：模块必须离线可用、可审计、无危险依赖
+
+[graph]
+targets = [
+    { triple = "aarch64-linux-android" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# 允许的许可证：须与本项目许可兼容
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # 明确不用的依赖（见 docs/01-项目方案.md §10）
+    { name = "tokio" },
+    { name = "async-std" },
+    { name = "chrono" },
+    { name = "parking_lot" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

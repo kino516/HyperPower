@@ -1,0 +1,15 @@
+[package]
+name = "thermo-ipc"
+description = "IPC 协议、错误码、DTO —— 后端与两个客户端的共同契约"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

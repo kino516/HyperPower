@@ -1,0 +1,26 @@
+[package]
+name = "xtask"
+description = "构建编排：build / check / pack / push / install"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# ⚠️ 依赖策略（本机 Windows GNU 工具链约束）
+#
+# 不使用 `clap`：它引入 windows-sys 0.61，该版本在**本机构建**时需要用
+# dlltool 生成导入库，而 rustup 自带的精简版 dlltool 在此调用方式下
+# 执行失败（CreateProcess）。参数解析改为手写，无依赖、无此问题。
+#
+# 不使用 `walkdir`：同样的 windows-sys 依赖链问题。目录遍历改用标准库。
+#
+# `zip` / `sha2` / `hex` 均为纯 Rust 实现，不受影响。
+[dependencies]
+anyhow = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

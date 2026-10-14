@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "presets": [
+    {
+      "id": "conservative",
+      "label": "保守",
+      "description": "低温慢充，最大化电池寿命",
+      "values": {
+        "mode": "conservative",
+        "thermal.tighten_temp": 40.0,
+        "thermal.relax_temp": 38.0,
+        "thermal.ramp_span": 3.0,
+        "thermal.tighten_curr": 700000,
+        "control.target_power_w": 30,
+        "control.closed_loop": true
+      }
+    },
+    {
+      "id": "official",
+      "label": "官方",
+      "description": "完全交由系统管理，模块不插手",
+      "values": {
+        "mode": "official"
+      }
+    },
+    {
+      "id": "turbo",
+      "label": "极速",
+      "description": "尽可能快，温度阈值放宽",
+      "values": {
+        "mode": "turbo",
+        "thermal.tighten_temp": 44.0,
+        "thermal.relax_temp": 43.0,
+        "thermal.ramp_span": 1.0,
+        "thermal.tighten_curr": 7000000,
+        "control.target_power_w": 60,
+        "control.closed_loop": true
+      }
+    },
+    {
+      "id": "custom",
+      "label": "自定义",
+      "description": "完全由你掌控",
+      "values": {
+        "mode": "custom"
+      }
+    }
+  ]
+}

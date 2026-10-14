@@ -1,0 +1,772 @@
+/**
+ * 主题样式
+ *
+ * # 这个文件干什么
+ *
+ * 把 miuix-vue 的配色令牌**完整**指向 KernelSU 注入的系统主题色：
+ *
+ * ```text
+ * 系统壁纸 ──► KernelSU 取色 ──► colors.css 的 --primary / --surface / …
+ *                                        │
+ *                                        ▼
+ *                              本文件的映射表（53 个令牌）
+ *                                        │
+ *                                        ▼
+ *                              所有 miuix 组件自动跟随
+ * ```
+ *
+ * ⚠️ 每个令牌都写 `var(--primary, #6750a4)` —— 第二个参数是**兜底色**：
+ * 虚拟域名不可用时退回 MD3 基线配色，界面不会掉样式。
+ *
+ * # ⚠️ 必须**完整**映射，不能只挑几个
+ *
+ * 只映射一部分会出问题：未被映射的令牌会退回 miuix 自带的基线配色
+ * （MIUIX 蓝 `#3482ff` 系），于是界面上会同时出现「系统壁纸色」和
+ * 「框架默认色」两套色，看起来像配色错乱。
+ *
+ * 真机踩过的例子：`MiuixButton` 的默认态用 `--m-color-secondary-variant`，
+ * 漏映射那一项后"取消"按钮渲染成**淡黄绿色**，与页面的蓝紫色主题格格不入。
+ *
+ * 因此下面的映射覆盖 miuix 的**整套** `--m-color-*` 令牌
+ * （对照 `node_modules/miuix-vue/dist/miuix-vue.css` 里的定义逐一核对）。
+ *
+ * # 三点说明
+ *
+ * | # | 说明 |
+ * |---|---|
+ * | 1 | `mui.kernelsu.org` 是**虚拟域名**（`WebViewAssetLoader` 本地服务），**不走网络**，也**不是 `file://`** |
+ * | 2 | 只在 `.miuix-monet` 类名下映射：没挂这个类就完全用 miuix 自带配色 |
+ * | 3 | 边到边由 `insets.css` 触发（见 `index.html`），比调 JS 的 `enableEdgeToEdge()` 可靠 —— 不依赖管理器版本，也不怕 API 改名 |
+ *
+ * # 不指定字体
+ *
+ * 刻意**不设置** `font-family` —— 让 WebView 用系统默认字体。
+ * 在 HyperOS / MIUI 上那就是 MiSans；在其它 ROM 上是各自的系统字体。
+ * 这样界面文字永远与系统一致，且无需内置字体文件。
+ *
+ * # ⚠️ 两个虚拟域名样式表**不在这里**引入
+ *
+ * `internal/colors.css` 与 `internal/insets.css` 定义在 `index.html` 里，
+ * 用 `<link>` 标签 —— 因为 **CSS 的 `@import` 是串行阻塞的**：
+ *
+ * ```text
+ * 用 @import：index.css → colors.css → insets.css → 渲染   （耗时相加）
+ * 用 <link>  ：index.css  ┐
+ *              colors.css ┼→ 渲染                          （取最慢的一个）
+ *              insets.css ┘
+ * ```
+ *
+ * 真机实测改成 `<link>` 后首屏明显变快。详见 `index.html` 的文件头说明。
+ *
+ * # 深色模式
+ *
+ * miuix-vue 的深色靠 `.m-theme-dark` **类**（不是媒体查询 ——
+ * 实测其 CSS 里 `prefers-color-scheme` 出现 0 次），由
+ * `setThemeMode("system")` 切换。本文件同时用媒体查询做兜底映射；
+ * 两者都生效时本文件的 `:root.miuix-monet` 特异性更高，以本文件为准。
+ */
+
+/* ============================================================
+ *  亮色
+ * ============================================================ */
+
+:root.miuix-monet {
+  /* ── 主色 ── */
+  --m-color-primary: var(--primary, #6750a4);
+  --m-color-on-primary: var(--onPrimary, #ffffff);
+  --m-color-primary-variant: var(--primary, #6750a4);
+  --m-color-on-primary-variant: var(--primaryContainer, #eaddff);
+  --m-color-primary-container: var(--primaryContainer, #eaddff);
+  --m-color-on-primary-container: var(--onPrimaryContainer, #4f378b);
+
+  /* ── 错误 ── */
+  --m-color-error: var(--error, #b3261e);
+  --m-color-on-error: var(--onError, #ffffff);
+  --m-color-error-container: var(--errorContainer, #f9dedc);
+  --m-color-on-error-container: var(--onErrorContainer, #8c1d18);
+
+  /* ── 禁用态（主色系）──
+     这些不映射会让禁用按钮/滑块显示出框架默认的灰蓝，与主题不符。
+
+     ⚠️ 禁用态的**主色系**要用「主色的淡色版本」，不能用中性灰
+
+     miuix 的设计意图是"**主色被冲淡**"，而不是"变成灰色"：
+
+     | 变量 | miuix 亮 | miuix 暗 |
+     |---|---|---|
+     | `--m-color-disabled-primary-button` | `#c2d9ff` 淡蓝 | `#253e64` 暗蓝 |
+     | `--m-color-disabled-primary-slider` | `#b8cff5` 淡蓝 | `#44587c` 暗蓝 |
+
+     初版一律映射成 `--outline`（中性灰），于是禁用按钮/滑块**丢掉了主色身份**，
+     在一屏紫色调的界面里出现一块突兀的灰。
+
+     `--primaryContainer` 正是"主色的淡色版本"这个语义，与 miuix 的意图一致，
+     且会跟随系统壁纸取色。 */
+  --m-color-disabled-primary: var(--outline, #79747e);
+  --m-color-disabled-on-primary: var(--surface, #fef7ff);
+  --m-color-disabled-primary-button: var(--primaryContainer, #eaddff);
+  --m-color-disabled-on-primary-button: var(--surface, #fef7ff);
+  --m-color-disabled-primary-slider: var(--primaryContainer, #eaddff);
+
+  /* ── 次要色 ──
+     ⚠️ `--m-color-secondary-variant` 是 `MiuixButton` 默认态的背景色。
+     漏掉它 → "取消"等次要按钮变成框架默认色（真机表现为淡黄绿）。 */
+  --m-color-secondary: var(--surfaceVariant, #e7e0ec);
+
+  /**
+   * 🔴 开关的**滑块**颜色 —— 必须用近白色，不能再指向正文色
+   *
+   * 这个变量在整个 miuix 里**只用在一个地方**（实测枚举过全部规则）：
+   *
+   * ```css
+   * .m-switch:not(.m-switch--checked) .m-switch__thumb { background: var(--m-color-on-secondary) }
+   * ```
+   *
+   * 即「开关处于**关闭**态时，那个小圆滑块的颜色」。
+   * miuix 自己的取值在亮色与深色下**都是 `#fff`** —— 因为它的语义是
+   * "**凸起在轨道上的旋钮**"，而不是 MD3 那个"secondary 之上的文字色"。
+   *
+   * 初版按字面把它映射到 `--onSurface`（正文色），结果：
+   *
+   * | | 轨道 | 滑块 | 观感 |
+   * |---|---|---|---|
+   * | 应该 | 浅灰 | **近白** | 立体的小旋钮 |
+   * | 实际（真机） | 浅灰 `#e7e0ec` | **近黑 `#1d1b20`** | 一团黑斑 🔴 |
+   *
+   * 这是"看起来很别扭"的一个真实来源 —— 关闭态的开关像一块黑色药丸。
+   *
+   * ⚠️ **刻意不跟随系统色**：系统没有"旋钮"这个角色，而任何"文字色"
+   * 映射过来都会是深色。miuix 自己也用常量，这里与它保持一致。
+   */
+  --m-color-on-secondary: #fff;
+
+  --m-color-secondary-variant: var(--surfaceContainerHigh, #ece6f0);
+  --m-color-on-secondary-variant: var(--onSurface, #1d1b20);
+  --m-color-disabled-secondary: var(--surfaceContainerLow, #f7f2fa);
+  --m-color-disabled-on-secondary: var(--outline, #79747e);
+  --m-color-disabled-secondary-variant: var(--surfaceContainer, #f3edf7);
+  --m-color-disabled-on-secondary-variant: var(--outline, #79747e);
+  --m-color-secondary-container: var(--secondaryContainer, #e8def8);
+  --m-color-on-secondary-container: var(--onSecondaryContainer, #1d192b);
+  --m-color-secondary-container-variant: var(--secondaryContainer, #e8def8);
+  --m-color-on-secondary-container-variant: var(
+    --onSecondaryContainer,
+    #1d192b
+  );
+
+  /* ── 第三色 ── */
+  --m-color-tertiary-container: var(--tertiaryContainer, #ffd8e4);
+  --m-color-on-tertiary-container: var(--onTertiaryContainer, #633b48);
+  --m-color-tertiary-container-variant: var(--tertiaryContainer, #ffd8e4);
+
+  /* ── 背景 ── */
+  --m-color-background: var(--background, #fef7ff);
+  --m-color-on-background: var(--onBackground, #1d1b20);
+  --m-color-on-background-variant: var(--onSurfaceVariant, #49454f);
+
+  /* ── 表面 ── */
+  --m-color-surface: var(--surface, #fef7ff);
+  --m-color-on-surface: var(--onSurface, #1d1b20);
+  --m-color-surface-variant: var(--surfaceContainer, #f3edf7);
+  --m-color-on-surface-secondary: var(--onSurfaceVariant, #49454f);
+  --m-color-on-surface-variant-summary: var(--onSurfaceVariant, #49454f);
+  --m-color-on-surface-variant-actions: var(--onSurfaceVariant, #49454f);
+  --m-color-disabled-on-surface: var(--outline, #79747e);
+
+  /* ── 表面容器（卡片层级）── */
+  --m-color-surface-container: var(--surfaceContainer, #f3edf7);
+  --m-color-on-surface-container: var(--onSurface, #1d1b20);
+  --m-color-on-surface-container-variant: var(--onSurfaceVariant, #49454f);
+  --m-color-surface-container-high: var(--surfaceContainerHigh, #ece6f0);
+  --m-color-on-surface-container-high: var(--onSurfaceVariant, #49454f);
+  --m-color-surface-container-highest: var(--surfaceContainerHighest, #e6e0e9);
+  --m-color-on-surface-container-highest: var(--onSurface, #1d1b20);
+
+  /* ── 描边与分隔 ── */
+  --m-color-outline: var(--outline, #79747e);
+  --m-color-divider-line: var(--outlineVariant, #cac4d0);
+  --m-color-window-dimming: rgba(0, 0, 0, 0.3);
+
+  /* ── 滑块刻度点 ── */
+  --m-color-slider-key-point: var(--outlineVariant, #cac4d0);
+  --m-color-slider-key-point-foreground: var(--primary, #6750a4);
+  --m-color-slider-background: var(--surfaceContainerHigh, #ece6f0);
+}
+
+/* ============================================================
+ *  深色
+ *
+ *  KernelSU 的 colors.css 会随系统深色模式切换同一组变量，
+ *  这里只需给出深色下的**兜底色**（虚拟域名不可用时用）。
+ * ============================================================ */
+
+@media (prefers-color-scheme: dark) {
+  :root.miuix-monet {
+    /* ── 主色 ── */
+    --m-color-primary: var(--primary, #d0bcff);
+    --m-color-on-primary: var(--onPrimary, #381e72);
+    --m-color-primary-variant: var(--primary, #d0bcff);
+    --m-color-on-primary-variant: var(--primaryContainer, #4f378b);
+    --m-color-primary-container: var(--primaryContainer, #4f378b);
+    --m-color-on-primary-container: var(--onPrimaryContainer, #eaddff);
+
+    /* ── 错误 ── */
+    --m-color-error: var(--error, #f2b8b5);
+    --m-color-on-error: var(--onError, #601410);
+    --m-color-error-container: var(--errorContainer, #8c1d18);
+    --m-color-on-error-container: var(--onErrorContainer, #f9dedc);
+
+    /* ── 禁用态 ──
+       ⚠️ 与亮色段同理：禁用态的主色系要用 `--primaryContainer`
+       （"主色的淡色版本"），不要用中性灰 —— 否则丢掉主色身份。
+       深色下 miuix 的取值也是暗蓝图（`#253e64` / `#44587c`）。 */
+    --m-color-disabled-primary: var(--outline, #938f99);
+    --m-color-disabled-on-primary: var(--surface, #141218);
+    --m-color-disabled-primary-button: var(--primaryContainer, #4f378b);
+    --m-color-disabled-on-primary-button: var(--surface, #141218);
+    --m-color-disabled-primary-slider: var(--primaryContainer, #4f378b);
+
+    /* ── 次要色 ── */
+    --m-color-secondary: var(--surfaceVariant, #49454f);
+
+    /* 开关滑块：miuix 在深色下同样是 `#fff`（见亮色段的说明） */
+    --m-color-on-secondary: #fff;
+
+    --m-color-secondary-variant: var(--surfaceContainerHigh, #2b2930);
+    --m-color-on-secondary-variant: var(--onSurface, #e6e0e9);
+    --m-color-disabled-secondary: var(--surfaceContainerLow, #1d1b20);
+    --m-color-disabled-on-secondary: var(--outline, #938f99);
+    --m-color-disabled-secondary-variant: var(--surfaceContainer, #211f26);
+    --m-color-disabled-on-secondary-variant: var(--outline, #938f99);
+    --m-color-secondary-container: var(--secondaryContainer, #4a4458);
+    --m-color-on-secondary-container: var(--onSecondaryContainer, #e8def8);
+    --m-color-secondary-container-variant: var(--secondaryContainer, #4a4458);
+    --m-color-on-secondary-container-variant: var(
+      --onSecondaryContainer,
+      #e8def8
+    );
+
+    /* ── 第三色 ── */
+    --m-color-tertiary-container: var(--tertiaryContainer, #633b48);
+    --m-color-on-tertiary-container: var(--onTertiaryContainer, #ffd8e4);
+    --m-color-tertiary-container-variant: var(--tertiaryContainer, #633b48);
+
+    /* ── 背景 ── */
+    --m-color-background: var(--background, #141218);
+    --m-color-on-background: var(--onBackground, #e6e0e9);
+    --m-color-on-background-variant: var(--onSurfaceVariant, #cac4d0);
+
+    /* ── 表面 ── */
+    --m-color-surface: var(--surface, #141218);
+    --m-color-on-surface: var(--onSurface, #e6e0e9);
+    --m-color-surface-variant: var(--surfaceContainer, #211f26);
+    --m-color-on-surface-secondary: var(--onSurfaceVariant, #cac4d0);
+    --m-color-on-surface-variant-summary: var(--onSurfaceVariant, #cac4d0);
+    --m-color-on-surface-variant-actions: var(--onSurfaceVariant, #cac4d0);
+    --m-color-disabled-on-surface: var(--outline, #938f99);
+
+    /* ── 表面容器 ── */
+    --m-color-surface-container: var(--surfaceContainer, #211f26);
+    --m-color-on-surface-container: var(--onSurface, #e6e0e9);
+    --m-color-on-surface-container-variant: var(--onSurfaceVariant, #cac4d0);
+    --m-color-surface-container-high: var(--surfaceContainerHigh, #2b2930);
+    --m-color-on-surface-container-high: var(--onSurfaceVariant, #cac4d0);
+    --m-color-surface-container-highest: var(
+      --surfaceContainerHighest,
+      #36343b
+    );
+    --m-color-on-surface-container-highest: var(--onSurface, #e6e0e9);
+
+    /* ── 描边与分隔 ── */
+    --m-color-outline: var(--outline, #938f99);
+    --m-color-divider-line: var(--outlineVariant, #49454f);
+    --m-color-window-dimming: rgba(0, 0, 0, 0.6);
+
+    /* ── 滑块刻度点 ── */
+    --m-color-slider-key-point: var(--outlineVariant, #49454f);
+    --m-color-slider-key-point-foreground: var(--primary, #d0bcff);
+    --m-color-slider-background: var(--surfaceContainerHigh, #2b2930);
+  }
+}
+
+/* ============================================================
+ *  全局基调
+ * ============================================================ */
+
+/**
+ * MiuixCard 的默认内边距
+ *
+ * ⚠️ **miuix-vue 0.1.1 的 `MiuixCard` 完全不带内边距** ——
+ * 编译产物里只有 `.m-card`、`.m-card-wrapper` 和两个修饰类，
+ * 没有任何间距变量。它是个**纯容器**，内边距由使用者决定。
+ * 不补的话卡片里的文字会直接贴到卡片边缘（实测正是这个问题）。
+ *
+ * 16px 是 MIUIX 卡片的标准内边距，与系统设置类界面一致。
+ *
+ * # ⚠️ 同时补 `box-sizing: border-box`
+ *
+ * miuix **没有**给 `.m-card` 设 `box-sizing`（实测计算值是 `content-box`）。
+ * 于是只要有人给卡片写 `height` / `width`，内边距就会**额外外扩**：
+ *
+ * ```text
+ * height: 100% + padding: 12px     （content-box）
+ *   ⇒ 实际占据 = 父高 + 24px  ← 溢出，压到下一个元素上
+ * ```
+ *
+ * 真机踩过：控制页的模式网格四块**互相重叠 14px**（详见
+ * `ControlPage.vue` 里 `.mode` 的说明）。
+ *
+ * `border-box` 是业界通用做法 —— 让 `height` 表示**含内边距的总高**，
+ * 与直觉一致。这里是全局兜底，防止同类问题在别处重现。
+ *
+ * （原本那一处重叠已改用 flex 撑满，不依赖 `box-sizing`；
+ *   这条是给将来写的代码兜底。）
+ */
+.m-card {
+  box-sizing: border-box;
+  padding: 16px;
+}
+
+/**
+ * 卡片内多行列表（`.rows`）的统一间距
+ *
+ * 四页里"一列 InfoRow"的卡片都标了 `class="rows"`，但**间距由各页自己
+ * 写死**（`margin-top: 12px` / `14px` 混用），容易漂移。
+ *
+ * 这里给一条全局默认值：`.rows` 内部的相邻行之间由 `InfoRow` 自己的
+ * `min-height: 56px` 撑开，**不需要额外间距**；行与行之间靠
+ * `MiuixDivider` 分隔（各页已经这么做了）。
+ *
+ * 因此 `.rows` 只负责一个职责：**首行与上一元素之间留白**。
+ */
+.rows > *:first-child {
+  margin-top: 0;
+}
+
+/* 说明文字（`.hint`）在卡片底部时，与上方内容的距离
+   —— 曾经控制页 12px、更多页 10px，切换页面时能看出差异 */
+.hint {
+  margin-top: 12px;
+}
+
+/**
+ * 卡片顶部的引导说明（`.lead`）
+ *
+ * 与 `.hint` 的区别在**位置**：
+ *
+ * | 类 | 位置 | 作用 |
+ * |---|---|---|
+ * | `.lead` | 卡片**顶部** | 这张卡是干什么的（读在操作之前） |
+ * | `.hint` | 卡片**底部** | 补充说明 / 注意事项（读在操作之后） |
+ *
+ * ⚠️ `MiuixCard` 内部**不是 flex 容器** —— 它不给子元素任何间距，
+ * 全靠元素自己的 margin。所以下面的 `margin-bottom` 是必需的，
+ * 否则说明文字会紧贴下方的滑块或开关。
+ *
+ * # `line-height: 1.6` 是必需的
+ *
+ * 这里是**唯一的**引导说明样式。曾经 `MorePage` 自己写了个 `.blurb`，
+ * 内容与 `.lead` 几乎相同，**只有行高不同**（`normal` vs `1.6`）：
+ *
+ * | 位置 | 行高 |
+ * |---|---|
+ * | 控制页 / 日志页 / 更多页的「设备检测」 | `normal`（≈15.6px） |
+ * | 更多页的「实际功率」 | `20.8px` |
+ *
+ * 两处都是 13px 的说明文字，一行紧、一行松 —— 切页时能看出差异。
+ *
+ * ⇒ 合并到这一处，取 `1.6`：说明文字常有 2~3 行，`1.6` 比 `normal`
+ *    明显更好读。**不要为某一页单独写第二个同类类名。**
+ */
+.lead {
+  display: block;
+  margin-bottom: 12px;
+  line-height: 1.6;
+}
+
+:root {
+  /* KernelSU 各版本注入的安全区变量名不同，做一条兼容链：
+     v3.3.0 用 --safe-area-inset-*，其派生变量是 --window-inset-*，
+     再退到 env() 与 0。任一层拿到值都能正确留白。 */
+  --inset-top: var(
+    --safe-area-inset-top,
+    var(--window-inset-top, env(safe-area-inset-top, 0px))
+  );
+  --inset-bottom: var(
+    --safe-area-inset-bottom,
+    var(--window-inset-bottom, env(safe-area-inset-bottom, 0px))
+  );
+
+  /* ⚠️ 刻意不设置 font-family：用系统默认字体（HyperOS 上即 MiSans） */
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* 原生 App 不整页回弹 */
+  overscroll-behavior: none;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--m-color-background);
+  color: var(--m-color-on-background);
+  /* 原生 App 不选中文本、不显示点击高亮、禁用双击缩放 */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+/* 日志等只读文本允许选中 */
+.selectable,
+.selectable * {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* 尊重系统的"减少动效"设置 —— 原生 App 必须做到 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ============================================================
+ *  排版规范（四个页面共用）
+ * ============================================================
+ *
+ * # 为什么要在这里定规矩
+ *
+ * 界面里"看起来别扭"极少是配色问题，几乎都是**对齐与节奏**问题：
+ * 同一种元素在不同页面用了不同的字号 / 缩进 / 间距，眼睛会立刻察觉
+ * 却说不清哪里不对。
+ *
+ * 因此把四条底线写在这里，四个页面统一遵守。
+ *
+ * # 唯一的左对齐基准：28px
+ *
+ * ```text
+ * 屏幕左边
+ *   │
+ *   ├─ 12px ─ 卡片左边缘（= .page 的 padding-left）
+ *   │
+ *   ├─ 28px ─ **所有文字的左边界**
+ *   │          = 12（页面） + 16（卡片内边距）
+ *   │          · 卡片内文字
+ *   │          · InfoRow 的行标题与值
+ *   │          · 分组标题（下面那一条覆写就是为它）
+ *   │
+ *   └─ 40px ─ ✗ 曾经分组标题在这里（比内容多 12px）
+ * ```
+ *
+ * 一条垂直线贯穿整页，视线才不会"跳"。
+ */
+
+/**
+ * 分组标题：把缩进拉回 28px
+ *
+ * miuix 自带的规则是 `.m-small-title { padding: 8px 28px }` ——
+ * 它假定这个标题放在一个**左右无内边距**的容器里。
+ *
+ * 而本项目所有页面都套在 `.page { padding: 12px }` 里，于是标题文字
+ * 落在 `12 + 28 = 40px`，卡片内文字落在 `12 + 16 = 28px`：
+ *
+ * | 元素 | 修正前 | 修正后 |
+ * |---|---|---|
+ * | 卡片内文字 | 28px | 28px |
+ * | **分组标题** | **40px** ✗ | **28px** ✓ |
+ *
+ * 真机上表现为"标题比它下面的内容明显更靠右"，看起来像没对齐。
+ *
+ * 覆写成 16px 后回到 28px，与内容落在同一条线上。
+ * 上下仍保留 miuix 的 8px 内边距（那部分观感是对的）。
+ */
+.m-small-title {
+  padding-left: 16px;
+  padding-right: 16px;
+}
+
+/**
+ * 数值与标题的统一字号
+ *
+ * 下面这张表是从 `node_modules/miuix-vue/dist/miuix-vue.css` 的 CSS 变量里
+ * 读出来的**权威值**（不是估的）：
+ *
+ * | 令牌 | 字号 | 本项目用途 |
+ * |---|---|---|
+ * | `title1` | 32px | 未使用 |
+ * | `title2` | 24px | **仅**页面级身份标题（如机型名、充电上限的百分比） |
+ * | `title3` | 20px | **所有**统计数值、设置值 |
+ * | `title4` | 18px | 空态 / 错误提示（如"正在读取…"） |
+ * | `body1` | 16px | 行标题、按钮、模式名 |
+ * | `body2` | 14px | 行值 |
+ * | **`subtitle`** | **14px / 700** | **分组标题**（`MiuixSmallTitle` 用的就是它） |
+ * | `footnote1` | 13px | 说明文字 |
+ * | `footnote2` | 11px | 微标注（刻度、统计项名） |
+ *
+ * ⚠️ 注意 `subtitle` 的**加粗**是关键信息：分组标题是 14px/700，
+ * 比 `body1`（16px/400）**小但更重**。曾经有三个页面把"卡片标题"
+ * 写成 16~18px/400 —— 于是卡内标题比它下面的分组标题还大，层级是倒的。
+ *
+ * ⇒ **规则：卡片内不放标题。** 标题一律用 `.m-small-title` 放在卡片外面。
+ *
+ * 现状核对（四页统一）：
+ *
+ * | 页面 | 分组标题 | 字号 |
+ * |---|---|---|
+ * | 状态 | 1 个（详细读数） | 14px/700 |
+ * | 控制 | 4 个（充电模式 / 温度控制 / 功率限制 / 充电上限） | 14px/700 |
+ * | 日志 | 4 个（充电历史 / 每次充电 / 最近事件 / 危险操作） | 14px/700 |
+ * | 更多 | 7 个（设备检测 / 系统 / 电池 / …） | 14px/700 |
+ */
+
+/* ============================================================
+ *  共享小组件（四个页面共用）
+ * ============================================================
+ *
+ * # 为什么放在这里
+ *
+ * 这些类原先**各页各写一份**。重复定义的直接后果是**数值会漂移** ——
+ * 同一个"状态胶囊"，状态页写 26px 高、日志页写 24px 高；同一个"提示框"，
+ * 三个页面三种内边距。用户看到的就是"部分页面大小不一致"。
+ *
+ * 实测统计（改前）：
+ *
+ * | 类 | 出现在 | 差异 |
+ * |---|---|---|
+ * | `.tag` | 状态 + 日志 | **height 26px vs 24px** |
+ * | `.notice` / `.note` / `.alert` | 控制 + 日志 + 状态 | **同一用途三套名字、三种 padding** |
+ * | `.actions` | 控制 + 日志 + 更多 | `margin-top` 14px vs 无 |
+ * | `.empty` | 控制 + 日志 + 状态 | `padding` `16px 0 4px` vs `12px 0` |
+ * | `.grid` / `.grid__cell` | 状态 + 日志 | `min-width: 0` 只写了一份 |
+ * | `@keyframes pulse` | 状态 + 日志 | 逐字重复 |
+ *
+ * ⇒ **同一种视觉元素只允许有一个定义。** 需要变体就加修饰类
+ *   （`.notice--error`），不要再复制一份。
+ *
+ * # ⚠️ 这些都是**全局**类（不带 `data-v` 作用域）
+ *
+ * 页面里的 `<style scoped>` 会把选择器编译成 `.tag[data-v-xxx]`，
+ * 而这里不加作用域。因此**优先级**：页面内 scoped 规则 > 本文件
+ * （多一个属性选择器）。若某页确实要覆盖，写在页面里即可。
+ *
+ * # ⚠️ `@keyframes` 必须放在这里，不能留在 scoped 里
+ *
+ * Vue 的 scoped 样式会**重命名**关键帧：`@keyframes pulse` 编译成
+ * `@keyframes pulse-data-v-xxx`，同时把 `animation: pulse` 也改写成那个名字。
+ * 因此如果在两页各写一份，会得到两个不同的关键帧；
+ * 而如果只在这里定义、页面里引用，则**引用会失效**（名字对不上）。
+ *
+ * ⇒ 规则：**用 `pulse` 的规则也必须一起放在这里**（见下面的 `.tag--live`）。
+ */
+
+/* ── 状态胶囊（`<span class="tag">充电中</span>`）── */
+
+/**
+ * 小胶囊标签
+ *
+ * 用于状态页顶部的「充电中 / 正常放行」与日志页的「正在记录」。
+ *
+ * ⚠️ 高度统一为 **24px**：改前状态页是 26px、日志页是 24px，
+ * 两页切来切去时胶囊的胖瘦不同。
+ */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--m-color-surface-container-high);
+  color: var(--m-color-on-surface-secondary);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.tag__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+/* 表示"正在变化"的呼吸灯 */
+.tag--live .tag__dot {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* ── 信息胶囊（不可点，用于显示"当前是什么"）── */
+
+.chip {
+  flex: none;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1.6;
+  background: var(--m-color-surface-container-high);
+  color: var(--m-color-on-surface-secondary);
+}
+
+.chip--on {
+  background: var(--m-color-primary-container);
+  color: var(--m-color-on-primary-container);
+}
+
+/* ── 卡内提示框（说明一段注意事项）── */
+
+/**
+ * 卡内提示框
+ *
+ * # 名称统一（改前有三个名字做同一件事）
+ *
+ * | 原名 | 在哪 | 实际样式 |
+ * |---|---|---|
+ * | `.note` | 控制页 | 中性底 + `padding: 10px 12px` + `line-height: 1.6` |
+ * | `.notice` | 日志页 | **错误底** + `padding: 10px 12px` + `line-height: 1.5` |
+ * | `.alert` | 控制页 | **错误底** + `padding: 12px` + 无行高 |
+ *
+ * 三者语义其实只有两种：**中性提示** 与 **错误/危险提示**。
+ * 现在合并成 `.notice` + `.notice--error`。
+ *
+ * ⚠️ 与 `.lead` / `.hint` 的区别：
+ *
+ * | 类 | 位置 | 底色 | 用途 |
+ * |---|---|---|---|
+ * | `.lead` | 卡顶 | 无 | 这张卡干什么 |
+ * | `.hint` | 卡底 | 无 | 补充说明（一句话） |
+ * | `.notice` | 任意 | **有色** | 需要"框起来"引起注意的一段话 |
+ */
+.notice {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--m-color-surface-container-high);
+  color: var(--m-color-on-surface-container-high);
+  line-height: 1.6;
+}
+
+/* 错误 / 危险：换底色，字色由使用处指定（通常用 on-error-container） */
+.notice--error {
+  background: var(--m-color-error-container);
+}
+
+/**
+ * ⚠️ 区分两个容易混淆的概念：**卡内提示框** vs **整卡告警**
+ *
+ * | 类 | 在哪定义 | 加在什么元素上 | 效果 |
+ * |---|---|---|---|
+ * | `.notice` / `.notice--error` | 本文件（共享） | 卡片**内部**的一个 `<div>` | 卡内嵌一块带底色的小方框 |
+ * | `.alert` / `.alert--stack` | `StatusPage.vue`（仅此一页） | **`MiuixCard` 本身** | 整张卡片变成告警底色 |
+ *
+ * 两者的**内边距来源不同**，这是不能合并的原因：
+ *
+ * · `.notice` 是普通 `div`，**自己带** `padding: 10px 12px`
+ * · `.alert` 加在 `MiuixCard` 上，而 `MiuixCard` 已经有 `padding: 16px`
+ *   ⇒ 它只需覆写底色，**再加 padding 会让整卡的留白变成 26px**
+ *
+ * 因此 `.alert` 留在 `StatusPage.vue` 里。它现在只在那一页出现（4 处），
+ * 不构成跨页重复。若将来别的页面也要"整卡告警"，把它移到这里再共享。
+ */
+
+/* ── 按钮行 ── */
+
+/**
+ * 按钮行（卡片底部的操作区）
+ *
+ * # ⚠️ `margin-top` 必须与 `.hint` 相同（都是 12px）
+ *
+ * 这不是随手定的 —— 两者在控制页是**同一个位置的两个分支**：
+ *
+ * ```vue
+ * <div class="slider">…</div>
+ * <div v-if="powerDirty" class="actions">应用 / 取消</div>
+ * <MiuixText v-else class="hint">拖动只是预览，点「应用」才写入</MiuixText>
+ * ```
+ *
+ * 用户拖动滑块 ⇒ `.hint` 被替换成 `.actions`。若两者上边距不同，
+ * **按钮出现的那一刻整块内容会跳一下**。
+ *
+ * 曾经的真实缺陷（首次重构时踩到）：
+ *
+ * | 元素 | `margin-top` | 与滑块的间隙 |
+ * |---|---|---|
+ * | `.hint` | 12px | **12px** |
+ * | `.actions` | 0（以为"间距该由前一个元素给"） | **0px** ← 按钮贴住滑块 |
+ *
+ * 当时的想法是"间距属于上方元素"，但上方是 `.slider`，它**没有**下边距 ——
+ * 间距实际是由 `.hint` 自己提供的。所以 `.actions` 必须自己带一份，
+ * 且取**同一个值**。
+ */
+.actions {
+  display: flex;
+  gap: 10px;
+  /* 与 `.hint` 一致，保证 v-if / v-else 切换时位置不跳 */
+  margin-top: 12px;
+}
+
+.actions__btn {
+  flex: 1;
+}
+
+/* 危险操作按钮：铺满一行 + 错误色 */
+.actions__btn--danger {
+  color: var(--m-color-error);
+}
+
+/* ── 统计三格（数字 + 单位说明）── */
+
+/**
+ * 三列统计网格
+ *
+ * 状态页的「功率 / 电量 / 充电器」与日志页的「记录次数 / 累计充入 / 历史最高」
+ * 共用同一套版式。
+ *
+ * `min-width: 0` 是必需的：网格项默认 `min-width: auto`，内容过宽时
+ * **不肯收缩**，会顶破 `1fr` 的均分（长充电器名「PD_PPS」就会）。
+ */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.grid__cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+/* ── 空态占位 ── */
+
+/**
+ * 空态（"暂时没有事件"、"正在读取…"）
+ *
+ * 改前控制页用 `padding: 16px 0 4px`，状态页与日志页用 `12px 0`。
+ * 统一为 `12px 0` —— 上下对称，在卡片里居中感更好。
+ */
+.empty {
+  padding: 12px 0;
+  text-align: center;
+}
+

@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "updated_at": 0,
+  "enabled": true,
+  "mode": "custom",
+  "observe_only": false,
+  "device": {
+    "profile": "auto",
+    "max_power_w": 0,
+    
+    "allow_generic": true,
+    "generic_ack": false,
+    "probe_ceiling": 0,
+    "auto_probe": true
+  },
+  "thermal": {
+    "sensor": "cell",
+    "tighten_temp": 43.0,
+    "relax_temp": 42.0,
+    "delay_s": 5,
+    "tighten_power_w": 3,
+    "ramp_span": 2.0,
+    "control_law": "ramp",
+    "virt_guard": true,
+    "virt_hard": 46.0,
+    "abs_max": 0.0
+  },
+  "control": {
+    "actuator": "dual",
+    "closed_loop": true,
+    "target_power_w": 0,
+    "patrol_s": 3,
+    "shift_s": 6,
+    "feedforward": 0,
+    "hardware_protect": true,
+    "stabilize_s": 15
+  },
+  "ui": {
+    "module_desc": true
+  },
+  "daemon": {
+    "on_demand": true,
+    "standby_s": 30,
+    "hb_timeout_s": 45
+  },
+  "limit": {
+    "enabled": false,
+    "soc": 80,
+    "verify_s": 15,
+    "keep_on_restore": true,
+    "warn_on_hypersc": true
+  },
+  "curve": [
+    {"t_max": 38.0, "curr": 18400000},
+    {"t_max": 40.0, "curr": 12000000},
+    {"t_max": 41.0, "curr": 9000000},
+    {"t_max": 42.0, "curr": 7000000},
+    {"t_max": 43.0, "curr": 5000000},
+    {"t_max": 44.0, "curr": 2500000},
+    {"t_max": 45.0, "curr": 700000}
+  ],
+  "log": {
+    "level": "info",
+    "csv": true,
+    "max_size_kb": 512
+  },
+  "history": {
+    "enabled": true,
+    "keep": 30,
+    "sample_s": 30
+  }
+}

@@ -1,0 +1,17 @@
+schemaVersion: 1
+id: a_thermo_charge
+name: 温控充 ThermoCharge
+summary: 按电池温度闭环控制充电速度
+description: README.md
+tags: [thermal, charging, battery]
+
+authors:
+  - name: 乱世殇歌
+
+compatibility:
+  # 与安装脚本门禁保持一致（customize.sh 中为 API < 31 则中止）
+  androidMinApi: 31
+  architectures: [arm64-v8a]
+
+release:
+  assetPattern: "thermo_charge-*.zip"
