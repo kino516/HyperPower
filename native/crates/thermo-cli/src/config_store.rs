@@ -164,7 +164,11 @@ pub fn mode_ids() -> &'static [&'static str] {
 }
 
 /// 模式显示名
-fn mode_label(id: &str) -> &'static str {
+///
+/// ⚠️ `pub`：`engine.rs` 生成"模式切换"事件消息时要用它 ——
+/// 事件消息是**给用户看**的，必须中文（用户反馈 2026-10-16：
+/// 「最近事件内的英文显示全部转换成中文」）。
+pub fn mode_label(id: &str) -> &'static str {
     match id {
         "conservative" => "保守",
         "official" => "官方",

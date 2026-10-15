@@ -351,31 +351,191 @@ function phaseLabel(phase: string): string {
   }
 }
 
-/** 事件类型 → 中文徽标文字；没见过的类型直接显示原文，不吞信息 */
+/**
+ * 事件类型 → 中文徽标文字；没见过的类型直接显示原文，不吞信息
+ *
+ * ⚠️ 必须与后端 `observability.rs` 里的 13 个 `kind` 常量**一一对应**。
+ *    初版只翻译了 7 个，于是徽标上冒出 `lifecycle`、`detect` 这样的英文 ——
+ *    用户要求的正是「英文显示全部转换成中文」。
+ *
+ *    漏翻译时不会报错（回退成原文），所以**加新 kind 时要回来同步这里**。
+ */
 const KIND_LABEL: Record<string, string> = {
+  // 状态与相位
   state: "状态",
+  hard_protect: "硬保护",
+  // 配置
   config: "配置",
-  release: "交回官方",
-  crash: "崩溃",
-  addon: "附加功能",
+  config_clamped: "配置钳位",
+  // 读写异常
   write_fail: "写入失败",
   read_fail: "读取失败",
+  crash: "崩溃",
+  // 进程与检测
+  lifecycle: "运行",
+  detect: "检测",
+  deny: "拒绝",
+  // 交回官方
+  release: "交回官方",
+  // 附加功能
+  addon: "附加功能",
+  addon_trip: "功能熔断",
 };
 
 function kindLabel(kind: string): string {
   return KIND_LABEL[kind] ?? kind;
 }
 
+/**
+ * 事件消息 → 用户能看懂的文字
+ *
+ * # 为什么需要兜底翻译（2026-10-16 用户反馈）
+ *
+ * 用户原话：「最近事件内的英文显示全部转换成中文」。
+ *
+ * 根因在后端：状态迁移与模式切换的消息原先用了 Rust 的 `{:?}`（Debug 格式），
+ * 于是界面上显示的是 `Normal → Tightening`、`模式切换：custom → conservative`。
+ * **后端已修**（`Phase::label()` / `mode_label()`），但有两个遗留问题：
+ *
+ * | 问题 | 说明 |
+ * |---|---|
+ * | **历史事件** | `events.jsonl` 里已经存了英文消息，改后端不会追溯修改它们 |
+ * | 升级过渡期 | 用户装上新版前产生的事件仍是英文 |
+ *
+ * ⇒ 这里做一层**兜底翻译**：遇到英文形态就翻成中文，已经是中文的原样返回。
+ *
+ * ⚠️ 翻译是**幂等**的 —— 中文消息不含这些英文词，正则不会命中，
+ *    因此新老事件混在一起也不会翻错。
+ */
+/**
+ * 旧版事件消息里的**英文术语 → 中文**
+ *
+ * # 为什么需要这张表
+ *
+ * 0.3.8 及更早的版本，事件消息里有几个英文术语：
+ *
+ * | 原文 | 用户看不懂的地方 |
+ * |---|---|
+ * | `worker 启动` / `worker 退出` | `worker` 是内部进程名 |
+ * | `supervisor 启动` | 同上 |
+ * | `uevent 订阅成功` | `uevent` 是内核机制名 |
+ * | `soc_limit 探测：命中 …` | `soc_limit` 是内部功能 id（界面叫「充电上限」） |
+ *
+ * 后端已改为直接发中文，但这张表仍然必要 ——
+ * **`events.jsonl` 里已经存了英文消息**，改后端不会追溯修改历史数据。
+ * 用户升级后仍会看到旧事件里的英文。
+ *
+ * ⚠️ 这是**过渡期兜底**，等旧事件被日志轮转淘汰后即可删除。
+ *    判定依据：所有位于 `data.ts` 之前的事件都会被 `logs clear` 或轮转清掉。
+ *
+ * ⚠️ 用**术语替换**而不是整句匹配：一句里可能同时出现多个术语
+ *    （如「交回官方：worker 退出」），整句匹配会漏。
+ *    `\b` 词边界避免误伤包含这些字母的其它词。
+ *
+ * ⚠️ **不动节点路径**（`/sys/class/...`）—— 那是文件系统路径，
+ *    翻译了反而让排障的人对不上。
+ */
+const LEGACY_TERMS: [RegExp, string][] = [
+  [/\bworker\b/g, "充电控制进程"],
+  [/\bsupervisor\b/g, "监督进程"],
+  [/uevent 订阅/g, "充电事件订阅"],
+  [/\bsoc_limit\b/g, "充电上限"],
+];
+
+function eventMsg(msg: string): string {
+  // ① 状态迁移：`Idle → Normal` / `HardProtect → Normal`（可含空格）
+  const m = msg.match(/^([A-Za-z_]+)\s*→\s*([A-Za-z_]+)$/);
+  if (m) {
+    // ⚠️ 捕获组在 TS 里推成 `string | undefined`（正则可能不匹配）——
+    //    这里已经过了 `if (m)`，但类型系统不知道捕获组一定存在，
+    //    因此用 `?? ""` 兜底；空串交给 phaseLabel 走它的 default 分支。
+    return `${phaseLabel((m[1] ?? "").toLowerCase())} → ${phaseLabel(
+      (m[2] ?? "").toLowerCase(),
+    )}`;
+  }
+
+  // ② 模式切换：`模式切换：custom → conservative`
+  const mm = msg.match(/^(模式切换：)([a-z]+)\s*→\s*([a-z]+)$/);
+  if (mm) {
+    return `${mm[1] ?? ""}${modeLabel(mm[2] ?? "")} → ${modeLabel(mm[3] ?? "")}`;
+  }
+
+  // ③ 旧版消息里的英文术语（历史数据兜底）
+  let out = msg;
+  for (const [re, zh] of LEGACY_TERMS) {
+    out = out.replace(re, zh);
+  }
+  // ④ 收拾替换后留下的多余空格
+  //
+  // `worker 启动` → 替换 `worker` 后成了「充电控制进程 启动」——
+  // 中文之间不该有空格。只收拾**两侧都是汉字**的那些空格，
+  // 因此「温度 38℃」这类（汉字+数字）不受影响。
+  //
+  // ⚠️ 用到了 lookbehind（ES2018）。项目支持基线是 Android 12+ 的系统
+  //    WebView，实测版本 154，支持没有问题。
+  return out.replace(/(?<=[\u4e00-\u9fa5]) (?=[\u4e00-\u9fa5])/g, "");
+}
+
+/** 模式 id → 中文名（与后端 `config_store::mode_label` 保持一致） */
+function modeLabel(id: string): string {
+  switch (id) {
+    case "conservative":
+      return "保守";
+    case "official":
+      return "官方";
+    case "turbo":
+      return "极速";
+    case "custom":
+      return "自定义";
+    default:
+      return id;
+  }
+}
+
+/**
+ * 最近事件默认显示条数
+ *
+ * 🔴 用户要求（2026-10-16）：
+ * 「最近事件一次性显示太多，默认显示最近 10 条，如果需要看更多需要点击更多查看」
+ *
+ * 「最近事件」的定位是**扫一眼有没有异常**，不是逐条阅读 ——
+ * 一次铺开几十条会把「充电历史」「每次充电」这些更需要关注的内容挤出视野。
+ */
+const EVENTS_PREVIEW = 10;
+
+/** 是否展开了全部事件 */
+const showAllEvents = ref(false);
+
+/** 实际渲染的事件列表（未展开时只给前 N 条） */
+const visibleEvents = computed(() =>
+  showAllEvents.value
+    ? events.value
+    : events.value.slice(0, EVENTS_PREVIEW),
+);
+
+/** 被折叠掉的条数（>0 才显示「更多」按钮） */
+const hiddenEventCount = computed(() =>
+  Math.max(0, events.value.length - EVENTS_PREVIEW),
+);
+
 /** 事件类型 → 徽标配色（出错类用错误色，其余按类别区分） */
 function kindClass(kind: string): string {
   switch (kind) {
+    // 出错类 → 错误色（最需要被一眼看到）
     case "crash":
     case "write_fail":
     case "read_fail":
+    case "addon_trip":
+    case "deny":
+      return "evt__badge--error";
+    // 硬保护也是"发生了危险情况"，用错误色
+    case "hard_protect":
       return "evt__badge--error";
     case "state":
       return "evt__badge--state";
+    // 配置钳位意味着"用户设的值被改了"，用配置色但值得注意
     case "config":
+    case "config_clamped":
       return "evt__badge--config";
     case "release":
       return "evt__badge--release";
@@ -1102,15 +1262,47 @@ const readout = computed<Readout | null>(() => {
             暂时没有事件。插上充电器、改一次设置，这里就会有记录。
           </MiuixText>
         </div>
-        <div v-else class="selectable evts">
-          <div v-for="(e, i) in events" :key="`${e.ts}-${i}`" class="evt">
-            <span class="evt__badge" :class="kindClass(e.kind)">
-              {{ kindLabel(e.kind) }}
-            </span>
-            <span class="evt__msg">{{ e.msg }}</span>
-            <span class="evt__time">{{ relTime(e.ts) }}</span>
+        <template v-else>
+          <div class="selectable evts">
+            <!--
+              ⚠️ 遍历 `visibleEvents`（默认只给前 10 条），不是 `events`
+
+              用户要求（2026-10-16）：「最近事件一次性显示太多，默认显示
+              最近 10 条，如果需要看更多需要点击更多查看」。
+            -->
+            <div
+              v-for="(e, i) in visibleEvents"
+              :key="`${e.ts}-${i}`"
+              class="evt"
+            >
+              <span class="evt__badge" :class="kindClass(e.kind)">
+                {{ kindLabel(e.kind) }}
+              </span>
+              <!--
+                ⚠️ 走 `eventMsg()` 而不是直接 `e.msg`
+
+                它是**兜底翻译**：升级前产生的旧事件消息仍是英文
+                （`Normal → Tightening`），而后端修好之后新事件已经是中文。
+                两者混在一起时，这个函数只翻英文的那种，中文原样返回。
+              -->
+              <span class="evt__msg">{{ eventMsg(e.msg) }}</span>
+              <span class="evt__time">{{ relTime(e.ts) }}</span>
+            </div>
           </div>
-        </div>
+
+          <!--
+            「更多」/「收起」
+
+            ⚠️ 只在真的被折叠时才出现（`hiddenEventCount > 0`）——
+              事件不足 10 条时冒出一个"更多"按钮，点下去毫无变化，
+              是比不显示按钮更差的体验。
+          -->
+          <div v-if="hiddenEventCount > 0 || showAllEvents" class="actions">
+            <MiuixButton class="actions__btn" @click="showAllEvents = !showAllEvents">
+              {{ showAllEvents ? "收起" : `更多（还有 ${hiddenEventCount} 条）` }}
+            </MiuixButton>
+          </div>
+        </template>
       </MiuixCard>
 
       <!-- ── 导出诊断日志（反馈问题时用）── -->

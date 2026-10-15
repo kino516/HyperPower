@@ -17,6 +17,40 @@ pub enum Phase {
     HardProtect,
 }
 
+impl Phase {
+    /// 中文名 —— 用于**给用户看**的地方（事件消息、界面文案）
+    ///
+    /// # 为什么要有它（2026-10-16 用户反馈）
+    ///
+    /// 事件消息原先写的是 `format!("{:?} → {:?}", prev, now)` ——
+    /// 那是 Rust 的 **Debug 格式**，于是用户在「最近事件」里看到的是：
+    ///
+    /// ```text
+    /// Normal → Tightening
+    /// ```
+    ///
+    /// 用户原话：「最近事件内的英文显示全部转换成中文」。
+    ///
+    /// 项目里其它事件消息**本来就是中文**（"已交回官方控制"、"充电会话已归档"、
+    /// "触发硬保护"），只有这一条漏了 —— 因为枚举没有中文名可用，
+    /// 就顺手用了 Debug。现在补上，两处都对齐。
+    ///
+    /// ⚠️ **不要**改 `{:?}` 的输出本身（`Debug` 是给开发者的，日志与
+    ///    序列化都依赖它保持英文稳定）。要中文就调这个函数。
+    ///
+    /// ⚠️ 措辞必须与前端 `format.ts::stateLabel` / `LogsPage::phaseLabel`
+    ///    **逐字一致** —— 同一个状态在两处显示不同说法会让用户以为
+    ///    是两个东西。前端用的是「正在限速」，这里就跟着用。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "待机",
+            Self::Normal => "正常放行",
+            Self::Tightening => "正在限速",
+            Self::HardProtect => "硬保护",
+        }
+    }
+}
+
 /// 跨拍状态
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct State {

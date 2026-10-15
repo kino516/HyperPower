@@ -104,6 +104,34 @@ const toneColor = computed(() => {
       return "var(--m-color-on-surface-secondary)";
   }
 });
+
+/**
+ * 充电器格的说明文字 —— **协商功率**
+ *
+ * 🔴 用户要求（2026-10-16）：把检测到的「协商值」显示在主页。
+ *
+ * 协商值 = 手机与**当前这个充电头**谈成的功率上限，读自
+ * `/sys/class/xm_power/charger/charger_common/power_max`。
+ *
+ * 与「更多」页那个「充电功率上限」的区别：
+ *
+ * | | 本格（协商值） | 更多页（机型能力） |
+ * |---|---|---|
+ * | 含义 | **这个充电头**能跑多快 | **这台手机**最高能吃多少 |
+ * | 换充电头 | **跟着变** | 不变 |
+ * | 取法 | 直接读节点 | 三来源（协商/电池型号/设备树）**取最大** |
+ *
+ * ⚠️ 插电脑 USB 口（SDP）或普通 5V 头时**协商不出快充**，此时节点读作 0
+ * （后端已 filter 成 `null`）。这种情况必须写明"未协商快充" ——
+ * 留空或显示 "—" 会让用户以为界面坏了。
+ */
+const chargerPowerLabel = computed(() => {
+  const w = st.value?.charger.power_max_w;
+  if (typeof w === "number" && w > 0) {
+    return `充电器 · 最高 ${f0(w)} W`;
+  }
+  return "充电器 · 未协商快充";
+});
 </script>
 
 <template>
@@ -246,8 +274,32 @@ const toneColor = computed(() => {
             <MiuixText type="title3" class="grid__charger">
               {{ st.charger.label ?? "—" }}
             </MiuixText>
-            <MiuixText type="footnote2" color="var(--m-color-on-surface-secondary)">
-              充电器
+            <!--
+              充电器格的小字：从固定的「充电器」改成**协商功率**
+
+              🔴 用户要求（2026-10-16）：「充电功率上限会检测 3 个数据，
+                 有一个为协商值……将此数值显示在主页」
+
+              三个候选来源（见 `detect.rs` 第 7 步）：
+
+              | 来源 | 节点 | 语义 |
+              |---|---|---|
+              | **协商值** | `charger_common/power_max` | **当前这个充电头**与手机谈成的功率 |
+              | 电池型号 | `battery/model_name` 的 `_100w` | 出厂标称 |
+              | 设备树 | `support_pps_100w` 节点名 | 支持的最高协议档位 |
+
+              「更多」页的「充电功率上限」显示的是**三者取最大**（= 机型能力上限），
+              那个值**不随换充电头变化**。而用户想知道的往往是另一种信息：
+              **"我这个充电头能跑多快"** —— 那就是协商值。
+
+              例：插 33W 头时，机型能力仍是 100W，但协商值是 33W。
+              两者的差值正好解释"为什么插着 33W 头、把上限设到 100W 也没用"。
+            -->
+            <MiuixText
+              type="footnote2"
+              color="var(--m-color-on-surface-secondary)"
+            >
+              {{ chargerPowerLabel }}
             </MiuixText>
           </div>
         </div>
@@ -259,7 +311,7 @@ const toneColor = computed(() => {
           当前是弱电源（{{ st.charger.label ?? "未知" }}）
         </MiuixText>
         <MiuixText type="footnote1" color="var(--m-color-on-error-container)">
-          这个功率反映的是**充电器/线材的能力**，不是手机的。
+          这个功率反映的是<b>充电器 / 线材的能力</b>，不是手机的。
           想验证手机能跑多快，请用原装充电器。
         </MiuixText>
       </MiuixCard>

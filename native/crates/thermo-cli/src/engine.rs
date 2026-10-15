@@ -313,7 +313,12 @@ impl Engine {
         if decision.phase != prev_phase {
             self.events.emit(
                 kind::STATE,
-                &format!("{:?} → {:?}", prev_phase, decision.phase),
+                // ⚠️ 用 `Phase::label()`（中文）而不是 `{:?}`（Debug）
+                //
+                // 用户反馈（2026-10-16）：「最近事件内的英文显示全部转换成中文」
+                // 根因就是这里原先用了 `{:?}`，界面上显示成 `Normal → Tightening`。
+                // 详见 `thermo_core::state::Phase::label` 的文档。
+                &format!("{} → {}", prev_phase.label(), decision.phase.label()),
                 json!({
                     "from": format!("{:?}", prev_phase).to_lowercase(),
                     "to": format!("{:?}", decision.phase).to_lowercase(),
@@ -840,9 +845,19 @@ impl Engine {
                 Pending::SwitchMode(id) => match self.cfg.switch_mode(&id) {
                     Ok((from, to)) => {
                         config_dirty = true;
+                        // ⚠️ 消息里用**中文模式名**，不能用 id
+                        //
+                        // 用户看到的原先是「模式切换：custom → conservative」——
+                        // 那两个词对用户毫无意义（用户反馈 2026-10-16：
+                        // 「最近事件内的英文显示全部转换成中文」）。
+                        // `data` 里仍保留 id，供程序化解析。
                         self.events.emit(
                             kind::CONFIG,
-                            &format!("模式切换：{from} → {to}"),
+                            &format!(
+                                "模式切换：{} → {}",
+                                crate::config_store::mode_label(&from),
+                                crate::config_store::mode_label(&to)
+                            ),
                             json!({ "from": from, "to": to }),
                         );
                     }

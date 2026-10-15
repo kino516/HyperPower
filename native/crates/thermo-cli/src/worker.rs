@@ -402,12 +402,13 @@ pub fn run() -> Result<()> {
 
     events.emit(
         kind::LIFECYCLE,
-        "worker 启动",
+        "充电控制进程启动",
         serde_json::json!({
             "pid": std::process::id(),
             "version": env!("CARGO_PKG_VERSION"),
             "config_ver": cfg.ver,
             "profile_source": profile.source.label(),
+            "role": "worker",
         }),
     );
 
@@ -494,9 +495,21 @@ pub fn run() -> Result<()> {
                 "附加功能 {id}：{} —— {detail}",
                 if supported { "支持" } else { "不支持" }
             );
+            // ⚠️ 消息里用**中文功能名**，不用内部 id
+            //
+            // 用户反馈（2026-10-16）：「最近事件内的英文显示全部转换成中文」。
+            // `soc_limit` 是内部 id，界面别处叫「充电上限」——
+            // 同一个功能两种叫法只会让人困惑。id 保留在 `data` 里供排障。
+            //
+            // 两侧都是 `&'static str`（`AddonSpec::label` 就是静态字符串），
+            // 所以 `id` 直接传、不取引用也不 clone（clippy 会拦）。
+            let label = engine
+                .addons
+                .slot(id)
+                .map_or(id, |s| s.addon().spec().label);
             events.emit(
                 kind::ADDON,
-                &format!("{id} 探测：{detail}"),
+                &format!("{label} 探测：{detail}"),
                 serde_json::json!({ "id": id, "supported": supported }),
             );
         }
@@ -514,7 +527,13 @@ pub fn run() -> Result<()> {
     let uevent = match UeventSubscriber::open() {
         Ok(s) => {
             log::info!("uevent 订阅成功（power_supply 事件将优先唤醒）");
-            events.emit(kind::LIFECYCLE, "uevent 订阅成功", serde_json::json!({}));
+            // ⚠️ 用户可见的消息说人话：`uevent` 是内核机制名，用户看不懂；
+            //    技术名保留在 logcat 与 data 里，排障不受影响。
+            events.emit(
+                kind::LIFECYCLE,
+                "已订阅充电事件（插拔与状态变化将即时唤醒）",
+                serde_json::json!({ "mechanism": "uevent" }),
+            );
             Some(s)
         }
         Err(e) => {
@@ -522,8 +541,8 @@ pub fn run() -> Result<()> {
             log::warn!("uevent 订阅失败（退回纯定时轮询）：{e:#}");
             events.emit(
                 kind::LIFECYCLE,
-                &format!("uevent 订阅失败，已降级为纯定时轮询：{e:#}"),
-                serde_json::json!({}),
+                &format!("充电事件订阅失败，已降级为定时轮询：{e:#}"),
+                serde_json::json!({ "mechanism": "uevent" }),
             );
             None
         }
@@ -570,9 +589,15 @@ pub fn run() -> Result<()> {
     loop {
         if TERM_REQUESTED.load(Ordering::Relaxed) {
             log::info!("收到终止信号，交回官方后退出");
+            // ⚠️ 这里传的是**内部原因串**（`release_now` 会把它写进
+            //    release 事件），保持英文便于排障；下面给用户看的那条用中文。
             engine.release_now("worker 退出");
             engine.write_snapshot(crate::observability::now_unix(), true);
-            events.emit(kind::LIFECYCLE, "worker 退出", serde_json::json!({}));
+            events.emit(
+                kind::LIFECYCLE,
+                "充电控制进程退出",
+                serde_json::json!({ "role": "worker" }),
+            );
             return Ok(());
         }
 

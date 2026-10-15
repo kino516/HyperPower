@@ -191,8 +191,13 @@ pub fn run() -> Result<()> {
 
     events.emit(
         kind::LIFECYCLE,
-        "supervisor 启动",
-        serde_json::json!({ "pid": std::process::id() }),
+        // ⚠️ 事件消息是**给用户看**的，用中文
+        //
+        // 用户反馈（2026-10-16）：「最近事件内的英文显示全部转换成中文」。
+        // `supervisor` / `worker` 是内部进程名（前者管进程、后者管充电），
+        // 用户看不懂 —— 消息用中文，`data` 里保留 `role` 供排障。
+        "监督进程启动",
+        serde_json::json!({ "pid": std::process::id(), "role": "supervisor" }),
     );
 
     // 🔴 首次运行时自动检测 —— 必须在拉起 worker **之前**
@@ -231,8 +236,8 @@ pub fn run() -> Result<()> {
         log::info!("worker 已启动（pid={}）", child.id());
         events.emit(
             kind::LIFECYCLE,
-            "worker 已启动",
-            serde_json::json!({ "pid": child.id() }),
+            "充电控制进程已启动",
+            serde_json::json!({ "pid": child.id(), "role": "worker" }),
         );
 
         // 稳定运行过一段时间 → 退避重置

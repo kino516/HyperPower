@@ -758,7 +758,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "thermo-addons"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "log",
  "serde",
@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "thermo-cli"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "thermo-core"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "proptest",
  "serde",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "thermo-ipc"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "serde",
  "serde_json",
