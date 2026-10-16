@@ -761,6 +761,49 @@ body {
   color: var(--m-color-error);
 }
 
+/**
+ * 「左边一段文字 + 右边一个控件」的行布局
+ *
+ * ```html
+ * <div class="row">
+ *   <div class="row__text">
+ *     <MiuixText type="body1">标题</MiuixText>
+ *     <MiuixText type="footnote1">说明（会自动换行到第二行）</MiuixText>
+ *   </div>
+ *   <MiuixSwitch … />
+ * </div>
+ * ```
+ *
+ * ⚠️ **必须放在这里（全局），不能只放在某个页面的 `<style scoped>` 里**
+ *
+ * 2026-10-17 真机踩到：控制页有这个类的 scoped 定义，日志页直接用了同名类 ——
+ * 于是日志页的「调试模式」**完全没有样式**：标题与说明挤在同一行成了一句
+ * 读不通的长句，而且：
+ *
+ * | 检查手段 | 能不能发现 |
+ * |---|---|
+ * | `vue-tsc` | ❌ 类名不是类型信息 |
+ * | `vite build` | ❌ 只是少命中一条 CSS 规则 |
+ * | 浏览器里跑一遍 | ✅ 唯一能发现的办法 |
+ *
+ * ⇒ 这类"跨页面复用同一个类名"的东西一律放全局，避免各页各写一份
+ *    （写两份还会随时间漂移，两处长得不一样）。
+ */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.row__text {
+  flex: 1;
+  /* ⚠️ 不可省：长文本（如节点路径、错误消息）会把 flex 项撑破容器 */
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
 /* ── 统计三格（数字 + 单位说明）── */
 
 /**
@@ -776,6 +819,24 @@ body {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 8px;
+}
+
+/**
+ * 网格居中变体：每格内容在**本格内**居中
+ *
+ * ⚠️ 两个页面共用（状态页三格、更多页电池三格），因此放**全局** ——
+ *    各页各写一份的话，迟早出现"两处看起来不一样"。
+ *
+ * ⚠️ 必须同时给 `text-align` 与 `align-items`
+ *
+ * 只写 `text-align: center` **实测无效** —— `.grid__cell` 是
+ * `display: flex; flex-direction: column`，而 `text-align` 管不了
+ * flex item 在**交叉轴**上的位置（那是 `align-items` 的职责）。
+ * 两者都写：将来 cell 改成块级也仍然居中。
+ */
+.grid--center .grid__cell {
+  text-align: center;
+  align-items: center;
 }
 
 .grid__cell {

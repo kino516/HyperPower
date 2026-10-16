@@ -242,6 +242,16 @@ impl Engine {
         // 把上一拍产生的事件推给 watch 订阅者
         self.publish_events();
 
+        // ①-b 按配置同步调试模式的**写入器开关**
+        //
+        // ⚠️ 必须在 `poll_server` **之后**：`ctl debug on` 是通过命令队列
+        //    改配置的，放前面会晚一拍才生效。
+        //
+        // ⚠️ 也必须在**本进程**做（而不是让 CLI 直接开）：
+        //    写入器是进程内的静态状态，CLI 开了 worker 也看不见。
+        //    worker 是唯一的写者 ⇒ 它自己按配置决定记不记。
+        self.sync_debug_mode();
+
         // ② 采样
         let outcome = self.sample();
         let Some(sample) = outcome.sample else {
@@ -355,10 +365,104 @@ impl Engine {
         // ⑦ 把本拍产生的事件推给 watch 订阅者
         self.publish_events();
 
-        // ⑧ 快照
+        // ⑧ 调试模式：记下**本拍的完整决策链**
+        //
+        // 用户要求（2026-10-17）：「开启调试模式会记录更详细的数据，
+        // 方便你抓包分析」。
+        //
+        // 事件流只在**状态变化时**记一条，所以排查"看起来没生效"这类
+        // 问题时，中间那几十拍的输入与输出全都看不到 —— 而那恰恰是
+        // 判断"算错了"还是"写了没生效"的唯一依据。
+        //
+        // ⚠️ 放在 `publish_events` **之后**：这样 `dt_ms` 能覆盖本拍
+        //    几乎全部工作（含事件推送），更接近真实的单拍耗时。
+        self.trace_debug(&sample, &decision);
+
+        // ⑨ 快照
         self.write_snapshot(now_s, false);
 
         rep
+    }
+
+    /// 按配置同步调试模式（每拍调用，**幂等**）
+    ///
+    /// # 为什么要"每拍同步"而不是"配置变更时同步一次"
+    ///
+    /// | 场景 | 只做"变更时"会怎样 |
+    /// |---|---|
+    /// | worker 重启 | 配置里开着，但新进程的写入器是关的 ⇒ **不再记录**，用户以为还在记 |
+    /// | 配置被外部改（手改 `config.json`） | 同上 |
+    ///
+    /// 而每拍同步的成本只是一次配置读 + 一次原子比较，可忽略。
+    ///
+    /// ⚠️ [`crate::debug_log::enable`] 本身是幂等的（路径相同只更新上限），
+    ///    所以每拍调用不会重置计数或清空文件。
+    fn sync_debug_mode(&self) {
+        let want = self.cfg.get_bool("debug.enabled");
+        if want {
+            let max_mb = u16::try_from(self.cfg.get_i64("debug.max_mb"))
+                .unwrap_or(crate::debug_log::DEFAULT_MAX_MB);
+            crate::debug_log::enable(crate::paths::debug_jsonl(), max_mb);
+        } else if crate::debug_log::is_enabled() {
+            crate::debug_log::disable();
+        }
+    }
+
+    /// 未开启调试模式时是**空操作**（一次原子读）
+    ///
+    /// # 记什么、为什么
+    ///
+    /// 这一行的目标是：**只看它就能判断"为什么最后是那个电流"**。
+    ///
+    /// | 字段 | 为什么需要 |
+    /// |---|---|
+    /// | `temp` / `soc` / `volt` / `curr` / `power` | 决策的**全部输入** |
+    /// | `phase` / **`reason`** | 决策结果的性质 —— 见下 |
+    /// | `pcap_ua` | 功率上限单独算出的电流上限 |
+    /// | `final_ua` | 与实际写入值一致（两者取严 + 钳位之后） |
+    /// | `gear` | 档位（虽不参与收紧，但要能看到它是否被改） |
+    /// | `should_write` / `release` | 本拍到底有没有动作 |
+    /// | `peak_c` | 收紧期的峰值温度 |
+    ///
+    /// # 为什么没有"温度诉求"那一列
+    ///
+    /// 判断"降速失效"的关键是分清两种完全不同的故障：
+    ///
+    /// | 故障 | 症状 | 本次能看出吗 |
+    /// |---|---|---|
+    /// | **算错了** | 控制律本身给出的值就不对 | ✅ `reason = Tighten` |
+    /// | **被盖住了** | 控制律对，但功率上限更严 | ✅ `reason = PowerLimit` |
+    ///
+    /// `Reason` 枚举**本身**就回答了"谁在起作用"这个问题
+    /// （`Tighten` / `PowerLimit` / `Normal` / `HardProtect`…），
+    /// 再配合 `pcap_ua` 与 `final_ua`，已经够定位。
+    ///
+    /// 要精确到"温度诉求是 20.81 A"则需要给 `thermo_core::Decision`
+    /// 加字段，而那要改 **14 处构造点**、动的是决策内核的公开契约 ——
+    /// 为一个诊断字段付这个代价不划算。真到需要时再加。
+    fn trace_debug(&self, sample: &thermo_core::Sample, decision: &thermo_core::Decision) {
+        if !crate::debug_log::is_enabled() {
+            return;
+        }
+        crate::debug_log::write(
+            "trace",
+            json!({
+                "temp": crate::observability::round_json(f64::from(sample.temp_c), 1),
+                "soc": sample.soc,
+                "status": format!("{:?}", sample.status),
+                "volt_uv": sample.voltage_uv,
+                "curr_ua": sample.current_ua,
+                "power_w": crate::observability::round_json(f64::from(sample.power_w()), 2),
+                "phase": format!("{:?}", decision.phase),
+                "reason": format!("{:?}", decision.reason),
+                "pcap_ua": decision.power_cap_ua,
+                "final_ua": decision.curr_ua,
+                "gear": decision.gear,
+                "should_write": decision.should_write,
+                "release": decision.release,
+                "peak_c": self.state.peak_c,
+            }),
+        );
     }
 
     /// 把本拍结果记入充电历史（**纯观测**）
@@ -546,20 +650,16 @@ impl Engine {
             .and_then(|n| n.read_i64().ok())
             .and_then(|v| u8::try_from(v.clamp(0, 100)).ok())
             .unwrap_or(0);
-        // 机身温度（可选）：0.1℃ 或 ℃ 两种单位都兼容
+        // 机身温度（可选）：单位兼容与范围校验见 `sysfs::board_temp_to_c`
+        //
+        // ⚠️ 必须与 `ctl status` 用的是**同一个函数** —— 否则状态页显示的
+        //    机身温度会和历史曲线里记的对不上（这类不一致极难察觉）。
         let board_c = self
             .nodes
             .board_temp
             .as_ref()
             .and_then(|n| n.read_i64().ok())
-            .map(|v| {
-                if v > 1000 {
-                    v as f32 / 1000.0
-                } else {
-                    v as f32 / 10.0
-                }
-            })
-            .filter(|v| (0.0..=120.0).contains(v));
+            .and_then(crate::sysfs::board_temp_to_c);
 
         SampleOutcome {
             sample: Some(Sample {
@@ -879,6 +979,66 @@ impl Engine {
                         json!({}),
                     ),
                 },
+                // ── 清空全部记录 ──
+                //
+                // 🔴 顺序很重要，见下方注释。
+                Pending::RecordsClear => {
+                    // ① 充电历史 —— 复用 `HistoryStore::clear()`
+                    //
+                    // ⚠️ 它**刻意保留**正在进行的会话草稿：用户点"清空"是清理
+                    //    旧记录，不该顺手毁掉他此刻正在观察的这一条。
+                    let (hist_n, hist_err) = match self.history.clear() {
+                        Ok(n) => (n, None),
+                        Err(e) => (0, Some(format!("{e:#}"))),
+                    };
+
+                    // ② 其余记录文件（诊断报告 / 打点 / 开机记录）
+                    //
+                    // 清单来自 `paths::clearable_records()` —— **唯一真源**，
+                    // 界面弹窗里展示的文案由同一份数据生成，不可能不一致。
+                    let mut files_removed = 0_usize;
+                    for rec in crate::paths::clearable_records() {
+                        if std::fs::remove_file(&rec.path).is_ok() {
+                            files_removed += 1;
+                        }
+                    }
+
+                    // ③ 事件流 —— **必须放最后**
+                    //
+                    // 因为它会连同磁盘上的事件一起清掉；而下面第 ④ 步要
+                    // **紧接着补记一条**，所以这里不能提前 emit 任何东西
+                    // （否则那条也会被自己清掉）。
+                    let ev_removed = self.events.clear();
+
+                    // ④ 补记一条"已清空"
+                    //
+                    // 不补的话，用户点完只看一片空白，无法确认操作**是否发生过**、
+                    // 也无法知道"清了多少"。这条会写进刚清空的文件，成为新起点。
+                    self.events.emit(
+                        kind::CONFIG,
+                        &format!(
+                            "已清空全部记录（历史 {hist_n} 条 · 事件 {ev_removed} 个文件 · \
+                             其它 {files_removed} 个文件）"
+                        ),
+                        json!({
+                            "history_sessions": hist_n,
+                            "event_files": ev_removed,
+                            "other_files": files_removed,
+                        }),
+                    );
+
+                    // ⑤ 历史清空失败要**明确报出来**
+                    //
+                    // 其余几步都是"尽力而为"，唯独历史失败会让用户以为
+                    // 全清干净了、实际旧记录还在。再补一条错误事件。
+                    if let Some(e) = hist_err {
+                        self.events.emit(
+                            kind::CONFIG,
+                            &format!("清空充电历史失败（其余记录已清）：{e}"),
+                            json!({}),
+                        );
+                    }
+                }
             }
         }
 

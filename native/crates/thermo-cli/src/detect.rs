@@ -50,6 +50,34 @@ pub enum ProbeMode {
     Full,
 }
 
+/// `failed_items` 的内部 id → 给用户看的中文名
+///
+/// # ⚠️ 为什么需要一张表
+///
+/// `failed_items` 里存的是 `current_ceiling` 这类**内部 id** ——
+/// 它们会写进 `device.json`，**不得改动**（老档案里存的就是这些字符串）。
+/// 但直接显示给用户等于让他看代码。因此单独一张"给界面用"的对照表。
+///
+/// # ⚠️ 新增 `failed_items.push` 时**必须**在这里补一行
+///
+/// 漏了不会报错 —— 那个项会显示成它自己的 id（如 `new_thing`），
+/// 用户看不懂。这是刻意的兜底：**显示 id 比显示"其它"更有诊断价值**，
+/// 至少能一眼看出是哪一项。
+fn failed_item_label(id: &str) -> &str {
+    match id {
+        "observe_nodes" => "观测节点",
+        "control_nodes" => "控速节点",
+        "soc_nodes" => "充电上限节点",
+        "gear_table" => "档位表",
+        "current_ceiling" => "电流上限",
+        "hardware_max_temp" => "硬件保护温度",
+        "power.max_w" => "充电功率上限",
+        "gear_write_probe" => "档位可写上限",
+        // 未登记的 id 原样显示（见上面的说明）
+        other => other,
+    }
+}
+
 /// 检测选项
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeOptions {
@@ -113,25 +141,29 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
             min: 60,
             max: 100,
         });
-        meta.notes.push(format!(
-            "SOC 上限可用：{}",
-            nodes
-                .soc_ctrl
-                .as_ref()
-                .map(sysfs::Node::path_str)
-                .unwrap_or_default()
-        ));
+        // ⚠️ 文案格式：`名称：短结论`
+        //
+        // 「检测记录」卡片把它拆成左右两列，而用户 2026-10-17 明确要求
+        // **右列要短** —— 长句会让卡片变成一堵文字墙，扫读不了。
+        //
+        // 节点的完整路径不放在这里：它属于**排障细节**，
+        // `ctl status` / `device.json` 的 `nodes` 段里都有。
+        meta.notes.push("SOC 上限：节点可用".to_string());
     } else {
         meta.failed_items.push("soc_nodes".to_string());
         meta.notes
-            .push("未找到可写的 smart_chg 节点，充电上限功能不可用".to_string());
+            .push("SOC 上限：不可用（未找到可写的 smart_chg 节点）".to_string());
     }
 
     // ---------- ④ 档位表（设备树直读，**零副作用**）----------
     log::info!("[4/10] 读取充电档位表…");
     let mut gear_rows: Vec<GearRow> = Vec::new();
     match sysfs::GearTable::detect() {
-        Ok((table, path)) => {
+        // ⚠️ 第二个返回值是档位表路径，**这里不再需要**：
+        //    它原先进 `notes` 文案（"…来源 {path}…"），而那正是
+        //    让「检测记录」右列过长的主因之一（见下方 notes 的说明）。
+        //    路径在 `device show` 与设备档案里都有。
+        Ok((table, _path)) => {
             gear_rows = table
                 .current_limits()
                 .into_iter()
@@ -159,11 +191,9 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
             // 最大功率档位 = 电流上限最大的档
             profile.capabilities.power.max_power_gear = table.max_power_gear();
 
-            meta.notes.push(format!(
-                "档位表：{count} 档（编号 0~{}），可写上限 {count}，来源 {path}（设备树直读，零副作用）",
-                count.saturating_sub(1),
-                count = count,
-            ));
+            // ⚠️ 短结论：档位数 + 来源类型。（完整路径不进界面，见上面的说明）
+            meta.notes
+                .push(format!("档位表：{count} 档（0~{}）· 设备树直读", count - 1));
             if let Some(g) = table.max_power_gear() {
                 meta.notes.push(format!("最大功率档位：{g}"));
             }
@@ -229,11 +259,25 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
         // 界面和 `device show` 都不提示，用户以为检测全部成功 ——
         // 而实际上 `current.max_ua` 用的是兜底常量，不是本机实测值。
         meta.failed_items.push("current_ceiling".to_string());
-        meta.notes.push(
-            "充电中 —— **跳过**电流上限检测（该节点此时反映的是模块自己的写入值，\
-             采信会形成自我循环、逐次压低上限）。拔掉充电器后重跑可得到真实值"
-                .to_string(),
-        );
+        // ⚠️ 这里原先写的是 `**跳过**` —— markdown 的加粗语法。
+        //
+        // `notes` 最终原样渲染到「检测记录」卡片里（`MorePage.vue` 直接
+        // 插入文本，不做 markdown 解析），于是**用户看到的是带星号的原文**：
+        //
+        //     充电中 —— **跳过**电流上限检测（…）
+        //
+        // 后端产出的是**给用户看的文案**，不该混入任何标记语法。
+        // 强调意图用措辞表达（"已跳过"本身已经足够醒目）。
+        //
+        // 并由 `notes里不得出现markdown标记` 测试守住这一类问题。
+        //
+        // ⚠️ 文案格式：`名称：结论 —— 怎么办`
+        //
+        // 「检测记录」卡片按**第一个 `：`** 把每条拆成左右两列
+        // （左列名称、右列结论）。写成"充电中 —— 已跳过电流上限检测…"
+        // 这种整句式会让它退化成一行长文，白占了卡片的宽度。
+        meta.notes
+            .push("电流上限：已跳过（充电中测得不准）—— 拔掉充电器后重跑".to_string());
         profile.capabilities.sources.current_max = ValueSource::Profile;
     } else if let Some(curr) = &nodes.curr {
         match curr.read_i64() {
@@ -295,7 +339,7 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
     } else {
         meta.failed_items.push("hardware_max_temp".to_string());
         meta.notes.push(
-            "硬件保护温度未探测到（设备树属性名因机型而异），使用保守兜底 45℃ —— \
+            "硬件保护温度：未探测到（属性名因机型而异）· 用保守兜底 45℃ —— \
              该项不精确：若本机真实上限低于 45℃，硬保护会偏晚"
                 .to_string(),
         );
@@ -388,27 +432,43 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
             if let Some(v) = candidate_dt {
                 parts.push(format!("设备树 {v}W"));
             }
-            meta.notes.push(format!(
-                "充电功率上限：{w}W（来源：{}；各来源读数：{}）",
-                power_source.label(),
-                parts.join(" / ")
-            ));
+            // 三个来源的逐项读数只记日志 —— 拼进界面会让右列变成一句长文
+            log::info!("[8/10] 功率来源逐项读数：{}", parts.join(" / "));
 
-            // 协商值缺失时提示原因，避免用户以为节点坏了
+            // ✅ **固定数据**：充电功率上限（用户 2026-10-17 确认）
+            //
+            // 它是三个来源**取最大**：
+            //
+            // | 来源 | 性质 |
+            // |---|---|
+            // | 电池型号里的 `_100w` | **固定**（出厂标称） |
+            // | 设备树 `support_pps_100w` | **固定**（支持的协议档位） |
+            // | `charger_common/power_max` | 实时（当前充电头谈成的） |
+            //
+            // 取最大之后通常由**固定来源**决定 ⇒ 它表达的是
+            // "**这台手机**最高能吃多少"，与充电头无关。
+            //
+            // ⚠️ 不要与下面那条"协商值"混为一谈 —— 那个才是实时的。
+            meta.notes
+                .push(format!("充电功率上限：{w}W · 来源{}", power_source.label()));
+
+            // ⚠️ 协商值**刻意不写 notes**（用户 2026-10-17）
+            //
+            // 它是**实时数据**：插这个头是 0，换原装头就是 100W。
+            // 写进"检测档案"会让档案里混一个随地变化的数字 ——
+            // 换 33W 头再跑一次检测，档案就成了 33W，
+            // 用户会以为"我的手机只能充 33W"。
+            //
+            // 它的位置在**状态页三格的「充电头」**（实时显示，本就不该归档）。
             if candidate_node.is_none() {
-                meta.notes.push(
-                    "`charger_common/power_max` 当前为 0（未协商出快充协议）—— \
-                     插原装充电器后重跑可得到协商值"
-                        .to_string(),
-                );
+                log::info!("[8/10] 协商值缺失（未协商出快充协议）—— 属实时数据，不进检测记录");
             }
         }
         None => {
             meta.failed_items.push("power.max_w".to_string());
+            // 这一条是**检测结果**（"这项没测到"），不是实时值 ⇒ 照旧记录
             meta.notes.push(
-                "未能读出充电功率上限（协商值 / 电池型号 / 设备树均无功率信息）—— \
-                 不做功率钳位，用户可自由设置目标功率"
-                    .to_string(),
+                "充电功率上限：未能读出（协商值 / 电池型号 / 设备树均无功率信息）".to_string(),
             );
         }
     }
@@ -437,8 +497,7 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
         match verify_gear_max(&nodes, derived) {
             Ok(max) => {
                 if max == derived {
-                    meta.notes
-                        .push(format!("档位上限 {derived} 已验证可写（写探）"));
+                    meta.notes.push(format!("档位上限：{derived} 已验证可写"));
                 } else {
                     meta.notes.push(format!(
                         "档位上限：推导值 {derived} 写不进去，保守降为 {max}"
@@ -449,15 +508,39 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
             }
             Err(e) => {
                 meta.failed_items.push("gear_write_probe".to_string());
+                // ⚠️ 错误细节**进日志，不进 notes**
+                //
+                // 原先文案是"档位上限验证失败，沿用推导值 {derived}：{e:#}" ——
+                // `{e:#}` 是 anyhow 的**完整因果链**，动辄两三行，
+                // 直接违反"右列要短"这条要求（用户 2026-10-17 反馈）。
+                // 界面只说"失败了"，细节去 logcat 里看。
+                log::warn!("[8/10] 档位上限写探失败（沿用推导值 {derived}）：{e:#}");
                 meta.notes
-                    .push(format!("档位上限验证失败，沿用推导值 {derived}：{e:#}"));
+                    .push(format!("档位上限：验证失败，沿用推导值 {derived}"));
             }
         }
     } else {
+        // 🔴 **快速模式必须也记一条**（2026-10-17 用户发现缺漏）
+        //
+        // 原先这里只写日志 ⇒ 跑完快速检测，「检测记录」里**根本没有
+        // "档位上限"这一项**。用户无法区分：
+        //
+        // | 可能 | 用户看到的 |
+        // |---|---|
+        // | 没测这一项 | （什么都没有） |
+        // | 测了、没问题 | （还是什么都没有） |
+        //
+        // 而同一个检测里，「电流上限」因充电被跳过时是**明确记一条**的
+        // （"电流上限：已跳过（充电中测得不准）"）—— 两处处理不一致。
+        //
+        // ⚠️ 语气是 `skip` 而非 `warn`：不做写探是**设计行为**
+        //    （快速检测的全部价值就是"零副作用"），不是失败。
+        meta.notes
+            .push("档位上限：未做写探（快速检测零副作用）".to_string());
         log::info!("[8/10] 跳过档位上限验证（快速模式或未加 --confirm）");
     }
 
-    // ---------- ⑨ 场景（已移除，见下）----------
+    // ---------- ⑨ 场景（已移除）----------
     //
     // 🔴 2026-10-14 移除「当前场景」这条检测记录
     //
@@ -469,15 +552,44 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
     // |---|---|
     // | 1 | `-1` 是**「未设置」**，而且是本机最常见的值 —— 显示原始值等于没显示 |
     // | 2 | 场景是**运行期值**（随前台应用变化），**不是检测结果** —— 放进检测档案本身位置就不对 |
-    // | 3 | 模块**不依赖**它（状态页那行的原文就是"模块不依赖它，仅作参考"） |
+    // | 3 | 模块**不依赖**它 |
     //
-    // ⇒ 整条删除。用户想了解场景可以看状态页的「系统场景」行，
-    //    那里用的是 `describe_scene`（会显示「未设置」）。
+    // ⇒ 整条删除。
     //
-    // ⚠️ 保留 `nodes.scene` 与 `describe_scene` —— 状态页仍在用。
-    log::info!("[9/10] 跳过场景记录（运行期值，不属于检测结果）");
+    // 🔴 2026-10-17 **连状态页那一行也删了**（用户要求：「只能看，没用处」）。
+    //    当时这里写着"保留 `nodes.scene` 与 `describe_scene` —— 状态页仍在用"，
+    //    现在状态页也不用了，于是 `Nodes.scene` / `SCENE_CANDIDATES` /
+    //    `describe_scene` / `ReadOnlyNode` 全部摘除。
+    //    查证记录见 `sysfs.rs` 里 `Nodes` 那段注释。
+    log::info!("[9/10] 跳过场景记录（该字段已整体移除）");
 
     // ---------- ⑩ 收尾 ----------
+    // ✅ **未成功项单独列一条**（用户 2026-10-17 要求）
+    //
+    // 原先这些只写进 `probe_meta.failed_items`（内部 id 的数组），
+    // 界面上的表现是"这一项干脆不出现" —— 用户无法区分：
+    //
+    // | 可能 | 用户看到的 |
+    // |---|---|
+    // | 没测这一项 | （什么都没有） |
+    // | 测了、没问题 | （还是什么都没有） |
+    //
+    // ⚠️ 必须**翻译成中文**：`failed_items` 里存的是 `current_ceiling`
+    //    这类内部 id，直接显示等于让用户看代码。
+    //
+    // ⚠️ 要**去重**：`current_ceiling` 有 4 个 push 点（充电中跳过、
+    //    节点不可用、读失败…），同一个 id 可能出现多次。
+    if !meta.failed_items.is_empty() {
+        let mut names: Vec<&str> = meta
+            .failed_items
+            .iter()
+            .map(|k| failed_item_label(k))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        meta.notes.push(format!("未成功项：{}", names.join(" / ")));
+    }
+
     log::info!("[10/10] 完成");
     profile.probe_meta = meta;
     // 本机实测结果默认**未验证**（需维护者核对后才作为出厂档案分发）
@@ -1145,5 +1257,63 @@ mod tests {
             "缺字段时默认为 Unknown"
         );
         assert_eq!(caps.power.max_w, Some(100), "其它字段正常读出");
+    }
+
+    /// 🔴 `notes` 是**给用户看的文案**，不得混入 markdown 标记
+    ///
+    /// # 这一起事故（2026-10-17 真机）
+    ///
+    /// `detect.rs` 里有一条写成：
+    ///
+    /// ```text
+    /// 充电中 —— **跳过**电流上限检测（…）
+    /// ```
+    ///
+    /// 而「检测记录」卡片是**直接插入文本**的（不做 markdown 解析），
+    /// 于是用户在手机上看到的是**带星号的原文**：
+    ///
+    /// ```text
+    /// 充电中 —— **跳过**电流上限检测（…）
+    /// ```
+    ///
+    /// # 为什么值得一条测试
+    ///
+    /// 这类问题**编译通过、测试通过、界面不报错** —— 只有肉眼看截图
+    /// 才会发现，而它不影响任何功能，因此极易长期潜伏。
+    ///
+    /// 用源码扫描而不是"检查运行时产出"：`notes` 是十几处
+    /// `push(format!(...))` 拼出来的，运行时抓不全。
+    #[test]
+    fn notes里不得出现markdown标记() {
+        // ⚠️ 必须**切掉测试模块自己**再扫
+        //
+        // 首次实现直接扫整个文件，结果测试**抓到了自己** ——
+        // 下面的断言文案里就写着 `**`（用来解释问题），第 1201 行的
+        // 检测逻辑本身也含 `"\"` + `"**"` 两个字面量。
+        //
+        // ⇒ 扫描范围要划在"生产代码"这一侧。
+        let src = include_str!("detect.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+
+        // 只看**非注释行**：文档注释里大量使用 `**强调**`，那是给
+        // 开发者看的，完全正当。
+        let mut offenders = Vec::new();
+        for (i, line) in prod.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            // `**` 出现在字符串字面量里才可疑
+            if line.contains('"') && line.contains("**") {
+                offenders.push(format!("第 {} 行：{}", i + 1, line.trim()));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "`notes` 的文案里出现了 markdown 的 `**` —— \
+             界面不解析它，用户会看到星号原文：\n{}",
+            offenders.join("\n")
+        );
     }
 }

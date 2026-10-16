@@ -149,9 +149,107 @@ pub fn device_json() -> PathBuf {
     data_dir().join("device.json")
 }
 
+/// 一条会被「清空全部记录」删掉的记录
+///
+/// 把**路径**与**给用户看的名字**绑在一起，是为了让两者不可能不一致 ——
+/// 见 [`clearable_records`] 的文档。
+#[derive(Debug, Clone)]
+pub struct ClearableRecord {
+    /// 文件路径
+    pub path: PathBuf,
+    /// 给用户看的名字（界面确认弹窗里逐条列出）
+    pub label: &'static str,
+}
+
+/// **「清空全部记录」要删的文件**（单一真源）
+///
+/// # 为什么路径与说明绑在一起
+///
+/// 这份清单原先在两处各写一份：
+///
+/// | 位置 | 内容 |
+/// |---|---|
+/// | `engine.rs` | 真正删除的**路径** |
+/// | `commands::RECORDS_SCOPE` | 界面弹窗里展示的**文案** |
+///
+/// 两份迟早会漂移，而漂移的后果是**最坏的一类不一致**：
+/// 弹窗告诉用户"会清 A、B、C"，实际只清了 A、B ——
+/// 用户据此以为清干净了，**而事实不是**。
+///
+/// ⇒ 现在只有一处定义，界面文案由 [`ClearableRecord::label`] 生成。
+///
+/// # ⚠️ 不在这里的东西（刻意的）
+///
+/// | 文件 | 为什么不能清 |
+/// |---|---|
+/// | `config.json` | 用户**全部设置** |
+/// | `device.json` | 设备档案 —— 清了模块进入"未检测不控制"，**完全不管充电**，必须重跑检测才恢复 |
+/// | `presets.json` | 预设模板 |
+/// | `runtime.json` | 运行期状态（进程状态快照） |
+/// | `*.pid` / `*.lock` | **单实例保护** —— 清掉可能让两个 worker 同时跑 |
+/// | `ipc/control.sock` | 控制通道 |
+///
+/// ⚠️ **两样东西刻意不在这张表里**：
+///
+/// | 项 | 处理方式 | 为什么 |
+/// |---|---|---|
+/// | `events.jsonl` | 由 `EventLog::clear()` 清 | 还要一并清**轮转归档**与**内存缓冲**，不是简单删一个文件 |
+/// | `history.json` / 草稿 | 由 `HistoryStore::clear()` 清 | 要**保住正在进行的会话**（用户点清空不是要毁掉此刻这条） |
+pub fn clearable_records() -> Vec<ClearableRecord> {
+    vec![
+        ClearableRecord {
+            path: data_dir().join("thermo-report.txt"),
+            label: "诊断报告",
+        },
+        // 调试模式下产生的数据
+        //
+        // ⚠️ 删它之后写入器**不需要重新初始化**：`debug_log` 每次写都是
+        //    重新 `open(append)`、不持有 fd（与 `EventLog` 同一套纪律），
+        //    所以下一次写入会自动重建文件。未开启调试模式时该文件不存在，
+        //    删它会静默失败 —— 无害。
+        ClearableRecord {
+            path: debug_jsonl(),
+            label: "调试数据（若已开启调试模式）",
+        },
+        ClearableRecord {
+            path: log_dir().join("perf.log"),
+            label: "界面打点日志",
+        },
+        ClearableRecord {
+            path: log_dir().join("service.log"),
+            label: "开机记录",
+        },
+        // 下面两个目前没有写入者（预留路径），一并清掉不留残渣
+        ClearableRecord {
+            path: main_log(),
+            label: "主日志",
+        },
+        ClearableRecord {
+            path: log_dir().join("daemon.out"),
+            label: "守护输出",
+        },
+    ]
+}
+
+/// 调试数据文件（调试模式下才有内容）
+///
+/// ⚠️ 放在子目录 `debug/` 下，与常规记录**物理分开**：
+///    它可能涨到几十 MB，混在数据目录根下会让 `du` 与文件管理器
+///    一眼看不出"是谁占的空间"。
+pub fn debug_jsonl() -> PathBuf {
+    data_dir()
+        .join(crate::debug_log::DIR_NAME)
+        .join(crate::debug_log::FILE_NAME)
+}
+
 /// 确保数据目录结构与权限就绪
 pub fn ensure_dirs() -> std::io::Result<()> {
-    for d in [data_dir(), log_dir(), data_dir().join("ipc")] {
+    for d in [
+        data_dir(),
+        log_dir(),
+        data_dir().join("ipc"),
+        data_dir().join(crate::debug_log::DIR_NAME),
+    ] {
         std::fs::create_dir_all(&d)?;
     }
     #[cfg(unix)]

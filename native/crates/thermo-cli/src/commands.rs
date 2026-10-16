@@ -60,6 +60,20 @@ pub enum Pending {
     /// 为什么保留进行中的：用户点"清空"是清理旧记录，
     /// 不该顺手毁掉他此刻正在观察的这一条。
     HistoryClear,
+    /// **清空全部记录**：事件 + 充电历史 + 诊断报告 + 日志文件
+    ///
+    /// # 为什么需要一个新动作，而不是让 CLI 自己删文件
+    ///
+    /// | 原因 | 说明 |
+    /// |---|---|
+    /// | **事件必须由 worker 清** | 清完要**立刻补记一条"已清空"**，否则用户只看到一片空白，无法确认操作发生过。而事件文件由 worker 独占写入 |
+    /// | 与充电历史共用一套逻辑 | 复用 [`HistoryStore::clear`]，它已处理"草稿被当前会话占用时不删"的边界 |
+    /// | 避免写者竞争 | CLI 直接删文件时，worker 可能正好在写同一批文件 |
+    ///
+    /// ⚠️ **不碰**：`config.json`（用户设置）、`device.json`（设备档案 ——
+    ///    清了会让模块进入"未检测不控制"）、`presets.json`、
+    ///    `*.pid` / `*.lock`（单实例保护）、`ipc/`（控制通道）。
+    RecordsClear,
 }
 
 /// 命令上下文
@@ -182,12 +196,20 @@ pub fn dispatch(ctx: &Ctx<'_>, cmd: &str, args: &Value, stream: bool) -> (Respon
         "logs" => (logs(args), false),
         // ── 充电历史（逐次充电的过程曲线）──
         "history" => (history_cmd(ctx, args), false),
+        // ── 清空全部记录（事件 / 历史 / 报告 / 日志）──
+        //
+        // ⚠️ 命令名叫 `records` 而不是挂到 `data` 下：
+        //    `data clear` 读起来像"清空整个数据目录"（含配置与设备档案），
+        //    而那会造成**模块停止控制**（未检测不控制）—— 歧义太危险。
+        "records" => (records(ctx, args), false),
         // ── 充电上限（附加功能的便捷别名）──
         "limit" => (limit(ctx, args), false),
         // ── 附加功能通用入口 ──
         "addon" => (addon(ctx, args), false),
         // ── 数据 ──
         "data" => (data(args), false),
+        // ── 调试模式（排障用的详细记录）──
+        "debug" => (debug_cmd(ctx, args), false),
         // ── 诊断 ──
         "probe" => (probe(ctx), false),
         "test" => (test(ctx, args), false),
@@ -281,10 +303,10 @@ fn status(ctx: &Ctx<'_>) -> Response {
 
     let battery = match &sample {
         Some(s) => json!({
-            "temp_c": (s.0 as f64) / 10.0,
-            "soc": s.3,
-            "power_w": s.4,
-            "status": s.2,
+            "temp_c": (s.temp_dc as f64) / 10.0,
+            "soc": s.soc,
+            "power_w": s.power_w,
+            "status": s.status,
             // 🔴 **实际**电流（A），与 `control.curr_now`（模块**写入**的值）不同
             //
             // 两者经常对不上 —— 真机实测：
@@ -296,7 +318,17 @@ fn status(ctx: &Ctx<'_>) -> Response {
             //
             // 展示实际值才反映"真正在充多快"；展示写入值只反映"模块的意图"。
             // 界面上两个都要有，用户才能看出系统是否跟随。
-            "current_a": round2(s.1.unsigned_abs() as f64 / 1e6),
+            "current_a": round2(s.curr_ua.unsigned_abs() as f64 / 1e6),
+            // 电池电压（V）
+            //
+            // ⚠️ 这个值**一直在读**（`read_battery` 用它算功率），原先只是
+            //    算完就丢掉。现在一并输出 —— **零额外 I/O** 就补上了一个
+            //    充电三要素（电压/电流/功率）里唯一缺的量。
+            //
+            // 界面上它有用：充电时电压会从 ~3.9V 一路升到 ~4.5V，
+            // 远高于标称 3.87V —— 这是正常的恒流→恒压过程，
+            // 用户看到"电压这么高"时能对着这一行确认没出问题。
+            "voltage_v": round2(s.volt_uv.unsigned_abs() as f64 / 1e6),
         }),
         None => json!({
             "temp_c": 0.0,
@@ -304,6 +336,7 @@ fn status(ctx: &Ctx<'_>) -> Response {
             "power_w": 0.0,
             "status": "Unknown",
             "current_a": null,
+            "voltage_v": null,
         }),
     };
 
@@ -322,19 +355,13 @@ fn status(ctx: &Ctx<'_>) -> Response {
         "weak": src.weak,
     });
 
-    // 系统场景（**只读参考**）
+    // ⚠️ 这里原有「系统场景」的读取与归一化（`nodes.scene` + `describe_scene`），
+    //    已删除（2026-10-17 用户要求：「只能看，没用处」）。
     //
-    // ⚠️ **模块不使用它做任何决策** —— 用户明确要求过
-    //    「不要调整场景模式，只用双写调整功率」。
-    //    这里只是把系统的值透出来给用户看（老项目也没有用它控制）。
-    //
-    // `-1` 归一化为 `"未设置"`：真机上这是最常见的值，
-    // 直接显示 `-1` 对用户毫无意义（见 `sysfs::describe_scene`）。
-    let scene = ctx
-        .nodes
-        .scene
-        .as_ref()
-        .and_then(|n| n.read().ok().map(|raw| crate::sysfs::describe_scene(&raw)));
+    // 删除理由（已查证）：它**从不参与决策**（`engine.rs` / `thermo-core`
+    // 里一次都没出现），也翻译不出模式名 —— 映射表
+    // `/vendor/etc/thermal-map.conf` 是加密的（真机拉取验证）。
+    // 一个永远只能显示裸数字的字段，放在界面上只会制造疑问。
 
     // ⚠️ `abs_max` 取**检测到的硬件保护温度**，不是常量
     //
@@ -357,9 +384,43 @@ fn status(ctx: &Ctx<'_>) -> Response {
         .and_then(|n| n.read_i64().ok())
         .map(tenths_to_celsius);
 
+    // 机身温度（℃；`null` = 本机无此节点或读数不合理）
+    //
+    // ⚠️ 与 `engine::sample` 用**同一个**换算函数 —— 否则状态页显示的
+    //    机身温度会和历史曲线里记的对不上（这类不一致极难察觉）。
+    //
+    // 为什么要显示它：`thermal.sensor = virt` 时，模块**按机身温度收紧**，
+    // 而状态页主卡的大字是**电池温度** —— 两者能差好几度。
+    // 不显示的话，用户会看到"电池才 38℃ 怎么就降速了"。
+    let board_c = ctx
+        .nodes
+        .board_temp
+        .as_ref()
+        .and_then(|n| n.read_i64().ok())
+        .and_then(crate::sysfs::board_temp_to_c)
+        // ⚠️ 必须取整后再进 JSON
+        //
+        // 首次部署漏了这一步，真机直接输出 `27.2000007629395` ——
+        // f32 的十进制展开长尾（见 `observability::round_json` 的文档）。
+        // 界面上就是一个难看且无意义的长数字。
+        //
+        // 项目里 `temp_c` / `cp_die_temp_c` 都走了这一步，这里也不例外。
+        .map(|c| crate::observability::round_json(f64::from(c), 1));
+
     ctx.data(json!({
         "ts": ctx.now_s,
         "state": phase,
+        // 当前生效的**模式**（保守 / 官方 / 极速 / 自定义）
+        //
+        // 用户要求（2026-10-17）：状态页三格要显示"当前控制页面里的充电模式"。
+        //
+        // 同时给 id 与中文标签：
+        //   · `mode` 供程序判断（与 `ctl mode` 的 id 一致）
+        //   · `mode_label` 供界面直接显示 —— 让**后端**负责 id→中文的映射，
+        //     前端不必再维护一份（两处各一份必然有一天不一致，
+        //     而对齐的正是用户在「控制」页看到的那几个词）
+        "mode": ctx.cfg.current_mode(),
+        "mode_label": crate::config_store::mode_label(ctx.cfg.current_mode()),
         "daemon": "running",
         // 🔴 是否已跑过检测 —— 界面**必须**据此提示，不能只靠 `state`
         //
@@ -374,11 +435,8 @@ fn status(ctx: &Ctx<'_>) -> Response {
         "detected": ctx.profile.profile.capabilities.detected,
         "battery": battery,
         "charger": charger,
-        // 系统场景（**只读参考，不参与决策**）
-        //
-        // `null` = 本机无此节点。值为 `-1` 时归一化成"未设置"文案
-        // （见 `sysfs::describe_scene`）。
-        "scene": scene,
+        // ⚠️ 这里原有 `"scene"` 字段，已删除（2026-10-17 用户要求）。
+        //    前端 `types.ts` 的 `StatusView.scene` 与状态页那一行也一并去掉了。
         "control": {
             "gear_now": ctx.state.gear,
             "curr_now": ctx.state.curr_ua,
@@ -392,6 +450,8 @@ fn status(ctx: &Ctx<'_>) -> Response {
             "abs_max": abs_max,
             // 电荷泵芯片温度（℃；null = 本机无此节点）
             "cp_die_temp_c": cp_die,
+            // 机身温度（℃；null = 本机无此节点）
+            "board_temp_c": board_c,
         },
         "session": { "duration_s": ctx.now_s.saturating_sub(ctx.started_at_s).max(0) },
         "uptime_s": ctx.now_s.saturating_sub(ctx.started_at_s).max(0),
@@ -400,12 +460,46 @@ fn status(ctx: &Ctx<'_>) -> Response {
     }))
 }
 
-/// 读电池（返回 `(温度0.1℃, 电流μA, 状态, 电量%, 功率W)`）
+/// 一次电池读数（`ctl status` 用）
 ///
-/// ⚠️ `电流μA` 是**原始带符号值**：本机实测**充电为负、放电为正**
+/// # ⚠️ 为什么是结构体而不是元组
+///
+/// 原先是 `(i64, i64, String, u8, f64)`，消费方靠 `s.0` / `s.3` 取值。
+/// 加进电压与机身温度后就是 7 个字段 —— 而这几项**单位不同、含义相近**：
+///
+/// | 字段 | 单位 |
+/// |---|---|
+/// | 温度 | 0.1℃ |
+/// | 电流 | μA |
+/// | **电压** | **μV** |
+/// | 电量 | % |
+///
+/// 数错一个索引就是**数量级错误**（μV 当 μA 用会差 1000 倍），
+/// 而元组索引没有任何提示。⇒ 字段名承担这份记忆。
+struct BatteryReading {
+    /// 温度（0.1℃）
+    temp_dc: i64,
+    /// 电流（μA，**原始带符号**：本机实测充电为负、放电为正）
+    curr_ua: i64,
+    /// 电压（μV）
+    volt_uv: i64,
+    /// 充电状态原文
+    status: String,
+    /// 电量（%）
+    soc: u8,
+    /// 功率（W，由电流与电压推算）
+    power_w: f64,
+}
+
+/// 读电池
+///
+/// ⚠️ `curr_ua` 是**原始带符号值**：本机实测**充电为负、放电为正**
 /// （如充电 `-10870000`、放电 `253000`）。展示时取绝对值即可
 /// —— 方向由 `status` 字段表达，不需要靠符号。
-fn read_battery(nodes: &Nodes) -> Option<(i64, i64, String, u8, f64)> {
+///
+/// ⚠️ `volt_uv` 原先**读了却丢掉**（只用来算功率）。现在一并返回：
+///    这是"零额外 I/O"就能补上的一个实时读数。
+fn read_battery(nodes: &Nodes) -> Option<BatteryReading> {
     let temp = nodes.battery_temp.as_ref()?.read_i64().ok()?;
     let status = nodes.battery_status.as_ref()?.read().ok()?;
     let curr = nodes
@@ -425,7 +519,14 @@ fn read_battery(nodes: &Nodes) -> Option<(i64, i64, String, u8, f64)> {
         .and_then(|v| u8::try_from(v.clamp(0, 100)).ok())
         .unwrap_or(0);
     let power = (curr.unsigned_abs() as f64) * (volt.unsigned_abs() as f64) / 1e12;
-    Some((temp, curr, status, soc, (power * 100.0).round() / 100.0))
+    Some(BatteryReading {
+        temp_dc: temp,
+        curr_ua: curr,
+        volt_uv: volt,
+        status,
+        soc,
+        power_w: (power * 100.0).round() / 100.0,
+    })
 }
 
 /// `device` —— 设备档案
@@ -924,6 +1025,137 @@ fn history_cmd(ctx: &Ctx<'_>, args: &Value) -> Response {
 
         other => Ctx::err(ErrorCode::Type, format!("未知的 history 子命令：{other}")),
     }
+}
+
+/// `debug` —— 调试模式（记录更详细的排障数据）
+///
+/// 用户要求（2026-10-17）：「在反馈问题中增加一个调试模式按钮，
+/// 如果开启调试模式会记录更详细的数据，方便你抓包分析」。
+///
+/// # 子命令
+///
+/// | 命令 | 作用 |
+/// |---|---|
+/// | `debug on` | 打开（写配置键，worker 下一拍生效） |
+/// | `debug off` | 关闭 |
+/// | `debug status`（默认） | 看当前状态与已记录的大小 |
+///
+/// ⚠️ **只改配置、不直接开写入器**：
+///    写入器是进程内的静态状态，CLI 开了 worker 也看不见。
+///    worker 每拍读配置自行决定（见 `engine::sync_debug_mode`），
+///    这样保持"worker 是唯一写者"的架构纪律。
+fn debug_cmd(ctx: &Ctx<'_>, args: &Value) -> Response {
+    let sub = arg(args, 0).unwrap_or_else(|| "status".to_string());
+    match sub.as_str() {
+        "on" => {
+            ctx.push(Pending::SetKey {
+                key: "debug.enabled".to_string(),
+                value: "true".to_string(),
+            });
+            ctx.data(json!({
+                "enabled": true,
+                "note": "调试模式已开启，下一拍开始记录。\
+                         它会记录每拍决策链、节点原始读写与运行日志 —— \
+                         复现完问题后请记得关掉。",
+            }))
+        }
+        "off" => {
+            ctx.push(Pending::SetKey {
+                key: "debug.enabled".to_string(),
+                value: "false".to_string(),
+            });
+            ctx.data(json!({ "enabled": false, "note": "调试模式已关闭" }))
+        }
+        "status" => {
+            let enabled = ctx.cfg.get_bool("debug.enabled");
+            let max_mb = ctx.cfg.get_i64("debug.max_mb");
+            let path = crate::paths::debug_jsonl();
+            // 大小从文件本身的 metadata 取（快），**不数行数** ——
+            // 数一遍 20 MB 要读整个文件，而界面每 3 秒就会查一次状态。
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            ctx.data(json!({
+                "enabled": enabled,
+                "path": path.display().to_string(),
+                "bytes": bytes,
+                "max_bytes": max_mb.max(0) as u64 * 1024 * 1024,
+                "max_mb": max_mb,
+                "note": if enabled {
+                    "正在记录。复现完问题后记得关掉。"
+                } else {
+                    "未开启。开启后会记录每拍决策链、节点原始读写与运行日志。"
+                },
+            }))
+        }
+        other => Ctx::err(ErrorCode::Type, format!("未知的 debug 子命令：{other}")),
+    }
+}
+
+/// `records` —— **清空全部记录**
+/// 覆盖：最近事件 · 充电历史 · 诊断报告 · 界面打点日志 · 开机记录日志。
+///
+/// ⚠️ **不含**：`config.json`（你的设置）、`device.json`（设备档案 ——
+///    清了模块会进入"未检测不控制"）、进程锁与控制通道。
+///
+/// # 为什么走 `Pending` 而不是在这里直接删
+///
+/// 见 [`Pending::RecordsClear`] 的文档 —— 主要因为**清完要补记一条事件**，
+/// 而事件文件由 worker 独占写入。
+fn records(ctx: &Ctx<'_>, args: &Value) -> Response {
+    let sub = arg(args, 0).unwrap_or_else(|| "clear".to_string());
+    match sub.as_str() {
+        "clear" => {
+            ctx.push(Pending::RecordsClear);
+            ctx.data(json!({
+                "cleared": true,
+                "scope": records_scope(),
+                "kept": RECORDS_KEPT,
+                "note": "已清空全部记录；正在充电的这一次会继续记录。\
+                         配置与设备档案未受影响。",
+            }))
+        }
+        // 只列出会清什么，不真删 —— 供界面在确认弹窗里展示
+        "list" => ctx.data(json!({
+            "scope": records_scope(),
+            "kept": RECORDS_KEPT,
+        })),
+        other => Ctx::err(ErrorCode::Type, format!("未知的 records 子命令：{other}")),
+    }
+}
+
+/// 「清空全部记录」**明确不碰**的东西（给用户看的文案）
+///
+/// 必须比"清什么"更醒目 —— 用户最怕的是"清记录把我的设置也清了"。
+/// 特别是 `device.json`：清掉它模块会**停止控制充电**。
+const RECORDS_KEPT: &[&str] = &[
+    "config.json（你的全部设置）",
+    "device.json（设备档案 —— 清了模块会停止控制充电）",
+    "presets.json（预设模板）",
+];
+
+/// 「清空全部记录」覆盖的范围（给用户看的文案）
+/// # ⚠️ 不在这里硬编码文件清单
+///
+/// 前两项是**特殊处理**的（不是简单删文件，见下方原因），所以写在这里；
+/// **其余全部来自 [`crate::paths::clearable_records`]** —— 与
+/// `engine.rs` 真正删除的那批同源，**结构上不可能不一致**。
+///
+/// 硬编码两份的后果是最坏的一类不一致：弹窗说清了 A、B、C，
+/// 实际只清了 A、B —— 用户据此以为清干净了，而事实不是。
+fn records_scope() -> Vec<String> {
+    let mut scope = vec![
+        // 事件：还要清**轮转归档**（`.1` / `.2`）与内存缓冲，
+        // 不是删一个文件那么简单
+        "最近事件（含轮转归档）".to_string(),
+        // 历史：**刻意保住正在进行的会话** ——
+        // 用户点"清空"是清理旧记录，不该毁掉他此刻正在观察的这一条
+        "充电历史（已完成会话）".to_string(),
+    ];
+    scope.extend(
+        crate::paths::clearable_records()
+            .into_iter()
+            .map(|r| r.label.to_string()),
+    );
+    scope
 }
 
 /// `logs` —— 日志查看
@@ -2125,6 +2357,92 @@ mod tests {
         assert!(
             requires.contains("电池保护") || requires.contains("电池健康保护"),
             "使用前提要点名那个系统开关，实得：{requires}"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────
+    //  「清空全部记录」的安全护栏
+    // ────────────────────────────────────────────────────────────
+
+    /// 🔴 **绝不能**删配置与设备档案
+    ///
+    /// 这两样一旦被清，后果都是用户意料之外的：
+    ///
+    /// | 文件 | 清掉的后果 |
+    /// |---|---|
+    /// | `config.json` | 用户**全部设置**回到出厂（模式、温度阈值、功率上限、充电上限…） |
+    /// | `device.json` | 模块进入「**未检测不控制**」⇒ **完全不管充电**，必须重跑检测才恢复 |
+    ///
+    /// 而"清空记录"这个操作的字面意思，**完全不会让用户预期到这两件事**。
+    /// 所以用测试把它钉死：以后谁往 `clearable_records()` 里加路径，
+    /// 只要碰到这两样就会立刻失败。
+    #[test]
+    fn 清空记录绝不能碰配置与设备档案() {
+        let paths: Vec<String> = crate::paths::clearable_records()
+            .into_iter()
+            .map(|r| r.path.display().to_string())
+            .collect();
+
+        // ⚠️ 用 `contains` 而不是全路径相等 —— 挡住"换个目录放同名文件"
+        for forbidden in [
+            "config.json",
+            "device.json",
+            "presets.json",
+            "runtime.json",
+            "/ipc/",
+            ".pid",
+            ".lock",
+        ] {
+            assert!(
+                !paths.iter().any(|p| p.contains(forbidden)),
+                "「清空全部记录」绝不能包含 `{forbidden}`，实得：{paths:?}"
+            );
+        }
+    }
+
+    /// 界面弹窗展示的清单必须**覆盖**真正要删的每一项
+    ///
+    /// 反过来说：不许出现"弹窗说会清 A，实际没清 A"或"实际清了 B，
+    /// 弹窗没提 B"。后者更危险 —— 用户会以为某项数据还在。
+    #[test]
+    fn 清空记录的界面清单与实删清单一致() {
+        let scope = records_scope();
+        let real = crate::paths::clearable_records();
+
+        // 每一项真删的，都必须在界面清单里有同名条目
+        for rec in &real {
+            assert!(
+                scope.iter().any(|s| s == rec.label),
+                "`{}` 会被真删，但界面清单里没有它 —— \
+                 用户看到的「会清什么」就是假的",
+                rec.label
+            );
+        }
+
+        // 反向：界面清单里除"事件/历史"两条特殊项外，其余都必须真的会被删
+        let labels: Vec<&str> = real.iter().map(|r| r.label).collect();
+        for s in &scope {
+            if s.contains("最近事件") || s.contains("充电历史") {
+                continue; // 这两条走 EventLog / HistoryStore，不在本表
+            }
+            assert!(
+                labels.contains(&s.as_str()),
+                "界面清单里的 `{s}` 不在实删清单里 —— 用户以为清了，实际没清"
+            );
+        }
+    }
+
+    /// 「不碰」的清单里必须**点名** `device.json` 并说明后果
+    ///
+    /// 它是唯一一个"清掉会导致功能静默停止"的文件，光写文件名不够。
+    #[test]
+    fn 不碰清单要点明设备档案的后果() {
+        let kept: String = RECORDS_KEPT.join(" · ");
+        assert!(kept.contains("config.json"), "必须点名配置：{kept}");
+        assert!(kept.contains("device.json"), "必须点名设备档案：{kept}");
+        assert!(
+            kept.contains("停止控制") || kept.contains("重跑检测"),
+            "光写文件名不够 —— 要说明「清了会停止控制充电」这个后果：{kept}"
         );
     }
 }

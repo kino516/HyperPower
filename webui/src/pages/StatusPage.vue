@@ -43,12 +43,73 @@ import {
   isCharging,
   stateLabel,
   stateTone,
+  volts2,
 } from "../format";
-import InfoRow from "../components/InfoRow.vue";
 import { refresh, sysState } from "../stores/sys";
 import type { DeviceProfileView } from "../types";
 
 const st = computed(() => sysState.status);
+
+/**
+ * 「详细读数」的 12 个格子
+ *
+ * # 为什么用数组 + `v-for`，而不是手写 12 个 `<div>`
+ *
+ * 手写时"顺序、标签、单位"三处都要人工对齐，而这份列表**还会继续加项**
+ * （2026-10-17 一次就加了 3 个：电压、机身温度、温度依据）。
+ * 数组把三者绑在同一个对象里，加一项就是加一行。
+ *
+ * # 顺序依据
+ *
+ * 按"用户看这块时的关注顺序"排，而不是按后端字段顺序：
+ * 电流 → 电压 → 档位/功率 → 温度 → 协议 → 运行时长。
+ * 两个电流排最前是因为它们的**差额**最能说明问题
+ * （差得多 = 系统没跟上模块的意图）。
+ *
+ * # ⚠️ 空值一律显示 `—`
+ *
+ * 不显示 `0`。`0` 是**一个有效的读数**（比如没在充电时电流确实接近 0），
+ * 而 `—` 表达"本机没有这个节点 / 读不到"。两者混用会让用户以为
+ * "我的手机电流真的是 0"。
+ */
+const readouts = computed<{ label: string; value: string }[]>(() => {
+  const s = st.value;
+  if (!s) {
+    return [];
+  }
+  const dash = "—";
+  return [
+    {
+      label: "实际电流",
+      value:
+        s.battery.current_a === null
+          ? dash
+          : `${f1(s.battery.current_a)} A`,
+    },
+    { label: "已写电流", value: `${amps1(s.control.curr_now)} A` },
+    {
+      label: "电压",
+      value:
+        s.battery.voltage_v === null ? dash : `${volts2(s.battery.voltage_v)} V`,
+    },
+    { label: "目标功率上限", value: `${f0(s.control.power_limit_w)} W` },
+    // ⚠️ 这里原有「电荷泵温度」，已删除（2026-10-17 用户要求）
+    //
+    // 它与**主卡小字**里的「电荷泵 48.9℃」是**同一个值**。两者都留时
+    // 同一个数字在一屏出现两次 ⇒ 只留主卡那个（它在"电池温度 · 收紧阈值
+    // · 电荷泵"三个数并排的位置上，一起看才能判断"是电池热还是芯片热"）。
+    {
+      label: "机身温度",
+      value:
+        s.thermal.board_temp_c === null
+          ? dash
+          : `${f1(s.thermal.board_temp_c)} ℃`,
+    },
+    // ⚠️ 这里原有「本次收紧峰值」（`thermal.peak_c`），已删除
+    //    （2026-10-17 用户要求）。字段本身仍在 `ctl status` 里。
+    { label: "已运行", value: duration(s.uptime_s) },
+  ];
+});
 
 /**
  * 设备档案（只为拿**设备名**与来源徽标）
@@ -125,13 +186,41 @@ const toneColor = computed(() => {
  * （后端已 filter 成 `null`）。这种情况必须写明"未协商快充" ——
  * 留空或显示 "—" 会让用户以为界面坏了。
  */
-const chargerPowerLabel = computed(() => {
-  const w = st.value?.charger.power_max_w;
-  if (typeof w === "number" && w > 0) {
-    return `充电器 · 最高 ${f0(w)} W`;
+
+/**
+ * 三格第二格「充电头」的值
+ *
+ * 🔴 用户要求（2026-10-17）：
+ *   · 未充电时显示「未充电」，**不要显示 UNKNOWN**
+ *   · 充电时显示当前充电头的**协商功率**
+ *
+ * # 为什么要专门处理"未充电"
+ *
+ * `power_max_w` 只在**插着充电器且协商成功**后才有值，拔掉就是 `null`。
+ * 照实走原来的分支会得到 `—` 或 `UNKNOWN`：
+ *
+ * | 显示 | 问题 |
+ * |---|---|
+ * | `—` | 像界面坏了 |
+ * | `UNKNOWN` | 干脆是英文内部值（用户明确点名不要） |
+ * | **未充电** | ✅ 说清了"为什么没有值" |
+ *
+ * ⚠️ 判据用 [`isCharging`]（`Charging` 或 `Full`）而不是"有没有协商值" ——
+ *    插着充电器但没协商出快充（如电脑 USB 口）时**仍算充电中**，
+ *    那时该显示"未协商"而不是"未充电"。
+ */
+const chargerCellLabel = computed(() => {
+  const s = st.value;
+  if (!s) {
+    return "—";
   }
-  return "充电器 · 未协商快充";
+  if (!isCharging(s.battery.status)) {
+    return "未充电";
+  }
+  const w = s.charger.power_max_w;
+  return typeof w === "number" && w > 0 ? `${f0(w)} W` : "未协商";
 });
+
 </script>
 
 <template>
@@ -243,63 +332,81 @@ const chargerPowerLabel = computed(() => {
         </div>
         <div class="bar__label">
           <MiuixText type="footnote1">电量 {{ f0(socPct) }}%</MiuixText>
-          <MiuixText type="footnote1">{{ f1(st.battery.power_w) }} W</MiuixText>
+          <!--
+            ⚠️ 这里原有 `{{ f1(st.battery.power_w) }} W`（进度条右侧的功率），
+               已删除（2026-10-17）：它与下方三格里的「功率」**是同一个值**，
+               同一个数字在一屏上出现两次没有意义。
+
+               保留三格那个 —— 它是大字、有标签，比挤在进度条旁边更醒目。
+          -->
         </div>
       </MiuixCard>
 
       <!-- ── 三格指标 ── -->
+      <!--
+        🔴 三格的标签与内容（用户 2026-10-17 定）：**功率 / 充电头 / 充电模式**
+
+        | 格 | 值 | 说明 |
+        |---|---|---|
+        | 功率 | `42.7 W` | **实测**充进去多少 |
+        | 充电头 | 未充电时「未充电」，充电时 `33 W` | 当前这个头**谈成**的功率 |
+        | 充电模式 | 保守 / 官方 / 极速 / 自定义 | 模块当前生效的模式 |
+
+        ⚠️ 「充电头」这个名字是刻意选的（原叫「充电器」）：
+        那一格的答案已经**不是"插了什么"而是"能跑多快"**，
+        而「充电器」这个名字会让人以为显示的是设备名。
+        「充电头」是用户口语里的说法，且"未充电 / 33 W"两种内容都读得通。
+
+        ⚠️ 容器类名必须用全局的 `.grid` / `.grid__cell`（定义在 `theme.css`）
+
+        2026-10-17 踩到：详细读数改双列网格时，在本文件的 `<style scoped>`
+        **又定义了一份 `.grid`（2 列）**，把全局的三列覆盖掉 ——
+        三格于是变成两行。而 `check-style-dup.mjs` 只查**同文件内**重复，
+        跨文件（scoped 覆盖全局）抓不到。
+
+        ⇒ 详细读数现在用自己的 `.readouts*`；这里保持 `.grid*` 不动。
+      -->
       <MiuixCard>
-        <div class="grid">
+        <div class="grid grid--center">
           <div class="grid__cell">
-            <MiuixText type="title3">{{ f1(st.battery.power_w) }}</MiuixText>
+            <MiuixText type="title3">{{ f1(st.battery.power_w) }} W</MiuixText>
             <MiuixText type="footnote2" color="var(--m-color-on-surface-secondary)">
-              功率 W
-            </MiuixText>
-          </div>
-          <div class="grid__cell">
-            <MiuixText type="title3">{{ f0(st.battery.soc) }}</MiuixText>
-            <MiuixText type="footnote2" color="var(--m-color-on-surface-secondary)">
-              电量 %
+              功率
             </MiuixText>
           </div>
           <!--
-            第三格原本是「已写电流」，但那对用户价值低 ——
-            它是**模块的动作**，不是**充电的结果**，且与「实际电流」经常对不上。
+            第二格：**充电头**（协商功率）
 
-            换成「充电器」：一眼解释"为什么只有 0.7W"
-            （插电脑 USB 口 = SDP 协议 = 约 0.5A）。
-            已写电流移到下方「详细读数」，排障时仍能看到。
+            🔴 用户要求（2026-10-17）：
+              · 未充电时显示「未充电」，**不要显示 UNKNOWN**
+              · 充电时显示当前充电头的**协商功率**
+
+            为什么要专门处理"未充电"：`power_max_w` 只在**插着充电器协商成功**
+            后才有值，拔掉就是 `null`。照实显示会变成 "—" 或 "UNKNOWN" ——
+            前者像界面坏了，后者干脆是英文内部值（用户明确点名不要）。
           -->
           <div class="grid__cell">
             <MiuixText type="title3" class="grid__charger">
-              {{ st.charger.label ?? "—" }}
+              {{ chargerCellLabel }}
             </MiuixText>
-            <!--
-              充电器格的小字：从固定的「充电器」改成**协商功率**
+            <MiuixText type="footnote2" color="var(--m-color-on-surface-secondary)">
+              充电头
+            </MiuixText>
+          </div>
+          <!--
+            第三格：**充电模式**（用户 2026-10-17 定）
 
-              🔴 用户要求（2026-10-16）：「充电功率上限会检测 3 个数据，
-                 有一个为协商值……将此数值显示在主页」
-
-              三个候选来源（见 `detect.rs` 第 7 步）：
-
-              | 来源 | 节点 | 语义 |
-              |---|---|---|
-              | **协商值** | `charger_common/power_max` | **当前这个充电头**与手机谈成的功率 |
-              | 电池型号 | `battery/model_name` 的 `_100w` | 出厂标称 |
-              | 设备树 | `support_pps_100w` 节点名 | 支持的最高协议档位 |
-
-              「更多」页的「充电功率上限」显示的是**三者取最大**（= 机型能力上限），
-              那个值**不随换充电头变化**。而用户想知道的往往是另一种信息：
-              **"我这个充电头能跑多快"** —— 那就是协商值。
-
-              例：插 33W 头时，机型能力仍是 100W，但协商值是 33W。
-              两者的差值正好解释"为什么插着 33W 头、把上限设到 100W 也没用"。
-            -->
-            <MiuixText
-              type="footnote2"
-              color="var(--m-color-on-surface-secondary)"
-            >
-              {{ chargerPowerLabel }}
+            显示「控制」页里当前生效的那个模式。文案来自后端的
+            `mode_label`（与 `ctl modes` 同一份映射）——
+            前端不再维护一份 id→中文的表，否则两处迟早对不上，
+            而对的正是用户在控制页看到的那几个词。
+          -->
+          <div class="grid__cell">
+            <MiuixText type="title3" class="grid__charger">
+              {{ st.mode_label }}
+            </MiuixText>
+            <MiuixText type="footnote2" color="var(--m-color-on-surface-secondary)">
+              充电模式
             </MiuixText>
           </div>
         </div>
@@ -320,153 +427,26 @@ const chargerPowerLabel = computed(() => {
       <MiuixSmallTitle text="详细读数" />
       <MiuixCard class="rows">
         <!--
-          实际电流 vs 已写电流：**两个都要有**
+          ┌─ 双列网格（用户 2026-10-17 从 6 个方案里选定）──────────────┐
 
-          实测两者经常对不上（系统响应滞后）：
-            | 模块写入 | 实际 |
-            |---|---|
-            | 8 A | 9.06 A |
-            | 8 A | 6.51 A |
+          改前是 10 条 `InfoRow`（每条两行：标题 + 说明），共 **560px**，
+          一屏放不下，而且说明文字大多比标题还长（如"模块写入节点的值
+          （与实际的差额来自系统响应滞后）"），把值挤到了很远的右边。
 
-          只显示写入值 → 用户以为"设了 8A 就是 8A"；
-          只显示实际值 → 排障时看不出模块想让它跑多少。
+          现在每条**一格**：小字标签 + 大数字。一屏看完，数字最醒目，
+          也与上方主卡的「38.6℃」大数字风格呼应。
+
+          ⚠️ **说明文字去哪了**：删掉了。它们要么与标题重复
+          （"实际电流 / 真正在充的电流"），要么在两个电流之间做解释 ——
+          而那一句已经写在主卡下方与 README 里。
+          真需要逐项说明时看 `thermo verify` 的输出（那里的描述更完整）。
         -->
-        <InfoRow
-          title="实际电流"
-          :summary="
-            st.battery.current_a === null ? '本机未上报电流节点' : '真正在充的电流'
-          "
-        >
-          <template #end>
-            <MiuixText type="body2">
-              {{
-                st.battery.current_a === null
-                  ? "—"
-                  : `${f1(st.battery.current_a)} A`
-              }}
-            </MiuixText>
-          </template>
-        </InfoRow>
-
-        <InfoRow title="已写电流" summary="模块写入节点的值（与实际的差额来自系统响应滞后）">
-          <template #end>
-            <MiuixText type="body2">{{ amps1(st.control.curr_now) }} A</MiuixText>
-          </template>
-        </InfoRow>
-
-        <InfoRow title="档位" :summary="'当前写入的限速档'">
-          <template #end>
-            <MiuixText type="body2">{{ f0(st.control.gear_now) }}</MiuixText>
-          </template>
-        </InfoRow>
-
-        <InfoRow title="目标功率上限">
-          <template #end>
-            <MiuixText type="body2">{{ f0(st.control.power_limit_w) }} W</MiuixText>
-          </template>
-        </InfoRow>
-
-        <!--
-          ⚠️ 硬件保护温度**只在已检测时显示**
-
-          它是从本机设备树读出来的（`ffc_temp_high`）。未检测时档案里是
-          兜底值 `45.0` —— 那是**模板默认值，不是本机数据**。
-          照实显示会让用户以为"我的手机保护温度就是 45℃"，
-          而真机可能是 48℃（甚至其它机型是别的值）。
-
-          ⇒ 宁可不显示，也不显示一个"看起来像真的"的假值。
-        -->
-        <InfoRow
-          v-if="st.detected"
-          title="硬件保护温度"
-          :summary="'本机硬件的上限，「收紧温度」不得超过它'"
-        >
-          <template #end>
-            <MiuixText type="body2">{{ f1(st.thermal.abs_max) }} ℃</MiuixText>
-          </template>
-        </InfoRow>
-        <InfoRow
-          v-else
-          title="硬件保护温度"
-          summary="尚未检测本机 —— 该值需从设备树读取"
-        >
-          <template #end>
-            <MiuixText type="body2">—</MiuixText>
-          </template>
-        </InfoRow>
-
-        <InfoRow
-          title="本次收紧峰值"
-          :summary="st.thermal.peak_c === null ? '未处于收紧期' : undefined"
-        >
-          <template #end>
-            <MiuixText type="body2">
-              {{ st.thermal.peak_c === null ? "—" : `${f1(st.thermal.peak_c)} ℃` }}
-            </MiuixText>
-          </template>
-        </InfoRow>
-
-        <InfoRow
-          title="电荷泵温度"
-          :summary="
-            st.thermal.cp_die_temp_c === null
-              ? '本机未上报此节点'
-              : '快充时的真正热点，通常高于电池温度'
-          "
-        >
-          <template #end>
-            <MiuixText type="body2">
-              {{
-                st.thermal.cp_die_temp_c === null
-                  ? "—"
-                  : `${f1(st.thermal.cp_die_temp_c)} ℃`
-              }}
-            </MiuixText>
-          </template>
-        </InfoRow>
-
-        <InfoRow
-          title="充电器协议"
-          :summary="
-            st.charger.power_max_w === null
-              ? '未协商出快充协议'
-              : `协商功率上限 ${st.charger.power_max_w} W`
-          "
-        >
-          <template #end>
-            <MiuixText type="body2">{{ st.charger.label ?? "—" }}</MiuixText>
-          </template>
-        </InfoRow>
-
-        <!--
-          系统场景：**只读参考**
-
-          ⚠️ 必须写明"模块不依赖它" —— 否则用户会以为改场景能影响温控。
-          模块只通过「档位 + 电流」两个节点控制功率（用户明确要求过
-          「不要调整场景模式」）。
-        -->
-        <InfoRow
-          v-if="st.scene !== null"
-          title="系统场景"
-          :summary="
-            st.scene === '未设置'
-              ? '系统未设置场景（常见状态）'
-              : '来自系统热控框架；模块不依赖它，仅作参考'
-          "
-        >
-          <template #end>
-            <MiuixText type="body2">{{ st.scene }}</MiuixText>
-          </template>
-        </InfoRow>
-
-        <InfoRow
-          title="已运行"
-          :summary="`累计 ${f0(st.ticks)} 拍`"
-        >
-          <template #end>
-            <MiuixText type="body2">{{ duration(st.uptime_s) }}</MiuixText>
-          </template>
-        </InfoRow>
+        <div class="readouts">
+          <div v-for="c in readouts" :key="c.label" class="readouts__cell">
+            <div class="readouts__label">{{ c.label }}</div>
+            <div class="readouts__value">{{ c.value }}</div>
+          </div>
+        </div>
       </MiuixCard>
 
       <!-- ── 已交回官方时的醒目提示 ── -->
@@ -481,6 +461,57 @@ const chargerPowerLabel = computed(() => {
 </template>
 
 <style scoped>
+
+/* ── 详细读数：双列网格 ── */
+
+/**
+ * 两列网格，每格「小字标签 + 大数字」
+ *
+ * 用户 2026-10-17 从 6 个方案里选定。改前是 10 条 `InfoRow`（每条两行），
+ * 共 560px 放不下一屏；现在 12 格两列共 6 行，一屏看完。
+ *
+ * ⚠️ `minmax(0, 1fr)` 而不是 `1fr`：CSS Grid 的 `1fr` 默认
+ *    `min-width: auto`，长内容（如 "PD_PPS" 或超大数字）会把列撑破。
+ *    这是 Grid 与 Flex 都有的老坑。
+ */
+.readouts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.readouts__cell {
+  /* 描边而不是填充：填充色会和卡片背景几乎一样（实测 #f3edf7 vs #fef7ff），
+     分组根本看不出来 —— 首版就是这样，三个"分组卡片"糊成一片 */
+  border: 1px solid var(--m-color-outline-variant);
+  border-radius: 12px;
+  padding: 10px 12px 9px;
+  min-width: 0;
+}
+
+.readouts__label {
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--m-color-on-surface-secondary);
+  /* 标签过长时截断而不是换行 —— 换行会让同一行的两格高度不齐 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.readouts__value {
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--m-color-on-surface);
+  margin-top: 2px;
+  /* 等宽数字：读数每拍都在变，比例数字会让整格的宽度跟着抖 */
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ── 功率上限卡片 ── */
 
 .pwr {

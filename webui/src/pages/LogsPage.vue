@@ -44,7 +44,9 @@ import {
   MiuixButton,
   MiuixCard,
   MiuixDialog,
+  MiuixDivider,
   MiuixSmallTitle,
+  MiuixSwitch,
   MiuixText,
   showSnackbar,
 } from "miuix-vue";
@@ -117,16 +119,67 @@ const session = ref<HistorySession | null>(null);
 const sessionLoading = ref(false);
 const sessionError = ref<string | null>(null);
 
-/** 清空历史的确认弹窗 */
+/** 清空**全部记录**的确认弹窗 */
 const confirmClear = ref(false);
 const clearing = ref(false);
+
+/**
+ * 弹窗里展示的「会清什么」/「不碰什么」
+ *
+ * ⚠️ 由后端现查给出（见 [`openClearConfirm`]），不在前端硬编码 ——
+ *    前端写一份的话迟早与真正删除的那批漂移，
+ *    而"弹窗说清了 A、实际只清了 B"会让用户**以为清干净了**。
+ */
+const clearScope = ref<string[]>([]);
+const clearKept = ref<string[]>([]);
 
 const stats = computed<HistoryStats | null>(() => list.value?.stats ?? null);
 const sessions = computed<HistoryListItem[]>(() => list.value?.sessions ?? []);
 const current = computed<HistoryCurrent | null>(() => list.value?.current ?? null);
 
-/** 阈值供模板判断：没有任何可清空的归档 */
-const nothingToClear = computed(() => sessions.value.length === 0);
+/**
+ * 充电历史默认显示的条数
+ *
+ * 🔴 用户要求（2026-10-17）：
+ * 「每次充电的记录只显示最近 3 次，如果需要看更多需要点击更多查看」
+ *
+ * # 为什么是 3 而不是更多
+ *
+ * 每条记录**展开后是一张曲线图**（几十个点 + 两条折线 + 读数条），
+ * 比一条文字事件重得多。一次铺开十几条会让这一页长得没法看，
+ * 而用户真正常看的永远是最新那几次。
+ *
+ * 与「最近事件」的 [`EVENTS_PREVIEW`]（10 条）取不同值是有意的：
+ * 事件是一行文字，历史是一条图 —— **同一个数字套两种粒度并不合适**。
+ */
+const HISTORY_PREVIEW = 3;
+
+/** 是否展开了全部充电记录 */
+const showAllSessions = ref(false);
+
+/**
+ * 实际渲染的记录列表（未展开时只给前 N 条）
+ *
+ * ⚠️ 展开中的那一条如果在折叠区里，`openId` 仍然有效 ——
+ *    收起时不会清掉展开状态，再展开回来曲线还在。
+ *    （不做"收起时自动折叠"是因为那会让用户的手指在图上时突然消失。）
+ */
+const visibleSessions = computed(() =>
+  showAllSessions.value
+    ? sessions.value
+    : sessions.value.slice(0, HISTORY_PREVIEW),
+);
+
+/** 被折叠掉的条数（>0 才显示「更多」按钮） */
+const hiddenSessionCount = computed(() =>
+  Math.max(0, sessions.value.length - HISTORY_PREVIEW),
+);
+
+// ⚠️ 这里原有 `nothingToClear`（"没有可清空的历史"）—— 已删除
+//
+// 它只服务于旧的「清空充电历史」按钮的禁用态。改成「清空全部记录」后
+// **没有"无事可做"的状态了**：即使一次充电记录都没有，事件与日志文件
+// 仍然存在，清空依然有意义。硬留一个永远为 false 的判断只会误导读者。
 
 // ============================================================
 //  数据加载
@@ -163,6 +216,8 @@ async function load(): Promise<void> {
   );
 
   await Promise.all([listP, eventsP]);
+  // 调试状态单独读：它失败不该让整页报错（与事件同一条纪律）
+  await loadDebug();
   loading.value = false;
   perfMark("loaded:logs");
 }
@@ -208,19 +263,32 @@ async function toggle(id: string): Promise<void> {
   }
 }
 
-/** 清空历史（已确认后调用） */
+/**
+ * 清空**全部记录**（已确认后调用）
+ *
+ * 🔴 用户要求（2026-10-17）：「清空充电历史记录好像只能清空历史记录，
+ * 加入更多功能，需要清空所有的临时文件，包括最近事件等等」。
+ *
+ * 覆盖：最近事件 · 充电历史 · 诊断报告 · 界面打点日志 · 开机记录。
+ * **不碰**：配置、设备档案、预设、进程锁、控制通道。
+ *
+ * ⚠️ 清单**由后端给出**（`recordsScope()`），前端只负责显示 ——
+ *    前端自己写一份的话，迟早与真正删除的那批不一致，
+ *    而后果是"弹窗说清了 A，实际只清了 B"，用户却以为清干净了。
+ */
 async function doClear(): Promise<void> {
   if (clearing.value) {
     return;
   }
   clearing.value = true;
   try {
-    await api.clearHistory();
+    await api.clearRecords();
     confirmClear.value = false;
     openId.value = null;
     session.value = null;
+    // 重新拉一次：历史、事件、统计全都变了
     await load();
-    void showSnackbar({ message: "已清空充电历史", duration: "short" });
+    void showSnackbar({ message: "已清空全部记录", duration: "short" });
   } catch (e) {
     void showSnackbar({
       message: `清空失败：${e instanceof Error ? e.message : String(e)}`,
@@ -232,10 +300,119 @@ async function doClear(): Promise<void> {
 }
 
 /**
+ * 打开确认弹窗时**现查**一遍清单
+ *
+ * ⚠️ 不用前端硬编码的文案，也不缓存 —— 后端的清单是唯一真源。
+ *    查不到时弹窗里就不显示清单（而不是显示一份可能过时的）。
+ */
+async function openClearConfirm(): Promise<void> {
+  confirmClear.value = true;
+  try {
+    const r = await api.recordsScope();
+    clearScope.value = Array.isArray(r.scope) ? (r.scope as string[]) : [];
+    clearKept.value = Array.isArray(r.kept) ? (r.kept as string[]) : [];
+  } catch {
+    // 查不到就不显示清单 —— 宁可少说，也不说一份可能不对的
+    clearScope.value = [];
+    clearKept.value = [];
+  }
+}
+
+/**
+ * 写操作之后等待后端落盘的时长（毫秒）
+ *
+ * # 为什么必须有这个等待（与 ControlPage 同一条纪律）
+ *
+ * 后端所有写都是**入队**的：`set` / `debug on` 等命令返回 `ok` 时，
+ * 改动还只是躺在队列里，由 worker 在**本拍结束时**统一应用
+ * （后端 `engine::apply_pending`）。此时立刻回读会读到**旧值** ——
+ * 界面看起来就是"点了没反应"。
+ *
+ * 有客户端在等时 worker 的步进下限是 150 ms，这里留 4 倍余量。
+ */
+const SETTLE_MS = 600;
+
+/** 等一会儿（写操作之后给后端落盘的时间） */
+function wait(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * 调试模式（用户要求 2026-10-17）
+ *
+ * # 为什么状态要**从后端读**而不是本地记
+ *
+ * 开关真正的作用是改配置键 `debug.enabled`，而写入器由 **worker** 打开。
+ * 如果前端只记本地状态，一旦在别处（CLI、另一个页面）改了配置，
+ * 这里显示的就会是错的。所以每次 `load()` 都回读一次。
+ */
+const debugStatus = ref<api.DebugStatus | null>(null);
+const debugBusy = ref(false);
+
+/** 开关的显示值（后端说了算） */
+const debugOn = computed(() => debugStatus.value?.enabled ?? false);
+
+/** 读一次调试状态（失败就保持上一次的值，不打断整页） */
+async function loadDebug(): Promise<void> {
+  try {
+    debugStatus.value = await api.fetchDebugStatus();
+  } catch {
+    // 读不到就不显示 —— 不给用户一个可能过时的开关状态
+  }
+}
+
+/**
+ * 切换调试模式
+ *
+ * ⚠️ `on` 之后要**等一拍**才真的开始记（写入器由 worker 在下一拍打开）——
+ *    这里 sleep 一下再回读，否则用户会看到"开了但显示 0 字节"而以为没生效。
+ */
+async function onToggleDebug(next: boolean): Promise<void> {
+  if (debugBusy.value) {
+    return;
+  }
+  debugBusy.value = true;
+  try {
+    await api.setDebugEnabled(next);
+    await wait(SETTLE_MS);
+    await loadDebug();
+    void showSnackbar({
+      message: next
+        ? "调试模式已开启，现在复现问题即可"
+        : "调试模式已关闭，调试数据保留在数据目录里",
+      duration: "long",
+    });
+  } catch (e) {
+    void showSnackbar({
+      message: `切换失败：${e instanceof Error ? e.message : String(e)}`,
+      duration: "long",
+    });
+    // 失败就回读真实状态，不要停在"看起来切成功了"的假象上
+    await loadDebug();
+  } finally {
+    debugBusy.value = false;
+  }
+}
+
+/** 字节数转人话（界面显示"已记录多少"用） */
+function fmtBytes(n: number): string {
+  if (n < 1024) {
+    return `${n} B`;
+  }
+  if (n < 1024 * 1024) {
+    return `${f1(n / 1024)} KB`;
+  }
+  return `${f1(n / 1024 / 1024)} MB`;
+}
+
+/**
  * 导出诊断日志（反馈问题时用）
  *
  * 报告落在**「下载」目录**（用户能在文件管理器里找到并直接分享），
  * 文件名带时间戳，多次导出不会互相覆盖。
+ *
+ * 若调试模式开着，会**另存**一份 `thermo-debug-*.jsonl` ——
+ * 调试数据有几十 MB，塞进报告本体既发不出去也打不开。
  */
 async function doExport(): Promise<void> {
   if (exporting.value) {
@@ -1044,7 +1221,7 @@ const readout = computed<Readout | null>(() => {
         </div>
 
         <div
-          v-for="s in sessions"
+          v-for="s in visibleSessions"
           v-else
           :key="s.id"
           class="sess"
@@ -1252,6 +1429,18 @@ const readout = computed<Readout | null>(() => {
             </div>
           </div>
         </div>
+
+        <!--
+          「更多」/「收起」—— 与「最近事件」同一套交互
+
+          ⚠️ 只在真的被折叠时才出现（`hiddenSessionCount > 0`）——
+            记录不足 3 条时冒出一个按钮、点下去毫无变化，比不显示更差。
+        -->
+        <div v-if="hiddenSessionCount > 0 || showAllSessions" class="actions">
+          <MiuixButton class="actions__btn" @click="showAllSessions = !showAllSessions">
+            {{ showAllSessions ? "收起" : `更多（还有 ${hiddenSessionCount} 次）` }}
+          </MiuixButton>
+        </div>
       </MiuixCard>
 
       <!-- ── 最近事件 ── -->
@@ -1318,6 +1507,51 @@ const readout = computed<Readout | null>(() => {
           <b>不含</b>账号、WiFi、应用列表等隐私信息。
         </MiuixText>
 
+        <MiuixDivider class="gap" />
+
+        <!--
+          ┌─ 调试模式（用户要求 2026-10-17）──────────────────────────┐
+
+          「在反馈问题中增加一个调试模式按钮，如果开启调试模式会记录
+            更详细的数据，方便你抓包分析。」
+
+          开关放在**导出按钮之前**：正确顺序是先开它、再复现、最后导出。
+          放在后面的话用户容易先导出再看见它，然后白导出一次。
+        -->
+        <div class="row">
+          <div class="row__text">
+            <MiuixText type="body1">调试模式</MiuixText>
+            <MiuixText
+              type="footnote1"
+              color="var(--m-color-on-surface-secondary)"
+            >
+              记录每拍决策过程、节点读写与运行日志 ——
+              复现完问题后请关掉
+            </MiuixText>
+          </div>
+          <MiuixSwitch
+            :model-value="debugOn"
+            :disabled="debugBusy"
+            @update:model-value="onToggleDebug"
+          />
+        </div>
+
+        <!--
+          开启后显示**已记录多少** —— 让用户对"要不要现在导出"有个判断，
+          也顺带证明它真的在记（只显示一个开关，用户没法确认）。
+        -->
+        <MiuixText
+          v-if="debugOn && debugStatus"
+          type="footnote2"
+          color="var(--m-color-on-surface-secondary)"
+          class="hint"
+        >
+          已记录 {{ fmtBytes(debugStatus.bytes) }} /
+          {{ debugStatus.max_mb }} MB（超出后自动丢掉最旧的一半）
+        </MiuixText>
+
+        <MiuixDivider class="gap" />
+
         <div class="actions">
           <MiuixButton
             class="actions__btn"
@@ -1368,7 +1602,8 @@ const readout = computed<Readout | null>(() => {
           color="var(--m-color-on-surface-secondary)"
           class="lead"
         >
-          清空后无法恢复，历史曲线会一起删掉。
+          清空后无法恢复。会清掉最近事件、充电历史、诊断报告与日志文件；
+          <b>不会动你的设置与设备档案</b>。
         </MiuixText>
 
         <!--
@@ -1382,10 +1617,10 @@ const readout = computed<Readout | null>(() => {
         <div class="actions">
           <MiuixButton
             class="actions__btn actions__btn--danger"
-            :disabled="clearing || nothingToClear"
-            @click="confirmClear = true"
+            :disabled="clearing"
+            @click="openClearConfirm"
           >
-            {{ nothingToClear ? "没有可清空的历史" : "清空充电历史" }}
+            清空全部记录
           </MiuixButton>
         </div>
       </MiuixCard>
@@ -1393,11 +1628,42 @@ const readout = computed<Readout | null>(() => {
       <!-- ── 清空确认 ── -->
       <MiuixDialog
         v-model="confirmClear"
-        title="清空充电历史？"
-        summary="只会清空已归档的历史记录；正在充电的这一次会继续记录。清空之后无法恢复。"
+        title="清空全部记录？"
+        summary="清空后无法恢复。正在充电的这一次会继续记录。"
         @close="confirmClear = false"
       >
         <template #default="{ close }">
+          <!--
+            ⚠️ 清单**来自后端**（`records scope`），不在前端硬编码 ——
+               前端写一份迟早与真正删除的那批漂移，
+               而"弹窗说清了 A、实际只清了 B"会让用户**以为清干净了**。
+          -->
+          <div v-if="clearScope.length > 0" class="scope">
+            <MiuixText type="footnote1" class="scope__head">会被清空：</MiuixText>
+            <MiuixText
+              v-for="s in clearScope"
+              :key="s"
+              type="footnote2"
+              color="var(--m-color-on-surface-secondary)"
+              class="scope__item"
+            >
+              · {{ s }}
+            </MiuixText>
+          </div>
+
+          <div v-if="clearKept.length > 0" class="scope scope--kept">
+            <MiuixText type="footnote1" class="scope__head">不受影响：</MiuixText>
+            <MiuixText
+              v-for="s in clearKept"
+              :key="s"
+              type="footnote2"
+              color="var(--m-color-on-surface-secondary)"
+              class="scope__item"
+            >
+              · {{ s }}
+            </MiuixText>
+          </div>
+
           <div class="actions">
             <MiuixButton class="actions__btn" @click="close">取消</MiuixButton>
             <MiuixButton
@@ -1422,6 +1688,41 @@ const readout = computed<Readout | null>(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+/* ── 清空确认弹窗里的清单 ── */
+
+/**
+ * 「会被清空」/「不受影响」两段清单
+ *
+ * ⚠️ 刻意**不用** `.notice`（有色底框）：弹窗里已经有两个按钮块，
+ *    再加两个色块会让这个弹窗变成一堵墙，用户反而不读。
+ *    用纯文字 + 缩进就够 —— 重点是让用户**逐条看得到**，
+ *    而不是把它们框起来（框起来会显得像警告，而"不受影响"那段不是）。
+ */
+.scope {
+  margin: 0 0 10px;
+}
+
+.scope__head {
+  display: block;
+  margin-bottom: 2px;
+}
+
+.scope__item {
+  display: block;
+  padding-left: 8px;
+  line-height: 1.7;
+}
+
+/**
+ * 「不受影响」那段与上面拉开一点距离
+ *
+ * 两段贴在一起时，用户容易把"会被清空"的最后一条
+ * 读成"不受影响"的第一条 —— 这个歧义在**删除确认**里代价很大。
+ */
+.scope--kept {
+  margin-top: 14px;
 }
 
 /* ── 首屏占位 ── */

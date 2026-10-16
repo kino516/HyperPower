@@ -127,18 +127,6 @@ const PATROL_IDLE_S: u64 = 15;
 /// 所以这里可以放心地长。
 const SLEEP_FALLBACK_S: u64 = 300;
 
-/// 休眠相关**事件**的最小间隔（秒）—— 防止客户端轮询把事件流刷爆
-///
-/// 日志（`main.log`）不受此限，每次迁移都记；只有写进
-/// `events.jsonl` 的那条要节流。
-///
-/// 取值理由见主循环里对休眠事件的处理：
-/// WebUI 轮询会让"进入/退出休眠"每 3 秒抖动一次，不节流约 2400 条/小时。
-///
-/// 300 秒与 `SLEEP_FALLBACK_S` 对齐 —— 一个真正空闲的模块
-/// 最多每 5 分钟记一条，既不丢信息也不刷屏。
-const SLEEP_EVENT_MIN_GAP_S: u64 = 300;
-
 /// 附加功能到期时间小于这个值时，缩短主循环等待以准点运行它（秒）
 const ADDON_SOON_S: u32 = 5;
 /// 两拍之间的**最小**间隔（秒）—— 防止 uevent 风暴把主循环变成忙循环
@@ -507,11 +495,29 @@ pub fn run() -> Result<()> {
                 .addons
                 .slot(id)
                 .map_or(id, |s| s.addon().spec().label);
-            events.emit(
-                kind::ADDON,
-                &format!("{label} 探测：{detail}"),
-                serde_json::json!({ "id": id, "supported": supported }),
-            );
+
+            // 🔴 **成功不记事件，失败才记**（用户反馈 2026-10-17）
+            //
+            // 用户问：「每次重启手机都会运行充电上限探测？」
+            //
+            // 答案：是的 —— `probe` 是 worker 启动流程的一环，每次进程启动
+            // 都会跑（**只读，零写入**，成本可忽略）。刻意如此：节点的
+            // 可写性会随系统更新 / 内核状态变化，缓存反而可能误判。
+            //
+            // 但它**每次都记一条事件**，于是每重启一次，"最近事件"里就多一条
+            // 「充电上限 探测：命中 …」—— 而这条信息**界面已经表达了**
+            // （「更多」页与「控制」页都会显示功能是否可用）。
+            // 重复的信息挤占事件流，正是用户前面抱怨的那类噪音。
+            //
+            // ⇒ 成功只记日志（logcat 里查得到）；**失败仍记事件** ——
+            //    那是用户必须知道的（"本机不支持，功能不能用"）。
+            if !supported {
+                events.emit(
+                    kind::ADDON,
+                    &format!("{label} 不可用：{detail}"),
+                    serde_json::json!({ "id": id, "supported": false }),
+                );
+            }
         }
     }
 
@@ -580,6 +586,15 @@ pub fn run() -> Result<()> {
     let mut was_sleeping = false;
     // 上次发"进入深度休眠"事件的时刻（**节流用**，见下）
     let mut last_sleep_event: Option<std::time::Instant> = None;
+    // 本轮休眠的「进入」事件**是否真的记了** —— 用于让进出严格配对
+    //
+    // 🔴 用户反馈（2026-10-17）：「最近时间，有两次退出深度休眠，
+    //    为何没有进入深度休眠？」
+    //
+    // 根因：两个事件原先**各自**判断节流，配对关系被破坏 ——
+    // 「进入」被吞掉的那一轮，「退出」照样会被记下来。
+    // 完整推演与修法见 [`crate::sleep_events::sleep_event_decision`]。
+    let mut sleep_event_open = false;
     // 本轮是否"刚从休眠/启动中醒来"
     //
     // 🔴 **初值必须是 `true`** —— 启动时也要先跑一拍确认充电状态，
@@ -766,49 +781,51 @@ pub fn run() -> Result<()> {
             (wait_s * 1000) as libc::c_int
         };
 
-        // 休眠的进入/退出只在**状态迁移时**记一次
+        // 休眠的进入/退出**成对**记录，并整体节流
         //
-        // # ⚠️ 但事件必须**节流**（真机实测踩到）
+        // 判定本身抽成了纯函数 [`crate::sleep_events::sleep_event_decision`] ——
+        // 那里有完整的推演，包括**为什么不能让两个事件各自判断节流**
+        // （2026-10-17 用户报的那个"有退出没进入"）。
         //
-        // WebUI 每 3 秒轮询一次，而每次 `ctl` 调用都是**新连接**：
+        // ⚠️ 抽出去还有一个原因：worker 整个模块是 `#[cfg(unix)]` 的，
+        //    **在这里写的测试在 Windows 上一个都不会跑**。
+        //    纯逻辑放 `sleep_events` 才真正可测。
         //
-        // ```text
-        // 轮询 → 连上（退出休眠）→ 应答 → 断开（进入休眠）→ 3 秒后轮询 …
-        // ```
-        //
-        // 若每次都记事件，界面开着期间会产出约 **2400 条/小时**的
-        // "进入/退出休眠"噪音，把真正有价值的事件（写入失败、
-        // 状态迁移）挤出 `events.jsonl`，日志 1~2 小时就轮转一次。
-        //
-        // 因此：日志（`main.log`）每次都记，**事件**按
-        // [`SLEEP_EVENT_MIN_GAP_S`] 节流。
-        if sleeping && !was_sleeping {
-            log::info!("未充电且无客户端 —— 进入深度休眠（插电或打开界面即恢复）");
-            let due =
-                last_sleep_event.is_none_or(|t| t.elapsed().as_secs() >= SLEEP_EVENT_MIN_GAP_S);
-            if due {
+        // 日志（`main.log` / logcat）仍每次都记 —— 排障需要完整时序；
+        // 只有写进 `events.jsonl` 的那条要节流。
+        if sleeping != was_sleeping {
+            let (log_enter, rec_enter, rec_exit) = crate::sleep_events::sleep_event_decision(
+                sleeping,
+                was_sleeping,
+                sleep_event_open,
+                last_sleep_event.map(|t| t.elapsed().as_secs()),
+                crate::sleep_events::SLEEP_EVENT_MIN_GAP_S,
+            );
+            if log_enter {
+                log::info!("未充电且无客户端 —— 进入深度休眠（插电或打开界面即恢复）");
+            } else {
+                log::info!("退出深度休眠（充电={charging} 客户端={clients}）");
+            }
+            if rec_enter {
                 events.emit(
                     kind::LIFECYCLE,
                     "进入深度休眠（不跑循环，零 CPU）",
                     serde_json::json!({ "fallback_wake_s": SLEEP_FALLBACK_S }),
                 );
+                // ⚠️ 只有「进入」刷新节流窗口；「退出」**不刷新**
+                //    （否则窗口顺延，下一次真正的「进入」又会被吞掉）
                 last_sleep_event = Some(std::time::Instant::now());
             }
-            was_sleeping = true;
-        } else if !sleeping && was_sleeping {
-            log::info!("退出深度休眠（充电={charging} 客户端={clients}）");
-            // 退出事件同样节流 —— 它与进入是一对，一起节流才对称
-            if last_sleep_event.is_some_and(|t| t.elapsed().as_secs() < SLEEP_EVENT_MIN_GAP_S) {
-                // 刚记过"进入"就立刻"退出" ⇒ 这是轮询抖动，不记
-            } else {
+            if rec_exit {
                 events.emit(
                     kind::LIFECYCLE,
                     "退出深度休眠",
                     serde_json::json!({ "charging": charging, "clients": clients }),
                 );
-                last_sleep_event = Some(std::time::Instant::now());
             }
-            was_sleeping = false;
+            // 只有「进入」会置起配对标记；「退出」一定清掉它
+            sleep_event_open = rec_enter;
+            was_sleeping = sleeping;
         }
 
         // ④ 等待：定时器 / uevent / 控制通道 / 信号

@@ -1013,11 +1013,8 @@ pub fn run_probe(official: bool, json: bool) -> Result<()> {
         }
     }
 
-    // 场景单独一行：它**只读**（类型即保证），因此在输出里也明确标注
-    match &nodes.scene {
-        Some(n) => println!("  {:<12}: {}（只读，仅用于显示）", "场景", n.path_str()),
-        None => println!("  {:<12}: （不可用）", "场景"),
-    }
+    // ⚠️ 这里原有「场景」单独一行（只读节点，标注"仅用于显示"），
+    //    已随该字段一起删除（2026-10-17 用户要求：「只能看，没用处」）。
 
     // ── 候选路径总览（**换机型时最有用的部分**）──
     print_candidate_tables();
@@ -1099,7 +1096,9 @@ fn print_candidate_tables() {
         ("档位表（设备树）", sysfs::GEAR_TABLE_CANDIDATES, false),
         ("电荷泵温度", sysfs::CP_DIE_TEMP_CANDIDATES, false),
         ("硬件保护温度", sysfs::HW_MAX_TEMP_CANDIDATES, false),
-        ("系统场景", sysfs::SCENE_CANDIDATES, false),
+        // ⚠️ 这里原有「系统场景」（`SCENE_CANDIDATES`），已删除
+        //    （2026-10-17 用户要求）。它既不参与决策、又翻译不出模式名，
+        //    留在"换机型排查表"里只是占一行。
     ];
 
     // 先算出**所有**候选路径的最大宽度（而不是写死一个常数）

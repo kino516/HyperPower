@@ -60,53 +60,53 @@ fn with_root(p: &str) -> PathBuf {
     PathBuf::from(format!("{root}/{}", p.trim_start_matches('/')))
 }
 
-/// **只读**节点句柄
+/// 把「机身温度」节点的原始读数换算成 ℃
 ///
-/// # 为什么需要单独一个类型
+/// # 为什么需要兼容两种单位
 ///
-/// [`Node`] 提供 `write` / `write_i64` / `write_and_verify`，因此把它放进
-/// `Nodes` 就等于"允许写"。对**不得写入**的观测节点（当前是场景 `sconfig`），
-/// 那种"允许"是隐患：后人随手补一句 `scene.write(...)` 就会破坏约束，
-/// 而代码审查未必拦得住。
+/// 该节点在不同机型（甚至同机型不同内核）上的单位不一致，实测见过两种：
 ///
-/// 本类型**只暴露读方法** —— 想写也写不了（编译期报错），
-/// 用类型系统替代人工纪律。这与项目既有的隔离风格一致
-/// （另见 `thermo-addons` 不依赖 `thermo-core`）。
+/// | 原始值量级 | 单位 | 换算 |
+/// |---|---|---|
+/// | 数百（如 `386`） | 0.1℃ | ÷10 |
+/// | 数万（如 `38600`） | 0.001℃ | ÷1000 |
 ///
-/// 约束来源：用户 2026-10-13 明确要求「场景模式只作为显示」。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReadOnlyNode {
-    /// 内部仍用 `Node`（复用其读取实现），但**不对外暴露写方法**
-    inner: Node,
+/// 用**量级**判断而不是配置项：这只是一个展示用的参考温度，
+/// 为它引入一个"单位配置"会让用户多一件要懂的事。
+///
+/// # ⚠️ 为什么抽成函数
+///
+/// 原先 `engine.rs` 的采样里写了一份。现在 `ctl status` 也要显示机身温度 ——
+/// 如果各写一份，两处迟早对不上（**同一个温度在状态页和曲线里不一样**，
+/// 而这种不一致极难被发现）。⇒ 单一实现，两个消费方。
+///
+/// 返回 `None` 表示读数不像一个合理温度（超出 0~120℃）——
+/// 宁可不显示，也不显示一个明显错误的数。
+pub fn board_temp_to_c(raw: i64) -> Option<f32> {
+    let c = if raw > 1000 {
+        raw as f32 / 1000.0
+    } else {
+        raw as f32 / 10.0
+    };
+    (0.0..=120.0).contains(&c).then_some(c)
 }
 
-impl ReadOnlyNode {
-    /// 打开只读节点句柄
-    pub fn new(path: impl AsRef<str>) -> Self {
-        Self {
-            inner: Node::new(path),
-        }
-    }
-
-    /// 路径字符串（供展示与日志）
-    pub fn path_str(&self) -> String {
-        self.inner.path_str()
-    }
-
-    /// 读取（先 `seek(0)` 再读）
-    pub fn read(&self) -> Result<String> {
-        self.inner.read()
-    }
-
-    /// 读取整数
-    ///
-    /// 目前仅有测试使用（展示场景时读的是原文），保留以便将来需要
-    /// 把某个只读节点当数值处理。
-    #[cfg(test)]
-    pub fn read_i64(&self) -> Result<i64> {
-        self.inner.read_i64()
-    }
-}
+// ⚠️ 这里原有 `ReadOnlyNode` 类型（一个"编译期无法写入"的只读节点句柄），
+//    已随「系统场景」一起删除（2026-10-17 用户要求）。
+//
+// # 它当年为什么存在
+//
+// 用户 2026-10-13 要求「场景模式只作为显示」，因此 `Nodes.scene` 被做成
+// `ReadOnlyNode` —— 用**类型系统**保证后人无法误写（`Node` 带 `write`，
+// 直接放进去就等于"允许写"）。
+//
+// # 为什么现在可以删
+//
+// 2026-10-17 用户判断该字段「只能看、没用处」，于是整条链路摘除：
+// 既然是**唯一**的只读节点，约束的对象没了，这个类型也就没有存在意义。
+//
+// ⚠️ 将来若再出现"必须只读"的节点，**把这个类型照原样加回来** ——
+//    那时的做法（类型而非人工纪律）是对的，不要退化成写注释提醒。
 
 /// 单个 sysfs 节点的句柄
 ///
@@ -176,10 +176,37 @@ impl Node {
         f.seek(SeekFrom::Start(0)).ok();
 
         // 不用 BufWriter：必须确保整值一次写入
-        f.write_all(value.as_bytes())
-            .with_context(|| format!("写入失败: {} <- {value:?}", self.path.display()))?;
-        f.flush().ok();
-        Ok(())
+        let r = f
+            .write_all(value.as_bytes())
+            .with_context(|| format!("写入失败: {} <- {value:?}", self.path.display()));
+        if r.is_ok() {
+            f.flush().ok();
+        }
+
+        // 调试模式：记下**节点的原始写入值**
+        //
+        // 用户要求（2026-10-17）：「节点原始读写值（含系统覆盖）」。
+        //
+        // ⚠️ 记在**这一层**是刻意的 —— `Node::write` 是所有节点写入的
+        //    唯一入口（`write_i64` / `apply_dual` / `release_control` …
+        //    最终都走这里）。记在上层的话，每新增一种写入路径就要
+        //    跟着补一处，迟早漏掉某条。
+        //
+        // ⚠️ 只在**失败或开启调试模式**时才构造 JSON —— 这是每拍都会走的
+        //    热路径，不能为了"没开调试也拼一遍字符串"而白付开销。
+        if r.is_err() || crate::debug_log::is_enabled() {
+            crate::debug_log::write(
+                "node",
+                serde_json::json!({
+                    "op": "write",
+                    "path": self.path.display().to_string(),
+                    "value": value,
+                    "ok": r.is_ok(),
+                    "err": r.as_ref().err().map(|e| format!("{e:#}")),
+                }),
+            );
+        }
+        r
     }
 
     /// 写入整数
@@ -190,9 +217,28 @@ impl Node {
     /// 写入后回读校验
     ///
     /// 返回 `Ok(true)` 表示一致；`Ok(false)` 表示写入未生效。
+    ///
+    /// ⚠️ 调试模式下会把**回读到的原始值**也记一条 ——
+    ///    这是"**系统覆盖**"最直接的证据：我们写了 X，回读却是 Y。
+    ///    温控侧与充电上限侧都会遇到（前者是官方热控改写档位，
+    ///    后者是系统的电池保护组件写回 80%）。
     pub fn write_and_verify(&self, value: &str) -> Result<bool> {
         self.write(value)?;
-        Ok(self.read()? == value)
+        let back = self.read()?;
+        let ok = back == value;
+        if !ok || crate::debug_log::is_enabled() {
+            crate::debug_log::write(
+                "node",
+                serde_json::json!({
+                    "op": "verify",
+                    "path": self.path.display().to_string(),
+                    "wrote": value,
+                    "read_back": back,
+                    "ok": ok,
+                }),
+            );
+        }
+        Ok(ok)
     }
 
     /// 是否存在
@@ -477,22 +523,27 @@ pub struct Nodes {
     /// 是否要把它纳入保护判据（例如"芯片过热则降流"）需要单独论证 ——
     /// 不能因为"能读到"就贸然拿它去切断充电。
     pub cp_die_temp: Option<Node>,
-    /// 场景模式（`sconfig`）—— **只读，仅用于显示**
-    ///
-    /// # 🔴 硬性约束：本模块**永不写入**场景节点
-    ///
-    /// 用户明确要求（2026-10-13）：**"场景模式只作为显示，只用双写调整功率"**。
-    ///
-    /// | 项 | 做法 |
-    /// |---|---|
-    /// | 读 | ✅ 允许（`probe` / `device show` 里展示，`detect` 记入备注） |
-    /// | 写 | ❌ **禁止** —— 类型为 [`ReadOnlyNode`]，**编译期**就没有写方法 |
-    /// | 参与决策 | ❌ **禁止** —— 内核的 `Sample` 里根本没有这个字段，架构上已隔离 |
-    ///
-    /// 背景：老项目 `ThermoCharge` 曾监测场景变化并"强制写回"，实测**无效**
-    /// （写回会被系统覆盖，且场景本就不是控制充电功率的正当手段）。
-    /// 本模块不沿用该做法：调整功率**只经"双写"**（档位 + 电流）。
-    pub scene: Option<ReadOnlyNode>,
+    // ⚠️ 这里原有 `pub scene: Option<ReadOnlyNode>`（系统场景 `sconfig`），
+    //    已删除（2026-10-17 用户要求：「只能看，没用处」）。
+    //
+    // # 删除前的完整账目（确认过它确实"没用"）
+    //
+    // | 项 | 结论 |
+    // |---|---|
+    // | 参与决策 | ❌ **从来没有** —— `engine.rs` 与 `thermo-core` 里一次都没出现 |
+    // | 被写入 | ❌ 从来没有（`ReadOnlyNode` 在编译期就没有写方法） |
+    // | 用户可见处 | 只有 3 处：`thermo nodes` 打印、`verify` 的候选路径总表、状态页一行 |
+    // | 翻译成模式名 | 🔴 **做不到** —— 映射表 `/vendor/etc/thermal-map.conf` 是加密的（真机拉取验证：4032 字节二进制），系统属性 / logcat / 其它节点都没有场景名 |
+    //
+    // ⇒ 一个"不参与决策、写不了、连名字都翻译不出来"的数字，
+    //    放在用户面前只会引起"这是什么？要紧吗？"的疑问。
+    //
+    // # ⚠️ 但有一条约束必须留下来
+    //
+    // 用户 2026-10-13 的要求是「**不要调整场景模式，只用双写调整功率**」——
+    // 删掉字段让这条约束**更容易**满足了（连读都读不到，自然写不了）。
+    // 老项目 `ThermoCharge` 曾监测场景变化并"强制写回"，实测**无效**
+    // （写回会被系统覆盖）。**将来也不要加回来做控制。**
     /// 档位表（设备树，只读）
     pub gear_table: Option<Node>,
 }
@@ -587,19 +638,8 @@ impl Nodes {
             .collect();
         let board_temp = pick_existing(&board_cands);
 
-        // ── 场景（**只读**，仅用于显示）──
-        //
-        // ⚠️ 构造为 `ReadOnlyNode`：类型上就没有写方法，后人无法误改。
-        //
-        // ⚠️ 用**候选表**而不是单一写死路径 —— 与其它节点一致。
-        //    初版只写了本机命中那一条路径，换机型就探测不到（显示"不可用"）。
-        let scene = pick_existing(
-            &SCENE_CANDIDATES
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect::<Vec<_>>(),
-        )
-        .map(|n| ReadOnlyNode::new(n.path_str()));
+        // ⚠️ 这里原有「场景」节点的探测（用 `SCENE_CANDIDATES` 找 `sconfig`），
+        //    已随字段一起删除（2026-10-17）。理由见 `Nodes` 里那段注释。
 
         let gear_table = pick_existing(
             &GEAR_TABLE_CANDIDATES
@@ -630,7 +670,6 @@ impl Nodes {
             battery_capacity,
             board_temp,
             cp_die_temp,
-            scene,
             gear_table,
         }
     }
@@ -937,48 +976,25 @@ impl GearTable {
     }
 }
 
-// ============================================================
-//  场景节点（**只读**，仅显示）
-// ============================================================
-
-/// 场景节点的候选路径（**顺序即优先级**）
-///
-/// # ⚠️ 这个节点与"控制"无关，只是给用户看的
-///
-/// 用户明确要求「**不要调整场景模式**，只用双写调整功率」（2026-07 定）。
-/// 因此 `Nodes.scene` 的类型是 [`ReadOnlyNode`] —— **编译期**就没有写方法。
-///
-/// # 值的含义
-///
-/// 由小米热控框架写入，`-1` 表示**未设置场景**（真机常见）。
-/// 非负值对应框架里的场景编号，但**具体编号含义没有公开文档**，
-/// 因此界面**照实显示原始值**，不做翻译 —— 猜错比不显示更糟。
-pub const SCENE_CANDIDATES: &[&str] = &[
-    // 本机（K90PM）命中
-    "/sys/class/thermal/thermal_message/sconfig",
-    // 他机型的可能位置
-    "/sys/class/thermal/thermal_message/scene",
-    "/sys/class/xm_power/charger/scene",
-    "/sys/class/xm_power/scene",
-];
-
-/// 场景值的显示文本
-///
-/// | 原值 | 显示 | 理由 |
-/// |---|---|---|
-/// | `-1` | `未设置` | `-1` 对用户毫无意义，且它是**最常见**的值 |
-/// | 其它整数 | 原样（如 `3`） | **不翻译** —— 编号含义无公开文档，猜错会误导 |
-/// | 空 / 读不到 | `未知` | — |
-pub fn describe_scene(raw: &str) -> String {
-    let t = raw.trim();
-    if t.is_empty() {
-        return "未知".to_string();
-    }
-    if t == "-1" {
-        return "未设置".to_string();
-    }
-    t.to_string()
-}
+// ⚠️ 这里原有「场景节点」整节（`SCENE_CANDIDATES` + `describe_scene`），
+//    已删除（2026-10-17 用户要求：「只能看，没用处」）。
+//
+// 当年那段注释里其实已经写明了它的**死穴**：
+//
+// > 非负值对应框架里的场景编号，但**具体编号含义没有公开文档**，
+// > 因此界面照实显示原始值，不做翻译 —— 猜错比不显示更糟。
+//
+// 2026-10-17 进一步查证确认「翻译不出来」不是暂时的：
+//
+// | 来源 | 结果 |
+// |---|---|
+// | `/vendor/etc/thermal-map.conf` | 🔴 **加密**（真机拉取：4032 字节二进制） |
+// | `/vendor/etc/thermal-engine.conf` | 空文件（"File empty by default"） |
+// | `getprop` 全部属性 | 无场景名 |
+// | logcat（`mi_thermald` / `thermal-hal` 均在运行） | 不打印场景名 |
+// | 社区（XDA / MiuiVariableThermal 等） | 无权威映射表 |
+//
+// ⇒ 一个**永远只能显示裸数字**的值，放在状态页确实只会制造疑问。
 
 // ============================================================
 //  官方温控策略表（`decrypt.txt` 直读）
@@ -2044,32 +2060,15 @@ algo_type\tmonitor
     }
 
     // ────────────────────────────────────────────────────────────
-    //  场景节点：**编译期**只读保证
+    //  ⚠️ 这里原有 `场景节点类型上没有写方法` 测试
     //
-    //  用户要求「场景模式只作为显示，不要调整场景模式，只用双写调整功率」。
-    //  下面的注释不是"说明"，而是**编译期断言** —— 一旦有人给 ReadOnlyNode
-    //  加上写方法，这段代码就会编译失败（不是运行期才发现）。
+    //  它用**函数指针断言**证明 `ReadOnlyNode` 只有读方法、没有写方法
+    //  （一旦有人加上 `write`，那段代码就编译失败 —— 不是运行期才发现）。
+    //
+    //  2026-10-17 随「系统场景」一起删除：`ReadOnlyNode` 的唯一使用者
+    //  就是那个只读的 `sconfig`，字段没了，类型也没了，约束的对象不存在。
+    //
+    //  ⇒ 将来若再加"必须只读"的节点，把类型与这个测试**照原样**加回来。
+    //    "用类型系统替代人工纪律"这个做法本身是对的，只是此刻没有对象。
     // ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn 场景节点类型上没有写方法() {
-        let n = ReadOnlyNode::new("/sys/class/thermal/thermal_message/sconfig");
-
-        // ✅ 允许的操作：读（函数指针断言保证这些方法确实存在）
-        let _: fn(&ReadOnlyNode) -> anyhow::Result<String> = ReadOnlyNode::read;
-        let _: fn(&ReadOnlyNode) -> anyhow::Result<i64> = ReadOnlyNode::read_i64;
-        let _: fn(&ReadOnlyNode) -> String = ReadOnlyNode::path_str;
-
-        // ❌ 下面这些**故意**注释掉：它们是编译错误的证明。
-        //    若要"启用"任何一行，必须先推翻"场景只读"这条约束。
-        //
-        //     n.write("0");
-        //     n.write_i64(1);
-        //     n.write_and_verify("1");
-        //
-        //     error[E0599]: no method named `write` found for struct `ReadOnlyNode`
-
-        // 运行时行为：路径与普通节点一致
-        assert!(n.path_str().ends_with("thermal_message/sconfig"));
-    }
 }

@@ -72,16 +72,14 @@ import { computed, onMounted, ref } from "vue";
 import {
   MiuixButton,
   MiuixCard,
-  MiuixDialog,
-  MiuixDivider,
   MiuixSmallTitle,
+  MiuixSwitch,
   MiuixText,
   showSnackbar,
 } from "miuix-vue";
 
 import * as api from "../api";
-import InfoRow from "../components/InfoRow.vue";
-import { amps1, f0, f1 } from "../format";
+import { batteryCapacityMah, f0, f1 } from "../format";
 import { perfMark } from "../perf";
 import { failedLabel } from "../types";
 import type { DeviceProfileView } from "../types";
@@ -94,7 +92,13 @@ const loading = ref(true);
 const probing = ref(false);
 
 /** 完整检测的确认弹窗 */
-const confirmFull = ref(false);
+/**
+ * 「同时验证档位可写上限」的勾选状态
+ *
+ * 勾上 = 完整检测（含写探，会短暂改变充电功率）；
+ * 不勾 = 快速检测（全程只读，零副作用）。
+ */
+const verifyGear = ref(false);
 
 /**
  * ⚠️ 这里原有「界面性能（诊断）」卡的三个成员：
@@ -132,9 +136,77 @@ const confirmFull = ref(false);
  *
  * 「设备名」搬去了状态页（用 `fetchDeviceCached()`，那边自己取）。
  */
-const caps = computed(() => device.value?.capabilities);
 const battery = computed(() => device.value?.battery);
 const notes = computed(() => device.value?.probe_meta.notes ?? []);
+
+/**
+ * 「检测记录」的一行
+ *
+ * 由 [`parseNote`] 从后端给的**一整句**里拆出来。
+ */
+interface NoteRow {
+  /** 左列名称；空串表示这条没有「名称：结论」结构，整句走右列 */
+  name: string;
+  /** 右列结论 */
+  brief: string;
+  /** 语气：决定徽标与颜色 */
+  tone: "ok" | "skip" | "warn";
+}
+
+/**
+ * 把后端的一句 `notes` 拆成「名称 + 结论 + 语气」
+ *
+ * # ⚠️ 这一步是**前端猜的**
+ *
+ * 后端目前给的是**纯字符串数组**（`probe_meta.notes`），没有结构信息。
+ * 理想做法是后端直接给 `{name, brief, tone}` —— 那时这里的全部逻辑
+ * 都可以删掉，界面也不会因为后端改一句措辞就退化。
+ *
+ * 之所以先这么办：改 `probe_meta` 的结构会影响 `device.json` 的**双向
+ * 兼容**（新档案在旧版本模块上读不出 ⇒ 档案失效 ⇒ 停止控制充电），
+ * 代价比"前端多猜一层"大得多。
+ *
+ * # 拆法
+ *
+ * | 输入 | 结果 |
+ * |---|---|
+ * | `档位表：15 档（…）` | name=`档位表`，brief=其余 |
+ * | `硬件保护温度未探测到（…）` | name=空，brief=整句（右列占满） |
+ *
+ * 只认**第一个** `：`：像 `充电功率上限：100W（来源：电池型号…）` 这种
+ * 内层还有冒号的，右侧保留完整内容。
+ *
+ * # 语气判据
+ *
+ * 用关键词而不是"看有没有 failed_items" —— 后者只覆盖"检测失败"，
+ * 而"充电中跳过了电流上限"这类**主动跳过**并不在 failed_items 的语义里。
+ * 关键词会随文案变化失效，但**失效的后果只是徽标颜色不对**，
+ * 不会影响任何功能。
+ */
+function parseNote(raw: string): NoteRow {
+  const text = raw.trim();
+  let tone: NoteRow["tone"] = "ok";
+  if (text.includes("跳过") || text.includes("已跳过")) {
+    tone = "skip";
+  } else if (
+    text.includes("未探测到") ||
+    text.includes("未能读出") ||
+    text.includes("不可用") ||
+    text.includes("失败")
+  ) {
+    tone = "warn";
+  }
+
+  const i = text.indexOf("：");
+  // 名称过长就不是名称了（多半是整句里恰好有个冒号）
+  if (i > 0 && i <= 12) {
+    return { name: text.slice(0, i), brief: text.slice(i + 1), tone };
+  }
+  return { name: "", brief: text, tone };
+}
+
+/** 渲染用的行（后端每次检测只产出一次，这里缓存住避免模板里反复解析） */
+const noteRows = computed<NoteRow[]>(() => notes.value.map(parseNote));
 
 /** 检测时间（Unix 秒 → 本地时间） */
 const probedAt = computed(() => {
@@ -182,15 +254,25 @@ onMounted(() => {
  * @param quick 快速模式（零副作用）
  * @param confirm 完整模式需要显式确认（含写探）
  */
-async function probe(quick: boolean, confirm = false): Promise<void> {
+async function probe(): Promise<void> {
   if (probing.value) {
     return;
   }
   probing.value = true;
-  confirmFull.value = false;
+  // 勾选 = 用户已经确认过写探会改功率 ⇒ 不再弹二次对话框
+  const full = verifyGear.value;
 
   try {
-    const r = await api.probeDevice({ quick, save: true, confirm });
+    const r = await api.probeDevice({
+      quick: !full,
+      save: true,
+      confirm: full,
+    });
+    // ⚠️ 跑完**自动取消勾选**
+    //
+    // 它跑一次就够（见模板里的说明）。留着的话，用户下次点「重新检测」
+    // 会**再次**扰动一次充电功率 —— 而他多半已经忘了自己勾过。
+    verifyGear.value = false;
     // 用检测结果直接刷新界面（省一次往返）
     device.value = r.profile;
 
@@ -275,17 +357,44 @@ async function probe(quick: boolean, confirm = false): Promise<void> {
           class="actions__btn"
           type="primary"
           :disabled="probing"
-          @click="probe(true)"
+          @click="probe()"
         >
           {{ probing ? "检测中…" : "重新检测" }}
         </MiuixButton>
-        <MiuixButton
-          class="actions__btn"
-          :disabled="probing"
-          @click="confirmFull = true"
-        >
-          完整检测
-        </MiuixButton>
+      </div>
+
+      <!--
+        ┌─ 档位上限验证（可选，默认关）──────────────────────────────┐
+
+        🔴 用户 2026-10-17 要求：「重新检测与完整检测有什么不同？
+           可以去掉只保留一个按钮吗」
+
+        两者的差别**只有一项**：档位可写上限的**写探** ——
+        其余（机型/电池/节点探测/档位表/电流上限/硬件温度/功率上限）
+        **逐项相同**。
+
+        因此把"完整检测"从**第二个按钮**降级成这个复选框：
+        主操作只有一个，而能力一个没少。
+
+        ⚠️ 为什么默认**关闭**：写探会试写档位节点 ⇒
+           **充电功率会短暂变化**。默认勾上等于每次重跑都扰动一次充电。
+
+        ⚠️ 为什么它**跑一次就够**：验证的是「档位表的推导上限是否真的
+           可写」，而推导依据是**设备树里的档位表** —— 设备树不变 ⇒
+           推导值不变 ⇒ 驱动接不接受也不变。
+           之后每次重跑都是白跑，还会白白扰动一次功率。
+
+        ⚠️ 勾选本身就是**确认**，因此不再弹二次确认对话框
+           （原来那个 `confirmFull` 对话框已删）。
+      -->
+      <div class="row probe__opt">
+        <div class="row__text">
+          <MiuixText type="body2">同时验证档位可写上限</MiuixText>
+          <MiuixText type="footnote2" color="var(--m-color-on-surface-secondary)">
+            会短暂改变充电功率；跑一次就够，之后不必再勾
+          </MiuixText>
+        </div>
+        <MiuixSwitch v-model="verifyGear" :disabled="probing" />
       </div>
 
       <MiuixText
@@ -325,109 +434,107 @@ async function probe(quick: boolean, confirm = false): Promise<void> {
 
     <!-- ── 电池 ── -->
     <MiuixSmallTitle text="电池" />
-    <MiuixCard class="rows">
-      <InfoRow title="型号" summary="标称功率即从此型号读出">
-        <template #end>
-          <MiuixText type="footnote2" class="mono">
-            {{ battery?.model_name || "—" }}
+    <MiuixCard>
+      <!--
+        🔴 用户要求（2026-10-17）：
+          「电池模块的信息优化显示效果」→「放到一列内」
+          →「**不要显示三行，放到一行内**」
+
+        最终形态：**横向一行三格**（与状态页的三格一致）。
+
+        | 改动 | 原因 |
+        |---|---|
+        | 三行 `InfoRow` → **一行三格**（`.grid`） | 用户明确要求；也与状态页的三格视觉统一 |
+        | 「型号」→「**容量**」 | 型号 `P11U_7560mah_100w` 是内部编码，用户读不懂；而它里面正好含容量 |
+        | 删「材质」 | `Li-poly` 没有可操作价值 |
+
+        ⚠️ 用全局的 `.grid` / `.grid--center`（定义在 `theme.css`）。
+        本页**不要**再 scoped 重定义 —— 那正是 2026-10-17
+        「状态页三格变两行」的事故原因。
+      -->
+      <!--
+        ⚠️ 这三项是**检测（归档）**数据，不是实时读取
+        —— 这是用户 2026-10-17 明确确认的设计，不是缺陷。
+
+        | | |
+        |---|---|
+        | 读取时机 | 检测的第 2 步（`[2/10] 读取电池信息`），整个检测只读一次 |
+        | 存在哪 | `device.json` 的 `battery` 段 |
+        | 界面读哪 | `device.value?.battery`（档案，不是现场采样） |
+        | 怎么更新 | 用户**手动跑一次检测** |
+
+        # 为什么不做成实时
+
+        三项的**变化速度差两个数量级**：
+
+        | 项 | 来源 | 变化 |
+        |---|---|---|
+        | 容量 | `charge_full_design` | **永不变**（出厂值） |
+        | 健康度 | `charge_full ÷ design` | 月级 |
+        | 循环次数 | `cycle_count` | **每次充放电 +1** |
+
+        循环次数确实"每天都在变"，所以曾考虑单独开一条实时读取的路
+        （新增轻量命令，打开本页时读一次）。**用户决定不做** ——
+        理由是"更新电池信息我手动运行一次检测就行"。
+
+        ⇒ 因此下面的「上次检测：xx:xx」那行小字**同时**承担了
+          "这三项有多新"的提示职责。**不要删它**。
+
+        # 将来若要改
+
+        先注意 `charge_full`（满电容量）**在充电中读可能不准** ——
+        与「电流上限」同一个道理（那时节点反映的是当前充电状态，
+        而非标称值）。要改的话须先用真机在各充电状态下验证读数。
+      -->
+      <div class="grid grid--center">
+        <div class="grid__cell">
+          <MiuixText type="title3">
+            {{ batteryCapacityMah(battery?.model_name) }}
           </MiuixText>
-        </template>
-      </InfoRow>
-      <InfoRow title="健康度">
-        <template #end>
-          <MiuixText type="body2">{{ f1(battery?.health_percent) }}%</MiuixText>
-        </template>
-      </InfoRow>
-      <InfoRow title="循环次数">
-        <template #end>
-          <MiuixText type="body2">{{ f0(battery?.cycle_count) }}</MiuixText>
-        </template>
-      </InfoRow>
-      <InfoRow title="材质">
-        <template #end>
-          <MiuixText type="body2">{{ battery?.technology || "—" }}</MiuixText>
-        </template>
-      </InfoRow>
+          <MiuixText type="footnote2" color="var(--m-color-on-surface-secondary)">
+            容量
+          </MiuixText>
+        </div>
+        <div class="grid__cell">
+          <MiuixText type="title3">{{ f1(battery?.health_percent) }}%</MiuixText>
+          <MiuixText type="footnote2" color="var(--m-color-on-surface-secondary)">
+            健康度
+          </MiuixText>
+        </div>
+        <div class="grid__cell">
+          <MiuixText type="title3">{{ f0(battery?.cycle_count) }}</MiuixText>
+          <MiuixText type="footnote2" color="var(--m-color-on-surface-secondary)">
+            循环次数
+          </MiuixText>
+        </div>
+      </div>
     </MiuixCard>
 
-    <!-- ── 充电能力 ── -->
-    <MiuixSmallTitle text="充电能力（本机实测）" />
-    <MiuixCard class="rows">
-      <InfoRow
-        title="档位范围"
-        :summary="`档位表 ${f0(caps?.gear_table_rows)} 行`"
-        :source="caps?.sources?.gear_max"
-      >
-        <template #end>
-          <MiuixText type="body2">
-            {{ f0(caps?.gear_min) }} ~ {{ f0(caps?.gear_max) }}
-          </MiuixText>
-        </template>
-      </InfoRow>
+    <!--
+      ── 充电能力（已移除）──
 
-      <InfoRow title="电流上限" :source="caps?.sources?.current_max">
-        <template #end>
-          <MiuixText type="body2">{{ amps1(caps?.current_max_ua) }} A</MiuixText>
-        </template>
-      </InfoRow>
+      🔴 用户要求（2026-10-17）：「充电能力与检测记录信息重复，删除掉充电能力」
 
-      <InfoRow
-        title="充电功率上限"
-        summary="机型能力上限，用于限制可设定的目标功率"
-        :source="caps?.sources?.power_max"
-      >
-        <template #end>
-          <MiuixText
-            type="body2"
-            :color="
-              caps?.power_max_w === null || caps?.power_max_w === undefined
-                ? 'var(--m-color-on-surface-secondary)'
-                : undefined
-            "
-          >
-            {{ caps?.power_max_w === null || caps?.power_max_w === undefined
-              ? "未读出"
-              : `${f0(caps.power_max_w)} W` }}
-          </MiuixText>
-        </template>
-      </InfoRow>
+      逐项核对确实**六项全重复**：
 
-      <InfoRow
-        title="功率最大档位"
-        summary="电流上限最高的档（本机为 0，即全速档）"
-      >
-        <template #end>
-          <MiuixText type="body2">{{ f0(caps?.power_max_gear) }}</MiuixText>
-        </template>
-      </InfoRow>
+      | 项 | 原充电能力卡片 | 「检测记录」 |
+      |---|---|---|
+      | 档位范围 | `0 ~ 15` | `档位表：15 档（0~14）` |
+      | 电流上限 | `18.4 A` | `电流上限：…` |
+      | 充电功率上限 | `100 W` | `充电功率上限：100W · 来源…` |
+      | 功率最大档位 | `0` | `最大功率档位：0` |
+      | 硬件保护温度 | `48 ℃` | `硬件保护温度：48℃ · 设备树直读` |
+      | 充电上限支持 | `支持` | `SOC 上限：节点可用` |
 
-      <InfoRow
-        title="硬件保护温度"
-        summary="超过则必须收紧"
-        :source="caps?.sources?.hardware_max_temp"
-      >
-        <template #end>
-          <MiuixText type="body2">{{ f0(caps?.hardware_max_c) }} ℃</MiuixText>
-        </template>
-      </InfoRow>
+      而且「检测记录」还多给一样东西：**来源**与**未成功项**
+      （原卡片只在标题旁挂一个小小的来源徽标）。
 
-      <MiuixDivider />
+      ⚠️ 删掉后**没有信息丢失**：
+        · 数值仍在 `device.json` 的 `capabilities` 段
+        · `ctl device show` / 导出报告里都能看到
+        · 检测记录里以人话复述了关键几项
+    -->
 
-      <InfoRow title="充电上限支持">
-        <template #end>
-          <MiuixText
-            type="body2"
-            :color="
-              caps?.soc_limit_supported
-                ? 'var(--m-color-primary)'
-                : 'var(--m-color-on-surface-secondary)'
-            "
-          >
-            {{ caps?.soc_limit_supported ? "支持" : "不支持" }}
-          </MiuixText>
-        </template>
-      </InfoRow>
-    </MiuixCard>
 
     <!--
       ── 实际功率（已移除）──
@@ -461,38 +568,44 @@ async function probe(quick: boolean, confirm = false): Promise<void> {
     -->
 
     <!-- ── 检测记录 ── -->
-    <template v-if="notes.length > 0">
+    <template v-if="noteRows.length > 0">
       <MiuixSmallTitle text="检测记录" />
       <MiuixCard>
+        <!--
+          ┌─ 状态摘要（用户 2026-10-17 从 3 个方案里选定）──────────────┐
+
+          改前是「圆点 + 一律灰色 13px 的长句子」：
+
+              ·  （演示模式：以下为示例数据）
+              ·  标称充电功率：100W（来源：电池型号 P11U_7560mah_100w）
+              ·  硬件保护温度：48℃
+
+          问题：没有层次（全是同样的灰）、长句难扫读、而且
+          **看不出哪项成功、哪项被跳过** —— 而那恰恰是用户最想知道的。
+
+          现在每条：一个 ✓/⚠ 徽标 + 左列名称 + 右列一句话结论。
+        -->
         <div class="selectable notes">
-          <div v-for="(n, i) in notes" :key="i" class="notes__item">
-            <span class="notes__dot">·</span>
-            <span>{{ n }}</span>
+          <div v-for="(r, i) in noteRows" :key="i" class="notes__row">
+            <span class="notes__mark" :class="`notes__mark--${r.tone}`">
+              {{ r.tone === "ok" ? "✓" : r.tone === "skip" ? "!" : "✕" }}
+            </span>
+            <span v-if="r.name" class="notes__name">{{ r.name }}</span>
+            <span class="notes__brief" :class="{ 'notes__brief--wide': !r.name }">
+              {{ r.brief }}
+            </span>
           </div>
         </div>
       </MiuixCard>
     </template>
 
-    <!-- ── 完整检测确认 ── -->
-    <MiuixDialog
-      v-model="confirmFull"
-      title="执行完整检测？"
-      summary="完整检测会向控速节点试写一次边界值，以验证可写上限 —— 充电功率会短暂变化，随后立即恢复原值。若只想读取本机能力，用「重新检测」即可（零副作用）。"
-      @close="confirmFull = false"
-    >
-      <template #default="{ close }">
-        <div class="actions">
-          <MiuixButton class="actions__btn" @click="close">取消</MiuixButton>
-          <MiuixButton
-            class="actions__btn"
-            type="primary"
-            @click="probe(false, true)"
-          >
-            确认执行
-          </MiuixButton>
-        </div>
-      </template>
-    </MiuixDialog>
+    <!--
+      ⚠️ 这里原有「执行完整检测？」的二次确认对话框，已删除（2026-10-17）
+
+      它服务的是原来那个独立的「完整检测」按钮。现在完整模式由
+      「同时验证档位可写上限」复选框触发 —— **勾选本身即确认**，
+      再弹一次对话框就成了"确认两遍"。
+    -->
   </div>
 </template>
 
@@ -536,16 +649,16 @@ async function probe(quick: boolean, confirm = false): Promise<void> {
   gap: 3px;
 }
 
+/* 档位上限验证的开关行：与上面的按钮拉开一点距离 */
+.probe__opt {
+  margin-top: 14px;
+  padding-top: 4px;
+}
+
 .probe__hint {
   display: block;
   margin-top: 8px;
   line-height: 1.5;
-}
-
-/* ── 通用 ── */
-
-.mono {
-  font-family: ui-monospace, monospace;
 }
 
 /* ── 实测功率结果 ── */
@@ -604,23 +717,86 @@ async function probe(quick: boolean, confirm = false): Promise<void> {
   text-align: right;
 }
 
+/* ── 检测记录：状态摘要行 ── */
+
 .notes {
   display: flex;
   flex-direction: column;
-  gap: 8px;
 }
 
-.notes__item {
+.notes__row {
   display: flex;
-  gap: 8px;
-  font-size: 13px;
-  line-height: 1.6;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 10px 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+/* 条目之间的分隔线（最后一条不要） */
+.notes__row + .notes__row {
+  border-top: 1px solid var(--m-color-outline-variant);
+}
+
+/**
+ * 状态徽标
+ *
+ * ⚠️ 三种语气各配一个**色底圆点 + 白字**，而不是只给文字上色：
+ *    纯色文字在"全是灰"的卡片里不够醒目，而这一列的**全部价值**
+ *    就是让用户一眼扫出"哪项不对"。
+ *
+ * 用固定色值而不是主题色：主题色板里没有"成功绿 / 警告橙"这两个语义色
+ * （只有 primary / error），而这里缺了它们整个设计就不成立。
+ */
+.notes__mark {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  line-height: 18px;
+  text-align: center;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff;
+  margin-top: 1px;
+}
+
+/* 成功：绿 */
+.notes__mark--ok {
+  background: #2e7d32;
+}
+
+/* 主动跳过：橙（不是错误，但需要用户知道"这项没测到"） */
+.notes__mark--skip {
+  background: #ed6c02;
+}
+
+/* 真失败：红 */
+.notes__mark--warn {
+  background: var(--m-color-error);
+}
+
+.notes__name {
+  flex: none;
+  /* 固定宽度让左右两列对齐；名称过长由 `parseNote` 的 12 字上限挡住 */
+  width: 96px;
+  color: var(--m-color-on-surface);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notes__brief {
+  flex: 1;
+  /* ⚠️ 不可省：长路径（如 /sys/firmware/devicetree/…）会把行撑破 */
+  min-width: 0;
+  text-align: right;
   color: var(--m-color-on-surface-secondary);
   word-break: break-word;
 }
 
-.notes__dot {
-  flex: none;
-  color: var(--m-color-outline);
+/* 没有名称的行（整句式，如"硬件保护温度未探测到…"）：整句占满，左对齐 */
+.notes__brief--wide {
+  text-align: left;
 }
 </style>

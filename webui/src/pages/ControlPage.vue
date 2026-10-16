@@ -1177,30 +1177,6 @@ async function applySoc(): Promise<void> {
     </MiuixCard>
 
     <MiuixCard v-else>
-      <!--
-        ┌─ 使用前提（用户要求，2026-10-16）─────────────────────────┐
-
-        用户原话：「加上提示：此模块需打开电池健康保护功能」。
-
-        为什么必须**置于卡片顶部**而不是折在末尾：
-        少了这个开关，整个功能都不会生效。用户如果先看到开关、
-        设好 90%、结果没生效，再回头找原因 —— 这个体验很糟。
-        把前提放在动手之前，就不会走这段弯路。
-
-        文案来自后端 `spec.requires`（与 `limit show` 同一份），
-        不在前端硬编码 —— 两处各写一份必然有一天会不一致。
-      -->
-      <div v-if="limitRequires" class="notice notice--warn">
-        <MiuixText type="body2" color="var(--m-color-on-tertiary-container)">
-          <b>使用前提</b>
-        </MiuixText>
-        <MiuixText type="footnote1" color="var(--m-color-on-tertiary-container)">
-          {{ limitRequires }}
-        </MiuixText>
-      </div>
-
-      <MiuixDivider class="gap" />
-
       <!-- 总开关 -->
       <div class="row">
         <div class="row__text">
@@ -1309,33 +1285,35 @@ async function applySoc(): Promise<void> {
           {{ limitUiNote }}
         </MiuixText>
       </div>
-      <InfoRow
-        title="已写入"
-        :summary="`巡检间隔 ${f0(limitInfo?.interval_s)} 秒`"
-      >
-        <template #end>
-          <MiuixText type="body2">{{ f0(limitInfo?.writes) }} 次</MiuixText>
-        </template>
-      </InfoRow>
-      <InfoRow title="出错次数">
-        <template #end>
-          <MiuixText
-            type="body2"
-            :color="
-              (limitInfo?.errors ?? 0) > 0 ? 'var(--m-color-error)' : undefined
-            "
-          >
-            {{ f0(limitInfo?.errors) }}
-          </MiuixText>
-        </template>
-      </InfoRow>
-      <!--
-        这里原有「机制来源：…」一行，已删除（2026-10-14 用户要求）
 
-        它对本模块的用户没有任何可操作价值 —— 既不是设置项，
-        也不是需要关注的状态；只是实现出处的备注。
-        这类信息留在代码注释与 README 里即可，不必占用界面。
+      <!--
+        ┌─ 使用前提 ────────────────────────────────────────────────┐
+
+        用户原话（2026-10-16）：「加上提示：此模块需打开电池健康保护功能」。
+        文案来自后端 `spec.requires`（与 `limit show` 同一份），
+        不在前端硬编码 —— 两处各写一份必然有一天会不一致。
+
+        ⚠️ 位置变更（2026-10-17 用户要求「把使用前提示放到下面」）：
+        原先放在**卡片顶部**，理由是"少了这个开关功能完全不生效，
+        应先看到它再动手"。
+
+        但那条理由的前提不成立 —— 实测本机**已支持**（节点探测命中），
+        这时"使用前提"就成了一个**已经满足的条件说明**，
+        占着卡片最显眼的位置反而把真正的操作（开关、目标电量）挤到下面。
+
+        ⇒ 移到底部，与其它两条说明并列。
+          它的告警色（`.notice--warn`）保留：万一节点真的消失
+          （用户关掉了系统开关），这条仍是页面上唯一带色的提示，
+          不会因为位置靠下而被忽略。
+
+        ⚠️ 若将来发现"不支持"是常见情形，应把它挪回去 ——
+           `limitSupported` 为 false 时走的是另一张卡片（顶部已有提示）。
       -->
+      <div v-if="limitRequires" class="notice notice--warn">
+        <MiuixText type="footnote1" color="var(--m-color-on-tertiary-container)">
+          <b>使用前提：</b>{{ limitRequires }}
+        </MiuixText>
+      </div>
 
       <!-- 熔断告警 -->
       <div v-if="limitInfo?.tripped" class="notice notice--error">
@@ -1560,21 +1538,13 @@ async function applySoc(): Promise<void> {
   margin: 14px 0;
 }
 
-/* ── 卡片 4：开关行 ── */
-
-.row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.row__text {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
+/*
+ * ⚠️ `.row` / `.row__text`（"左边文字 + 右边控件"的行布局）**已移到
+ *    `theme.css`** —— 日志页的「调试模式」开关也要用同一套。
+ *
+ * 留在本文件的 scoped 样式里时，别的页面用 `.row` 会**完全没有样式**：
+ * 标题与说明文字挤在同一行，而且**不报任何错**（2026-10-17 真机截图发现）。
+ */
 
 /* 未启用时整块淡化，明确表达"当前不起作用" */
 .is-dim {

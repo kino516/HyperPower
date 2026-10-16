@@ -6,10 +6,11 @@
   "description": "温控充 ThermoCharge 的 WebUI（KernelSU / APatch 模块内运行）",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && node check-style-dup.mjs && vite build",
+    "build": "vue-tsc --noEmit && node check-style-dup.mjs && node check-component-import.mjs && node check-html-comment.mjs && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
     "check:styles": "node check-style-dup.mjs",
+    "check:components": "node check-component-import.mjs",
     "check:html": "node check-html-comment.mjs"
   },
   "dependencies": {

@@ -39,6 +39,7 @@ mod addon_host;
 mod cli;
 mod commands;
 mod config_store;
+mod debug_log;
 mod detect;
 mod engine;
 mod history;
@@ -50,6 +51,12 @@ mod paths;
 mod profile_io;
 #[cfg(unix)]
 mod server;
+/// ⚠️ **不要**给这个模块加 `#[cfg(unix)]`
+///
+/// 它是纯逻辑，且带测试。worker 本身是 `#[cfg(unix)]` 的，
+/// 若把它塞回 worker，**测试在 Windows 上永远不跑**（2026-10-17 踩到）。
+/// 详见模块文档。
+mod sleep_events;
 #[cfg(unix)]
 mod supervisor;
 mod sysfs;

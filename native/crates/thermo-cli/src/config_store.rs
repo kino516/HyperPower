@@ -52,6 +52,8 @@ pub const SECTIONS: &[&str] = &[
     "device", "thermal", "control", "ui", "daemon", "limit", "log", "curve",
     // 充电历史（观测归档；`get --section history` 可查其开关与保留策略）
     "history",
+    // 调试模式（排障用；界面在「反馈问题」里查它的开关与上限）
+    "debug",
 ];
 
 // ============================================================
@@ -388,6 +390,25 @@ pub const KEYS: &[KeySpec] = &[
     spec("history.keep", KeyKind::Int { min: 1, max: 500 }),
     // 采样间隔：10s（细腻）~ 300s（省地方）。默认 30s。
     spec("history.sample_s", KeyKind::Int { min: 10, max: 300 }),
+    // ── §11 调试模式分区（2，**排障用**，不参与控制）──
+    //
+    // 用户要求（2026-10-17）：「在反馈问题中增加一个调试模式按钮，
+    // 如果开启调试模式会记录更详细的数据，方便你抓包分析」。
+    //
+    // ⚠️ 与 `log.*` 分区的区别：
+    //    · `log.*` 是**长期**的常规日志设置（级别、CSV、大小）
+    //    · `debug.*` 是**临时**的深度记录 —— 用户复现完问题就该关掉
+    //
+    // 详见 `crate::debug_log` 模块文档。
+    spec("debug.enabled", KeyKind::Bool),
+    // 调试数据上限（MB）。20 MB ≈ 一次过夜充电（约 6 MB）的 3 倍余量。
+    spec(
+        "debug.max_mb",
+        KeyKind::Int {
+            min: crate::debug_log::MIN_MAX_MB as i64,
+            max: crate::debug_log::MAX_MAX_MB as i64,
+        },
+    ),
 ];
 
 /// 按点号键查规格
@@ -506,6 +527,11 @@ pub fn default_config() -> Value {
             "keep": 30,
             // 曲线采样间隔（秒）
             "sample_s": 30
+        },
+        // 调试模式（排障用）—— 出厂**关闭**
+        "debug": {
+            "enabled": false,
+            "max_mb": crate::debug_log::DEFAULT_MAX_MB
         },
     })
 }
@@ -1120,11 +1146,28 @@ impl ConfigStore {
 
     /// 充电历史的运行配置（见 `crate::history`）
     pub fn history_cfg(&self) -> crate::history::HistoryCfg {
+        // 调试模式下把采样间隔压到 5 秒
+        //
+        // 用户要求（2026-10-17）：调试模式要「历史曲线采样加密（30 秒 → 5 秒）」。
+        //
+        // ⚠️ 用**运行时覆盖**而不是改配置键，有两个原因：
+        //    1. 配置键 `history.sample_s` 的下限是 10（防用户设太小把文件写爆），
+        //       而调试模式就是要临时突破它 —— 改下限会让这个保护失效
+        //    2. 关掉调试模式后应当**自动恢复**原来的间隔；
+        //       改配置的话用户还得记得手动调回去
+        //
+        // 代价：曲线点密 6 倍 ⇒ 一次充电的归档从约 10 KB 涨到约 60 KB。
+        // 调试是临时的，可以接受（`history.keep` 仍然限制总份数）。
+        let sample_s = if self.get_bool("debug.enabled") {
+            crate::history::DEBUG_SAMPLE_S
+        } else {
+            self.get_i64("history.sample_s").max(10)
+        };
         crate::history::HistoryCfg {
             enabled: self.get_bool("history.enabled"),
             // 至少留 1 次 —— 否则归档完会立刻把刚写的那次删掉
             keep: self.get_i64("history.keep").max(1) as usize,
-            sample_s: self.get_i64("history.sample_s").max(10),
+            sample_s,
         }
     }
 
@@ -1476,10 +1519,12 @@ mod tests {
         // 语义完全重复，且曾导致"界面显示的值 ≠ 实际生效的值"。
         //
         // 新增的 3 个见 §10：`history.enabled` / `history.keep` / `history.sample_s`。
+        //
+        // +2（2026-10-17）见 §11：`debug.enabled` / `debug.max_mb` —— 调试模式。
         assert_eq!(
             key_count(),
-            43,
-            "移除 device.power_limit_w 并加入充电历史后合计 43 个键"
+            45,
+            "移除 device.power_limit_w、加入充电历史（+3）与调试模式（+2）后合计 45 个键"
         );
     }
 

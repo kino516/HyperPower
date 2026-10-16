@@ -68,5 +68,9 @@
     "enabled": true,
     "keep": 30,
     "sample_s": 30
+  },
+  "debug": {
+    "enabled": false,
+    "max_mb": 20
   }
 }

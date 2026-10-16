@@ -145,6 +145,41 @@ impl EventLog {
         }
     }
 
+    /// 清空事件流（**含内存缓冲与轮转归档**），返回删掉的文件数
+    ///
+    /// # 为什么要清三样东西，而不是删一个文件
+    ///
+    /// | 目标 | 不清会怎样 |
+    /// |---|---|
+    /// | `events.jsonl` | 记录仍在 |
+    /// | **`.1` / `.2` 轮转归档** | 磁盘上仍是旧数据 —— 用户以为清干净了，实际 `cat events.jsonl.1` 还看得到。**"看起来清空了其实没有"** |
+    /// | **内存里的 `recent`** | `watch` 订阅者仍会收到**已删除**的事件 |
+    ///
+    /// # 安全性
+    ///
+    /// [`Self::emit`] 每次都重新 `OpenOptions::append().open()`、**不持有 fd**，
+    /// 所以删文件不会写到"已删除的 inode"上；下一次 `emit` 会新建它。
+    ///
+    /// ⚠️ 调用方通常**紧接着要 `emit` 一条"已清空"事件** —— 那是刻意的：
+    ///    否则用户清完只看到一片空白，无法确认操作发生过。
+    pub fn clear(&self) -> usize {
+        // ① 内存缓冲（`watch` 的推送源）
+        if let Ok(mut r) = self.recent.lock() {
+            r.clear();
+        }
+        // ② 当前文件 + 轮转归档
+        let mut removed = 0;
+        if std::fs::remove_file(&self.path).is_ok() {
+            removed += 1;
+        }
+        for i in 1..=KEEP_FILES {
+            if std::fs::remove_file(self.suffixed(i)).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// 超过上限则轮转（`.1` → `.2`，当前 → `.1`）
     fn rotate_if_needed(&self) {
         let Ok(meta) = std::fs::metadata(&self.path) else {

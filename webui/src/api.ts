@@ -394,6 +394,9 @@ export async function exportDiagnosticLog(): Promise<string> {
     // ⚠️ `/sdcard` 在所有 Android 上都是指向当前用户内部存储的符号链接
     `DL=/sdcard/Download`,
     `DLFILE=$DL/thermo-report-$TS.txt`,
+    // 调试数据另存一个文件，与报告**同名不同后缀** —— 便于配对
+    // （用户手上可能同时有好几次导出）
+    `DBGFILE=$DL/thermo-debug-$TS.jsonl`,
     `{`,
     `  echo "===== 温控充 诊断报告 ====="`,
     `  echo "生成时间: $(date '+%Y-%m-%d %H:%M:%S %z')"`,
@@ -452,6 +455,26 @@ export async function exportDiagnosticLog(): Promise<string> {
     `  echo "----- 界面打点与异常（最近 20 次导出）-----"`,
     `  echo "（每行 = 一次导出；ERR| 开头的是界面报错的技术细节）"`,
     `  tail -n 20 ${DATA}/logs/perf.log 2>/dev/null || echo "(未记录过性能数据)"`,
+    `  echo`,
+    // ── 调试模式数据（用户要求 2026-10-17）──
+    //
+    // ⚠️ **不把 debug.jsonl 塞进报告本体**：它有 20 MB，塞进去会让报告
+    //    既发不出去也打不开。这里只报**它存在与多大**，真正的数据
+    //    由下面那步**另存为一个文件**。
+    //
+    // 同时在报告里报一份**尾部预览**（最近 30 行）——
+    // 这样即使调试数据那个大文件没被发出去，报告本身也带了线索。
+    `  echo "----- 调试模式数据 -----"`,
+    `  if [ -s ${DATA}/debug/debug.jsonl ]; then`,
+    `    echo "调试数据存在：$(wc -c < ${DATA}/debug/debug.jsonl) 字节 / $(wc -l < ${DATA}/debug/debug.jsonl) 行"`,
+    `    echo "（完整数据会另存为一个 thermo-debug-*.jsonl 文件，一并发送即可）"`,
+    `    echo`,
+    `    echo "--- 尾部队道预览（最近 30 行）---"`,
+    `    tail -n 30 ${DATA}/debug/debug.jsonl 2>/dev/null`,
+    `  else`,
+    `    echo "(未开启调试模式，或尚未产生数据)"`,
+    `    echo "提示：在「反馈问题」里打开「调试模式」后复现一次问题，再来导出。"`,
+    `  fi`,
     `} > ${report} 2>&1`,
     // 复制到下载目录。成功报告下载路径，失败退回数据目录路径 ——
     // 两种情况前端都能给用户一个**真实存在**的路径。
@@ -459,6 +482,13 @@ export async function exportDiagnosticLog(): Promise<string> {
     `  echo $DLFILE`,
     `else`,
     `  echo ${report}`,
+    `fi`,
+    // 调试数据另存一个文件（与报告同名，后缀不同，便于配对）
+    //
+    // ⚠️ 失败**不算错误**：没开调试模式时它本来就不存在。
+    //    所以这里不 echo 路径，前端用 `$DLFILE` 推导出来即可。
+    `if [ -s ${DATA}/debug/debug.jsonl ]; then`,
+    `  cp ${DATA}/debug/debug.jsonl $DBGFILE 2>/dev/null || true`,
     `fi`,
     // 最后一行是字节数（前端据此判断"是否真的写成功了"）
     `wc -c < ${report}`,
@@ -975,10 +1005,84 @@ export function fetchHistorySession(id?: string): Promise<HistorySession> {
  *
  * ⚠️ **正在充电的这一次会继续记录** —— 清空的只是历史归档。
  * 界面文案要把这点讲清楚，否则用户会以为"连当前的也停了"。
+ *
+ * ⚠️ 自 0.3.12 起，界面上的按钮已改为「清空全部记录」
+ *    （走 [`clearRecords`]）—— 这个函数保留给"只想清历史"的场景。
  */
 export async function clearHistory(): Promise<void> {
   // 清空要重写整个历史文件，可能比一般写操作慢 ⇒ 用写超时（15s）
   await run(["history", "clear"], TIMEOUT_WRITE_MS);
+}
+
+/**
+ * **清空全部记录**（事件 + 充电历史 + 诊断报告 + 日志文件）
+ *
+ * 用户要求（2026-10-17）：「清空充电历史记录好像只能清空历史记录，
+ * 加入更多功能，需要清空所有的临时文件，包括最近事件等等」。
+ *
+ * # ⚠️ 不碰配置与设备档案
+ *
+ * 后端已用测试把这条钉死（`清空记录绝不能碰配置与设备档案`）——
+ * 特别是 `device.json`：清掉它模块会进入「未检测不控制」，
+ * **完全不管充电**，必须重跑检测才恢复。
+ *
+ * 返回后端给出的 `scope`（会清什么）与 `kept`（不碰什么），
+ * 供界面在确认弹窗里如实展示 —— 而不是前端自己写一份（那会漂移）。
+ */
+export async function clearRecords(): Promise<Record<string, unknown>> {
+  const raw = (await run(["records", "clear"], TIMEOUT_WRITE_MS)) as Record<
+    string,
+    unknown
+  >;
+  return raw;
+}
+
+/**
+ * 只查询**会清什么**，不真删
+ *
+ * 供界面在弹窗里展示清单 —— 文案由后端生成，前端只负责显示，
+ * 因此不可能出现「弹窗说清了 A，实际只清了 B」。
+ */
+export async function recordsScope(): Promise<Record<string, unknown>> {
+  const raw = (await run(["records", "list"])) as Record<string, unknown>;
+  return raw;
+}
+
+/**
+ * 调试模式状态
+ *
+ * 用户要求（2026-10-17）：「在反馈问题中增加一个调试模式按钮，
+ * 如果开启调试模式会记录更详细的数据，方便你抓包分析」。
+ */
+export interface DebugStatus {
+  /** 是否已开启 */
+  enabled: boolean;
+  /** 数据文件的完整路径 */
+  path: string;
+  /** 已记录字节数（从文件的 metadata 取，不数行 —— 界面每 3 秒会查一次） */
+  bytes: number;
+  /** 上限字节数 */
+  max_bytes: number;
+  /** 上限（MB，给界面直接显示） */
+  max_mb: number;
+  /** 一句话说明（开启/未开启两种口径） */
+  note: string;
+}
+
+/** 读调试模式状态 */
+export async function fetchDebugStatus(): Promise<DebugStatus> {
+  const raw = (await run(["debug", "status"])) as DebugStatus;
+  return raw;
+}
+
+/**
+ * 开关调试模式
+ *
+ * ⚠️ 只改**配置**，真正的写入器由 worker 在**下一拍**打开 ——
+ *    因此 `on` 之后要等一两秒才会开始有数据（界面文案里说明了）。
+ */
+export async function setDebugEnabled(on: boolean): Promise<void> {
+  await run(["debug", on ? "on" : "off"], TIMEOUT_WRITE_MS);
 }
 
 // ============================================================
@@ -994,6 +1098,8 @@ const demo = {
   soc: 80,
   /** 当前生效的模式（演示用） */
   mode: "custom",
+  /** 调试模式开关（演示用） */
+  debugOn: false,
 };
 
 /** 演示：四种模式 */
@@ -1050,6 +1156,10 @@ function mockHistoryList(): unknown {
   const now = Math.floor(Date.now() / 1000);
   const lastStart = now - 5400;
   return {
+    // ⚠️ 刻意给 **5 条**（多于 HISTORY_PREVIEW = 3）
+    //
+    // 演示模式应当能展示分页效果 —— 只给 2 条的话「更多」按钮永远不出现，
+    // 界面改动在演示模式下就验证不到（真机上有 5 条真实记录，一致）。
     sessions: [
       {
         id: "1",
@@ -1075,10 +1185,46 @@ function mockHistoryList(): unknown {
         avg_power_w: 30.2,
         points: 82,
       },
+      {
+        id: "3",
+        started_at: lastStart - 172_800,
+        ended_at: lastStart - 165_000,
+        duration_s: 7800,
+        soc_start: 28,
+        soc_end: 82,
+        peak_temp_c: 40.6,
+        energy_wh: 54.3,
+        avg_power_w: 25.1,
+        points: 88,
+      },
+      {
+        id: "4",
+        started_at: lastStart - 259_200,
+        ended_at: lastStart - 251_000,
+        duration_s: 8200,
+        soc_start: 48,
+        soc_end: 85,
+        peak_temp_c: 38.7,
+        energy_wh: 33.9,
+        avg_power_w: 15.4,
+        points: 94,
+      },
+      {
+        id: "5",
+        started_at: lastStart - 345_600,
+        ended_at: lastStart - 340_000,
+        duration_s: 5600,
+        soc_start: 83,
+        soc_end: 85,
+        peak_temp_c: 40.3,
+        energy_wh: 2.8,
+        avg_power_w: 0.9,
+        points: 62,
+      },
     ],
     stats: {
-      count: 2,
-      energy_total_wh: 110.7,
+      count: 5,
+      energy_total_wh: 201.7,
       peak_temp_c: 42.5,
       keep: 30,
       enabled: true,
@@ -1105,6 +1251,46 @@ function mock(parts: string[]): unknown {
     return mockHistoryList();
   }
 
+  // 调试模式（演示模式：只回状态，不真写文件）
+  if (head === "debug") {
+    if (sub === "on") {
+      demo.debugOn = true;
+    } else if (sub === "off") {
+      demo.debugOn = false;
+    }
+    return {
+      enabled: demo.debugOn,
+      path: "/data/adb/thermo_charge/debug/debug.jsonl",
+      bytes: demo.debugOn ? 2_411_724 : 0,
+      max_bytes: 20 * 1024 * 1024,
+      max_mb: 20,
+      note: demo.debugOn
+        ? "正在记录。复现完问题后记得关掉。"
+        : "未开启。开启后会记录每拍决策链、节点原始读写与运行日志。",
+    };
+  }
+
+  // 清空全部记录（演示模式：只回一份与后端同形的清单，不真删）
+  if (head === "records") {
+    return {
+      cleared: sub === "clear",
+      scope: [
+        "最近事件（含轮转归档）",
+        "充电历史（已完成会话）",
+        "诊断报告",
+        "界面打点日志",
+        "开机记录",
+        "主日志",
+        "守护输出",
+      ],
+      kept: [
+        "config.json（你的全部设置）",
+        "device.json（设备档案 —— 清了模块会停止控制充电）",
+        "presets.json（预设模板）",
+      ],
+    };
+  }
+
   if (head === "status") {
     return {
       battery: {
@@ -1114,6 +1300,9 @@ function mock(parts: string[]): unknown {
         soc: 65,
         status: "Charging",
         temp_c: 38.6,
+        // 演示值取恒流末段的高电压（真机全程约 3.9 → 4.5 V），
+        // 好让两位小数的意义一眼可见
+        voltage_v: 4.32,
       },
       charger: {
         label: "PD_PPS",
@@ -1122,10 +1311,12 @@ function mock(parts: string[]): unknown {
         usb_type: "USB_PD",
         weak: false,
       },
-      // 演示值：用非 -1 的值，好让界面这一行在浏览器预览时可见
-      // （真机上最常见的其实是 -1 ⇒ 后端会归一化成"未设置"）
-      scene: "3",
+      // ⚠️ 这里原有 `scene: "3"`（系统场景的演示值），已随该字段删除（2026-10-17）
       control: { curr_now: 12_000_000, gear_now: 0, power_limit_w: 43 },
+      // 演示值：模式取「极速」—— 与 mockModes() 里的 current 保持一致，
+      // 否则状态页显示的模式和控制页高亮的那个会对不上
+      mode: "turbo",
+      mode_label: "极速",
       daemon: "running",
       detected: true,
       released: false,
@@ -1136,6 +1327,9 @@ function mock(parts: string[]): unknown {
         basis: "cell",
         // 演示值：比电池温度高约 10℃（真机实测的真实关系）
         cp_die_temp_c: 48.9,
+        // 演示值：机身温度通常略高于电池温度（这也是 `basis = virt`
+        // 时会"看起来更早降速"的原因）
+        board_temp_c: 41.2,
         peak_c: null,
         tighten_temp: 43,
       },
@@ -1307,10 +1501,20 @@ function mockDevice(): DeviceProfileView {
       method: "quick_readonly",
       // 新版检测已全只读，不再需要充电
       needs_charge_for: [],
+      // 演示值：取**真机实测的那 7 条**（2026-10-17 从 K90 Pro Max 上 dump）
+      //
+      // ⚠️ 刻意包含「已跳过」那条 —— 它对应橙色徽标，
+      //    是三种语气里唯一"不是成功也不是失败"的一类。
+      //    只放成功项的话，浏览器预览里根本看不出状态徽标有没有生效。
       notes: [
         "（演示模式：以下为示例数据）",
-        "标称充电功率：100W（来源：电池型号 P11U_7560mah_100w）",
-        "硬件保护温度：48℃",
+        "SOC 上限：节点可用",
+        "档位表：15 档（0~14）· 设备树直读",
+        "最大功率档位：0",
+        "电流上限：已跳过（充电中测得不准）—— 拔掉充电器后重跑",
+        "硬件保护温度：48℃（设备树直读）",
+        "充电功率上限：100W · 来源电池型号",
+        "档位上限：未做写探（快速检测零副作用）",
       ],
       probed_at: Math.floor(Date.now() / 1000) - 300,
     },
