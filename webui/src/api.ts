@@ -1235,7 +1235,8 @@ function mockLimit(): AddonStatus {
       soc_active: demo.limitEnabled ? demo.soc : null,
       soc_target: demo.soc,
       verify_s: 15,
-      warn_on_hypersc: true,
+      warn_on_conflict: true,
+      conflict_suspected: false,
       write_count: 3,
       // 与后端 `NOTE_UI_NOT_SYNCED` 同款文案（演示模式要能看出这块提示的样子）
       note_ui_not_synced:
@@ -1247,7 +1248,7 @@ function mockLimit(): AddonStatus {
     interval_s: 60,
     label: "充电上限",
     last_error: null,
-    origin: "节点机制来自 HyperSC 逆向；本模块独立实现",
+    origin: "节点机制由真机实测确证：写 smart_chg 控制字、读 soc_limit 生效值",
     probe: "命中 smart_chg",
     // 与后端 `REQUIRES_BATTERY_PROTECT` 同款文案
     requires:

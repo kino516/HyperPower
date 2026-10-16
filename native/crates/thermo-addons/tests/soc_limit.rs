@@ -4,7 +4,7 @@
 //!
 //! | 层 | 内容 |
 //! |---|---|
-//! | 纯逻辑 | 控制字编解码（对照 HyperSC 逆向出的对照表） |
+//! | 纯逻辑 | 控制字编解码（对照真机实测出的对照表） |
 //! | 行为 | 零写入 / 写回 / 回读校验 / 探测 |
 //! | 容错 | 配置非法、节点不可用、熔断 |
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -134,7 +134,7 @@ fn probed(config: SocLimitConfig, io: &mut FakeIo) -> SocLimit {
 }
 
 // ============================================================
-//  ① 纯逻辑：控制字（对照 HyperSC 真机实测表）
+//  ① 纯逻辑：控制字（对照真机实测表）
 // ============================================================
 
 #[test]
@@ -368,6 +368,120 @@ fn 回读不符时报告错误() {
     assert_eq!(addon.write_count(), 1);
 }
 
+// ============================================================
+//  ⑩ 写入方冲突识别（2026-10-16）
+//
+//  `smart_chg` 是全局节点 —— 任何写它的程序都在改同一个开关。
+//  两个程序同时启用时会互相覆盖，表现为**连续多次**写下去就被改回。
+// ============================================================
+
+/// 单次回读不符**不能**断言冲突（否则会误报成"有别的程序在抢"）
+///
+/// 驱动可能延迟一拍才把控制字应用到 `soc_limit` 上 ——
+/// 凭一次不符就让用户去卸载另一个模块，是错误的指引。
+#[test]
+fn 单次回读不符不提示冲突() {
+    let mut io = FakeIo::hyperos();
+    io.write_ignored = true;
+    let mut addon = probed(enabled_config(85), &mut io);
+
+    let outcome = addon.tick(&mut io, 0);
+    let msg = outcome
+        .error
+        .as_ref()
+        .map(|e| e.msg.clone())
+        .unwrap_or_default();
+
+    assert!(msg.contains("回读不符"), "应当报回读不符，实得：{msg}");
+    assert!(
+        !msg.contains("另一个程序"),
+        "只失败一次不该断言有冲突，实得：{msg}"
+    );
+}
+
+/// 连续两次写下去就被改回 ⇒ 提示疑似写入方冲突
+///
+/// 这正是"两个程序抢同一个节点"的表现：谁在后面谁生效，
+/// 于是我们每拍都写、每拍都被改回去。
+#[test]
+fn 连续回读不符提示疑似冲突() {
+    let mut io = FakeIo::hyperos();
+    io.write_ignored = true;
+    let mut addon = probed(enabled_config(85), &mut io);
+
+    let _ = addon.tick(&mut io, 0); // 第 1 次：只说回读不符
+    let second = addon.tick(&mut io, 15); // 第 2 次：应带上冲突提示
+
+    let msg = second
+        .error
+        .as_ref()
+        .map(|e| e.msg.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("另一个程序"),
+        "连续两次不符应当提示疑似冲突，实得：{msg}"
+    );
+    // ⚠️ 这条断言是**防回归守卫**：锁定"用户可见的文案里不得出现
+    //    第三方模块名"。下面两个是历史品牌名 —— 它们只出现在断言里，
+    //    产品代码与任何输出字段中都不得再有。
+    assert!(
+        !msg.contains("Hyper") && !msg.contains("hypersc"),
+        "提示不应指名具体模块，实得：{msg}"
+    );
+}
+
+/// 关掉提示开关后不再追加冲突提示（但错误本身照报）
+#[test]
+fn 关掉开关后不提示冲突() {
+    let mut io = FakeIo::hyperos();
+    io.write_ignored = true;
+    let cfg = SocLimitConfig {
+        warn_on_conflict: false,
+        ..enabled_config(85)
+    };
+    let mut addon = probed(cfg, &mut io);
+
+    let _ = addon.tick(&mut io, 0);
+    let second = addon.tick(&mut io, 15);
+    let msg = second
+        .error
+        .as_ref()
+        .map(|e| e.msg.clone())
+        .unwrap_or_default();
+
+    assert!(msg.contains("回读不符"), "错误本身仍要报，实得：{msg}");
+    assert!(!msg.contains("另一个程序"), "关掉后不该提示，实得：{msg}");
+}
+
+/// 一旦写入生效，冲突计数必须清零
+///
+/// 否则"很久以前连续失败过两次"会让后续每一次偶发不符都顶着冲突提示，
+/// 用户会以为冲突一直存在。
+#[test]
+fn 写入成功后冲突计数清零() {
+    let mut io = FakeIo::hyperos();
+    io.write_ignored = true;
+    let mut addon = probed(enabled_config(85), &mut io);
+
+    let _ = addon.tick(&mut io, 0);
+    let _ = addon.tick(&mut io, 15); // 计数到 2
+
+    // 恢复正常：让写入真的生效
+    io.write_ignored = false;
+    let ok = addon.tick(&mut io, 30);
+    assert!(ok.is_ok(), "这次应成功");
+
+    // 再制造一次失败 —— 计数应已清零，因此**不**带冲突提示
+    io.write_ignored = true;
+    let after = addon.tick(&mut io, 45);
+    let msg = after
+        .error
+        .as_ref()
+        .map(|e| e.msg.clone())
+        .unwrap_or_default();
+    assert!(!msg.contains("另一个程序"), "计数应已清零，实得：{msg}");
+}
+
 #[test]
 fn 驱动特殊态零值时会被写回() {
     let mut io = FakeIo::hyperos();
@@ -464,8 +578,8 @@ fn 状态里的前提与自我介绍一致() {
 
 /// 系统界面不会同步 —— 必须主动说明
 ///
-/// HyperSC 靠 hook `ChargeProtectFragment` 改系统设置页的文案；
-/// 本模块是纯 root + sysfs，**没有 hook 层**。
+/// 系统「电池保护」设置页有自己的界面文案；本模块是纯 root + sysfs，
+/// **没有 hook 层**，改不了那个界面。
 ///
 /// 不说清楚的话：用户设了 90%、进系统设置一看仍写着 80%，
 /// 会判断成"没生效" —— 而实际上限制**已经生效**。

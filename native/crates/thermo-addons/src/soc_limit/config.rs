@@ -64,8 +64,24 @@ pub struct SocLimitConfig {
     pub verify_s: u32,
     /// 温控"交回官方"时是否保留本上限
     pub keep_on_restore: bool,
-    /// 检测到 HyperSC 模块时是否提示用户（两者写同一节点，会互相覆盖）
-    pub warn_on_hypersc: bool,
+    /// 检测到**其它也在写同一节点的充电控制模块**时是否提示用户
+    ///
+    /// # 为什么需要这个提示
+    ///
+    /// `smart_chg` 是一个**全局节点** —— 任何写它的程序都在改同一个开关。
+    /// 两个程序同时启用时，谁都可能在后，于是**互相覆盖**：
+    /// 用户会看到"设置过一会儿自己变回去了"这种莫名现象，
+    /// 却不知道是有两个程序在抢。
+    ///
+    /// 因此检测到就明确提示，让用户**二选一**。
+    ///
+    /// ⚠️ 字段名保持中性（`conflict` 而不是指名道姓）—— 会写这个节点的
+    ///    程序不止一个，写死某个名字将来必然过时。
+    ///
+    /// ⚠️ 缺省值由**容器级** `#[serde(default)]` 提供（走 `Default` = `true`），
+    ///    这里不要再写字段级 `default` —— 那会覆盖成 `false`，
+    ///    于是"老配置缺这个键"变成"关闭提示"，与 `Default` 不一致。
+    pub warn_on_conflict: bool,
 }
 
 impl Default for SocLimitConfig {
@@ -75,7 +91,7 @@ impl Default for SocLimitConfig {
             soc: SYS_DEFAULT_SOC,
             verify_s: 15,
             keep_on_restore: true,
-            warn_on_hypersc: true,
+            warn_on_conflict: true,
         }
     }
 }

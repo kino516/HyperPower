@@ -48,7 +48,7 @@
     "soc": 80,
     "verify_s": 15,
     "keep_on_restore": true,
-    "warn_on_hypersc": true
+    "warn_on_conflict": true
   },
   "curve": [
     {"t_max": 38.0, "curr": 18400000},

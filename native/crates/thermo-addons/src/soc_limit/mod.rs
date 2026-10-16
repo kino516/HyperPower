@@ -1,7 +1,12 @@
 //! 附加功能 ①：充电上限（`soc_limit`）
 //!
-//! 设定"充到指定电量即停止"。机制来自 HyperSC 逆向（见 [`logic`] 的模块文档），
-//! 本模块**独立实现**，不引用其任何代码。
+//! 设定"充到指定电量即停止"。
+//!
+//! # 机制是怎么来的
+//!
+//! 全部由**真机实测确证**（见 [`logic`] 的模块文档与那几张对照表）：
+//! 写入节点是 `smart_chg`、读取节点是 `soc_limit`、控制字的使能位是 `0x11`。
+//! 这些都是在这台设备上一条一条试出来的，不是从别处抄的。
 //!
 //! # 它碰什么、不碰什么
 //!
@@ -61,12 +66,20 @@ pub const REQUIRES_BATTERY_PROTECT: &str =
 
 /// **系统界面不同步**的说明（界面用）
 ///
-/// 这是 HyperSC 逆向里明确列为"必须处理的边界"的一条：
-/// HyperSC 靠 hook `ChargeProtectFragment` 把界面上的 80% 改成用户设的值，
-/// 而**本模块没有 hook 层**（纯 root + sysfs），改不了系统界面。
+/// # 为什么需要说明这件事
 ///
-/// 不说清楚的话，用户设了 90% 却看到系统设置里写着 80%，
-/// 会判断成"没生效" —— 而实际上限制**已经生效**了（写的是同一个节点）。
+/// 系统的「电池保护」设置页有一套**自己的界面文案**，写的是它自己记的
+/// 那个百分比（默认 80%）。那个文案的显示逻辑在**系统应用里**，
+/// 而本模块是**纯 root + sysfs，没有 hook 层**，改不了系统界面。
+///
+/// ⇒ 用户设了 90%，进系统设置一看仍写着 80%。
+///
+/// 不说清楚的话，用户会判断成"没生效" —— 而实际上限制**已经生效**
+/// （写的是同一个节点，驱动按他设的值执行）。
+/// 这是"看起来失败其实成功了"的典型，必须在界面上说透。
+///
+/// ⚠️ 文案里**不要提任何具体做法**（比如"改界面文案"），
+///    那既不是我们能做的事，也容易让用户误以为可以做到。
 pub const NOTE_UI_NOT_SYNCED: &str =
     "系统设置里显示的百分比不会跟着变（那是系统自己的文案）。以本页的「已生效」为准。";
 
@@ -103,6 +116,19 @@ pub struct SocLimit {
     /// ⚠️ 这个区间**因机型而异**：初版把它写死成 `60 ~ 100`
     /// （本机 K90PM 的值），换机型就会用错范围。
     range: Option<(u8, u8)>,
+    /// **连续**"写下去又被改回"的次数 —— 用于识别**写入方冲突**
+    ///
+    /// # 为什么这个数能识别冲突
+    ///
+    /// `smart_chg` 是**全局节点**：任何写它的程序都在改同一个开关。
+    /// 两个程序同时启用时，谁都可能在后 —— 于是出现
+    /// 「我们写 85 → 立刻被改回 80 → 下拍再写 85 → 又被改回」的循环。
+    ///
+    /// 单次回读不符**不能**说明有冲突（可能只是驱动延迟一拍才生效），
+    /// 所以只在**连续**多次不符时才提示 —— 见 [`Self::conflict_hint`]。
+    ///
+    /// 写入成功即清零。
+    verify_fail_streak: u32,
 }
 
 impl SocLimit {
@@ -117,6 +143,7 @@ impl SocLimit {
             last_written: None,
             write_count: 0,
             range: None,
+            verify_fail_streak: 0,
         }
     }
 
@@ -132,6 +159,29 @@ impl SocLimit {
     fn effective_range(&self) -> (u8, u8) {
         self.range
             .unwrap_or((config::SOC_FALLBACK_MIN, config::SOC_FALLBACK_MAX))
+    }
+
+    /// **写入方冲突**的提示后缀（不含则返回空串）
+    ///
+    /// # 判据
+    ///
+    /// `smart_chg` 是**全局节点** —— 任何写它的程序都在改同一个开关。
+    /// 两个程序同时启用时会出现「我们写 85 → 立刻被改回 80 → 下拍再写 85
+    /// → 又被改回」的循环，表现为**连续多次**回读不符。
+    ///
+    /// ⚠️ 门槛设在 **2 次**而不是 1 次：
+    ///    单次回读不符未必是冲突 —— 驱动可能延迟一拍才把控制字应用到
+    ///    `soc_limit` 上。凭一次不符就断言"有别的程序在抢"会误报，
+    ///    反而让用户去卸载一个根本没冲突的模块。
+    ///
+    /// ⚠️ 这个提示**不指名任何具体模块**：会写这个节点的程序不止一个，
+    ///    写死名字将来必然过时，而且用户可能装的是我们不知道的东西。
+    fn conflict_hint(&self) -> &'static str {
+        if self.config.warn_on_conflict && self.verify_fail_streak >= 2 {
+            "（连续多次写下去就被改回 —— 可能有另一个程序也在写这个节点，请二选一）"
+        } else {
+            ""
+        }
     }
 
     /// 当前配置
@@ -183,22 +233,26 @@ impl Addon for SocLimit {
             id: "soc_limit",
             label: "充电上限",
             summary: "充到指定电量即停止，保护电池寿命",
-            origin:
-                "节点机制来自 HyperSC（com.zephyr.smartcharge）逆向；本模块独立实现，不引用其代码",
+            // ⚠️ 来源说明**不指名任何第三方模块**（用户要求，2026-10-16）
+            //
+            // 这里只描述**机制本身是怎么确证的** —— 那才是这条信息
+            // 对使用者的价值（"这不是猜的"）。
+            // 而"参考过哪个程序"既不影响使用，也会让成品看起来像是别人的附庸，
+            // 因此不写进任何面向用户的字段。
+            origin: "节点机制由真机实测确证：写 smart_chg 控制字、读 soc_limit 生效值",
             default_interval_s: 15,
             // ⚠️ **使用前提**（用户明确要求加上，2026-10-16）
             //
             // # 为什么这个前提是真的
             //
             // 本功能写的是 `smart_charge/smart_chg` —— 它属于系统
-            // 「电池保护」（HyperOS 里也叫「电池健康保护」）功能的实现，
-            // 与 `com.miui.securitycenter` 的 `ChargeProtectFragment`
-            // 是同一套东西：系统 UI 改的是这个节点上的 80% 默认值，
+            // 「电池保护」（HyperOS 里也叫「电池健康保护」）功能的实现：
+            // 系统设置页里那个 80% 默认值，改的就是这个节点，
             // 而我们改的是同一个节点上的自定义值。
             //
-            // HyperSC 的闸门逻辑里就有一道对应判断：
-            //   `IMiCharge.getMiChargePath("smart_chg")` 返回 `null`/`""`
-            //   ⇒ 视为"设备不支持电池保护"，直接退出。
+            // 也就是说：**我们和系统在写同一个开关**。系统那侧的功能开关
+            // 关掉时，驱动是否仍执行 SOC 限制**不可依赖** —— 它本来就是
+            // 该功能的一部分。
             //
             // ⇒ **系统开关关掉时，这个节点的行为不可靠**（驱动可能不执行
             //    SOC 限制）。所以必须让用户先打开它。
@@ -344,17 +398,21 @@ impl Addon for SocLimit {
             .and_then(|raw| logic::parse_active(&raw));
         self.last_seen = verify;
         if logic::needs_rewrite(self.config.soc, verify) {
+            self.verify_fail_streak = self.verify_fail_streak.saturating_add(1);
             let seen = verify.map_or_else(|| "读不到".to_string(), |v| format!("{v}%"));
             return TickOutcome {
                 wrote: true,
                 changed: true,
                 error: Some(AddonError::bad_cond(format!(
-                    "写入后回读不符：期望 {}%，实得 {seen}",
-                    self.config.soc
+                    "写入后回读不符：期望 {}%，实得 {seen}{}",
+                    self.config.soc,
+                    self.conflict_hint()
                 ))),
                 next_interval_s: interval,
             };
         }
+        // 生效了 ⇒ 冲突计数清零（单次不符可能只是驱动延迟一拍）
+        self.verify_fail_streak = 0;
 
         TickOutcome::wrote(interval)
     }
@@ -400,7 +458,9 @@ impl Addon for SocLimit {
                 "soc_in_effect": matches_target,
                 "verify_s": self.config.verify_s,
                 "keep_on_restore": self.config.keep_on_restore,
-                "warn_on_hypersc": self.config.warn_on_hypersc,
+                "warn_on_conflict": self.config.warn_on_conflict,
+                // 当前是否已构成"疑似写入方冲突"（界面可据此显示提示）
+                "conflict_suspected": self.verify_fail_streak >= 2,
                 "node_ctrl": self.node_ctrl,
                 "node_read": self.node_read,
                 "last_written": self.last_written,

@@ -374,7 +374,7 @@ pub const KEYS: &[KeySpec] = &[
     spec("limit.soc", KeyKind::Int { min: 60, max: 100 }),
     spec("limit.verify_s", KeyKind::Int { min: 5, max: 300 }),
     spec("limit.keep_on_restore", KeyKind::Bool),
-    spec("limit.warn_on_hypersc", KeyKind::Bool),
+    spec("limit.warn_on_conflict", KeyKind::Bool),
     // ── §9 日志分区（3）──
     spec("log.level", KeyKind::Enum(LOG_LEVELS)),
     spec("log.csv", KeyKind::Bool),
@@ -487,7 +487,7 @@ pub fn default_config() -> Value {
             "soc": 80,
             "verify_s": 15,
             "keep_on_restore": true,
-            "warn_on_hypersc": true
+            "warn_on_conflict": true
         },
         "curve": [
             {"t_max": 38.0, "curr": 18400000},
@@ -664,6 +664,47 @@ impl ConfigStore {
                 log::info!("配置迁移（模式 {id}）：tighten_curr {old_ua} μA → {watts} W");
                 migrated = true;
             }
+        }
+
+        // ── 一次性迁移：`limit.warn_on_hypersc` → `limit.warn_on_conflict` ──
+        //
+        // 🔴 背景（2026-10-16）：用户要求「去掉 HyperSC 的信息」——
+        //    配置键名里不该出现某个具体第三方模块的名字。
+        //    语义也本来就更宽：会写 `smart_chg` 这个节点的程序不止一个，
+        //    写死一个名字将来必然过时。
+        //
+        // 🔴 位置同样关键：**必须在"逐键补默认"之前**。
+        //    补默认会把缺失的 `warn_on_conflict` 填成 `true` ——
+        //    一旦填上，只要用户曾经把旧键设成 `false`，
+        //    这次"改名"就会**静默把他的选择翻转回 true**。
+        //
+        // | 场景 | 行为 |
+        // |---|---|
+        // | 全新安装（两个键都没有） | 不迁移，走出厂默认 `true` |
+        // | 老存档（只有旧键） | 把旧键的**值**搬过来，然后删掉旧键 |
+        // | 已迁移过（只有新键） | 不碰 |
+        // | 两个键都有 | **以新键为准**，只删旧键 |
+        //
+        // ⚠️ 这里与上面那条 `tighten_curr` 迁移的处理**刻意不同**：
+        //    那条保留旧键（"原键保留但不再参与决策"），这条**删掉旧键**。
+        //    理由：这是个纯改名（值域完全一样，bool → bool），
+        //    旧键没有任何存在价值；留着反而会让人以为它还在生效。
+        //    而 `tighten_curr` 是**语义变了**（电流→功率），
+        //    留着旧键有助于用户对照排查。
+        if value.pointer("/limit/warn_on_hypersc").is_some() {
+            if value.pointer("/limit/warn_on_conflict").is_none() {
+                let old = value
+                    .pointer("/limit/warn_on_hypersc")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                set_path(&mut value, "limit.warn_on_conflict", json!(old));
+                log::info!("配置迁移：limit.warn_on_hypersc → limit.warn_on_conflict（值 {old}）");
+            }
+            // 删旧键：`pointer_mut` 拿到对象后 remove
+            if let Some(obj) = value.pointer_mut("/limit").and_then(Value::as_object_mut) {
+                obj.remove("warn_on_hypersc");
+            }
+            migrated = true;
         }
 
         // 逐键补默认（缺失才补，已有不动）
@@ -1796,6 +1837,82 @@ mod tests {
             );
         }
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ────────────────────────────────────────────────────────────
+    //  `limit.warn_on_hypersc` → `limit.warn_on_conflict` 改名迁移
+    //
+    //  ⚠️ 测试里的这个键名是**历史事实**（老存档里就长这样），
+    //     必须原样使用才能验证迁移；产品代码里已经不再出现它。
+    // ────────────────────────────────────────────────────────────
+
+    /// 老存档里的 `warn_on_hypersc` **值**要搬到新键上
+    ///
+    /// ⚠️ 这条必须是"值搬运"而不是"建个默认值"：
+    ///    用户如果把提示**关掉过**（`false`），改名时若不搬值，
+    ///    补默认会把它翻回 `true` —— 静默改变用户的选择，
+    ///    违反项目规则「不可静默修正」。
+    #[test]
+    fn 冲突提示开关改名时值要迁移() {
+        for old_value in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "thermo_mig_conflict_{}_{}",
+                std::process::id(),
+                i32::from(old_value)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.json");
+
+            let mut old = default_config();
+            // 模拟老存档：只有旧键，且值是用户设过的
+            old["limit"]
+                .as_object_mut()
+                .unwrap()
+                .remove("warn_on_conflict");
+            old["limit"]["warn_on_hypersc"] = json!(old_value);
+            std::fs::write(&path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+
+            let s = ConfigStore::load(&path);
+
+            assert_eq!(
+                s.get_bool("limit.warn_on_conflict"),
+                old_value,
+                "旧值 {old_value} 必须搬到新键上（不能被默认值覆盖）"
+            );
+
+            // 旧键必须被**删掉** —— 留着会让人以为它还在生效
+            let text = std::fs::read_to_string(&path).unwrap();
+            let on_disk: Value = serde_json::from_str(&text).unwrap();
+            assert!(
+                on_disk.pointer("/limit/warn_on_hypersc").is_none(),
+                "旧键应当已从落盘内容里删除，实得：{text}"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// 两个键都在时，**以新键为准**，只删旧键
+    ///
+    /// （"迁移过一次之后用户又手改了旧键"这种情形不能反过来覆盖新键。）
+    #[test]
+    fn 两个键都在时以新键为准() {
+        let dir = std::env::temp_dir().join(format!("thermo_mig_both_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        let mut old = default_config();
+        old["limit"]["warn_on_conflict"] = json!(false); // 用户后设的新键
+        old["limit"]["warn_on_hypersc"] = json!(true); // 残留的旧键
+        std::fs::write(&path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+
+        let s = ConfigStore::load(&path);
+
+        assert!(
+            !s.get_bool("limit.warn_on_conflict"),
+            "新键已存在时不得被旧键覆盖"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

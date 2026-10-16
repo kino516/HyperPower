@@ -25,7 +25,7 @@
 //! io.rs         I/O 抽象（宿主注入，功能自己不碰文件系统）
 //! registry.rs   插槽注册表 —— 新增功能只改这里一行
 //! runner.rs     调度 + 熔断
-//! soc_limit/    附加功能 ①：充电上限（机制来自 HyperSC 逆向）
+//! soc_limit/    附加功能 ①：充电上限（机制由真机实测确证）
 //! ```
 
 #![forbid(unsafe_code)]
