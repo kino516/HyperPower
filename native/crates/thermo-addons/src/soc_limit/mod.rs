@@ -34,6 +34,42 @@ pub const SMART_CHG_CANDIDATES: &[&str] = &[
     "/sys/class/charger/smart_charge/smart_chg",
 ];
 
+/// **使用前提**文案（界面与 `limit show` 共用同一份）
+///
+/// 用户明确要求（2026-10-16）：「加上提示：此模块需打开电池健康保护功能」。
+///
+/// ## 为什么这不是"多余的提醒"
+///
+/// `smart_charge/*` 这一组节点属于系统「电池保护」功能的实现 ——
+/// 系统设置里的「智能断充」（默认 80%）改的就是同一个节点。
+/// 开关关掉时驱动是否仍执行 SOC 限制**不可依赖**，因此这是**真实前提**，
+/// 不是免责声明。
+///
+/// ## 措辞为什么把两个名字都写上
+///
+/// 同一个开关在不同 HyperOS 版本 / 机型上叫法不同：
+///
+/// | 叫法 | 出现位置 |
+/// |---|---|
+/// | **电池健康保护** | 部分新版设置项名称 |
+/// | **电池保护** | 设置路径与系统组件名（`ChargeProtectFragment`） |
+///
+/// 只写一个名字，另一个版本的用户会在设置里**找不到**，然后以为
+/// 提示写错了。写上两个 + 路径，任何版本都能对上。
+pub const REQUIRES_BATTERY_PROTECT: &str =
+    "需先在系统设置中打开「电池健康保护」（设置 → 省电与电池 → 电池保护）";
+
+/// **系统界面不同步**的说明（界面用）
+///
+/// 这是 HyperSC 逆向里明确列为"必须处理的边界"的一条：
+/// HyperSC 靠 hook `ChargeProtectFragment` 把界面上的 80% 改成用户设的值，
+/// 而**本模块没有 hook 层**（纯 root + sysfs），改不了系统界面。
+///
+/// 不说清楚的话，用户设了 90% 却看到系统设置里写着 80%，
+/// 会判断成"没生效" —— 而实际上限制**已经生效**了（写的是同一个节点）。
+pub const NOTE_UI_NOT_SYNCED: &str =
+    "系统设置里显示的百分比不会跟着变（那是系统自己的文案）。以本页的「已生效」为准。";
+
 /// 由控制节点推出"生效值"节点（同目录的 `soc_limit`）
 fn read_node_for(ctrl: &str) -> String {
     match ctrl.rfind('/') {
@@ -150,6 +186,27 @@ impl Addon for SocLimit {
             origin:
                 "节点机制来自 HyperSC（com.zephyr.smartcharge）逆向；本模块独立实现，不引用其代码",
             default_interval_s: 15,
+            // ⚠️ **使用前提**（用户明确要求加上，2026-10-16）
+            //
+            // # 为什么这个前提是真的
+            //
+            // 本功能写的是 `smart_charge/smart_chg` —— 它属于系统
+            // 「电池保护」（HyperOS 里也叫「电池健康保护」）功能的实现，
+            // 与 `com.miui.securitycenter` 的 `ChargeProtectFragment`
+            // 是同一套东西：系统 UI 改的是这个节点上的 80% 默认值，
+            // 而我们改的是同一个节点上的自定义值。
+            //
+            // HyperSC 的闸门逻辑里就有一道对应判断：
+            //   `IMiCharge.getMiChargePath("smart_chg")` 返回 `null`/`""`
+            //   ⇒ 视为"设备不支持电池保护"，直接退出。
+            //
+            // ⇒ **系统开关关掉时，这个节点的行为不可靠**（驱动可能不执行
+            //    SOC 限制）。所以必须让用户先打开它。
+            //
+            // ⚠️ 未插充电器时驱动**只记录不执行**（dmesg:
+            //    `adapter is plugout, don't handle soc limit`），
+            //    因此"没插电时看不到效果"是正常的，与开关无关。
+            requires: Some(REQUIRES_BATTERY_PROTECT),
         }
     }
 
@@ -169,9 +226,28 @@ impl Addon for SocLimit {
 
         self.node_ctrl = None;
         self.node_read = None;
+        // ⚠️ 找不到节点时，**先怀疑系统开关、再怀疑机型**
+        //
+        // # 为什么把"电池保护没开"放在第一位
+        //
+        // 这两种原因的**表象完全相同**（都表现为节点不存在或不可写），
+        // 但处理成本差了一个数量级：
+        //
+        // | 原因 | 用户要做什么 | 成本 |
+        // |---|---|---|
+        // | **电池保护开关没开** | 去设置里打开 | 10 秒 |
+        // | 机型真的不支持 | 无解，放弃该功能 | —— |
+        //
+        // 若只写"本机型不支持"，绝大多数用户会直接放弃 ——
+        // 而他们很可能只是**少开了一个开关**。
+        //
+        // 反过来写（先提示查开关）不会误导：真不支持的机型用户
+        // 查完开关发现本来就是开的，自然得出"确实不支持"的结论。
         let outcome = ProbeOutcome::Unsupported {
             reason: format!(
-                "未找到可写的 smart_chg 节点（已尝试 {} 条候选路径）",
+                "未找到可写的 smart_chg 节点。请先确认系统设置里已打开「电池健康保护」\
+                 （设置 → 省电与电池 → 电池保护）；若本来就开着，则本机型可能不支持充电上限\
+                 （已尝试 {} 条候选路径）",
                 SMART_CHG_CANDIDATES.len()
             ),
         };
@@ -292,6 +368,16 @@ impl Addon for SocLimit {
 
     fn status(&self) -> AddonStatus {
         let spec = self.spec();
+        // 「已生效」的判据：**读 soc_limit**（驱动报告的生效值）
+        //
+        // ⚠️ 不能用 `smart_chg` 的读值 —— 它在 16/17/80 之间漂移，
+        //    与写入值无稳定对应关系（真机实测确证）。详见 [`logic`] 的文档。
+        //
+        // 未插充电器时驱动只记录不执行，此时 `soc_limit` 可能读到一个
+        // 与目标不符的值 —— 这**不是失败**，插电后自会生效。
+        // 因此这里只如实报告"实际读到多少"，不在后端做"是否生效"的判决。
+        let active = self.last_seen;
+        let matches_target = active == Some(self.config.soc);
         AddonStatus {
             id: spec.id.to_string(),
             label: spec.label.to_string(),
@@ -305,9 +391,13 @@ impl Addon for SocLimit {
                 .support
                 .as_ref()
                 .map_or_else(|| "尚未探测".to_string(), |p| p.message().to_string()),
+            // ⚠️ 与 `spec().requires` **同源** —— 界面与 CLI 拿同一份文案
+            requires: spec.requires.map(str::to_string),
             detail: json!({
                 "soc_target": self.config.soc,
-                "soc_active": self.last_seen,
+                "soc_active": active,
+                // 目标与生效是否一致（界面据此决定要不要提示"尚未生效"）
+                "soc_in_effect": matches_target,
                 "verify_s": self.config.verify_s,
                 "keep_on_restore": self.config.keep_on_restore,
                 "warn_on_hypersc": self.config.warn_on_hypersc,
@@ -315,6 +405,9 @@ impl Addon for SocLimit {
                 "node_read": self.node_read,
                 "last_written": self.last_written,
                 "write_count": self.write_count,
+                // 系统界面不会同步 —— 必须主动说明，否则用户看到系统的
+                // 80% 会以为没生效
+                "note_ui_not_synced": NOTE_UI_NOT_SYNCED,
             }),
         }
     }

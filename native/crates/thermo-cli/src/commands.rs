@@ -1201,6 +1201,13 @@ fn addon_show(ctx: &Ctx<'_>, id: &str) -> Response {
         return Ctx::err(ErrorCode::Range, format!("未知附加功能：{id}"));
     };
     let st = slot.status();
+    // ⚠️ 这里**手工重建** JSON（而不是直接序列化 `AddonStatus`），
+    //    因为还要并入 5 个来自 `slot` 的运行期字段。
+    //
+    //    ⚠️ **代价**：`AddonStatus` 每加一个字段，这里都要跟一次 ——
+    //    2026-10-16 就漏过一次（新增 `requires` 后 `limit show` 里查不到，
+    //    而界面上有 —— 同一份信息两个出口不一致）。
+    //    为此加了 `附加功能状态字段不会漏进命令行输出` 测试守着。
     ctx.data(json!({
         "addon_api_version": thermo_addons::ADDON_API_VERSION,
         "id": st.id,
@@ -1212,6 +1219,9 @@ fn addon_show(ctx: &Ctx<'_>, id: &str) -> Response {
         "tripped": st.tripped,
         "interval_s": st.interval_s,
         "probe": st.probe,
+        // 使用前提（用户要求 2026-10-16）
+        // 界面与 CLI 必须是**同一份文案**，否则用户看到两个说法会以为哪个是错的
+        "requires": st.requires,
         "consecutive_failures": slot.consecutive_failures(),
         "last_error": slot.last_error().map(|e| e.to_string()),
         "writes": slot.writes(),
@@ -2038,6 +2048,83 @@ mod tests {
             crate::paths::MODULE_DIR,
             "WebUI 的 MODULE_DIR 与 Rust 的 MODULE_DIR 不一致 —— \
              改 id 时漏改了 api.ts，界面会**整个失效**"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────
+    //  附加功能输出完整性
+    // ────────────────────────────────────────────────────────────
+
+    /// `AddonStatus` 的每个字段都必须出现在 `limit show` 的输出里
+    ///
+    /// # 这个测试是为一次真实事故加的（2026-10-16）
+    ///
+    /// 用户要求「加上提示：此模块需打开电池健康保护功能」时，
+    /// 我给 `AddonStatus` 加了 `requires` 字段 —— 界面**立刻**显示了，
+    /// 但 `addon_show` 是**手工重建 JSON** 的（它还要并入 5 个来自
+    /// `slot` 的运行期字段，不能直接序列化），那行没跟 ⇒
+    /// **`ctl limit show` 里查不到这条提示**。
+    ///
+    /// 同一份信息两个出口不一致，而且不报错 —— 属于最难发现的一类。
+    ///
+    /// # 为什么用"比对"而不是"手抄字段名"
+    ///
+    /// 手抄的清单本身就是**会漏的那一份**（它就是 `addon_show` 里
+    /// 那张手工清单的副本）。这里改成**从真实 `AddonStatus` 序列化出键集**
+    /// 再与实际输出比对 ⇒ 以后谁给 `AddonStatus` 加了字段，
+    /// 这个测试会直接失败，并指出漏了哪个键。
+    #[test]
+    fn 附加功能状态字段不会漏进命令行输出() {
+        let (ctx, ..) = ctx_with(ConfigStore::with_defaults("x"));
+
+        // "应当输出的全部字段" —— 来自类型本身，不是手抄
+        let st = ctx
+            .addons
+            .slot("soc_limit")
+            .expect("soc_limit 应当已注册")
+            .status();
+        let expected = serde_json::to_value(&st).expect("AddonStatus 应当可序列化");
+        let expected_obj = expected
+            .as_object()
+            .expect("AddonStatus 序列化后应当是对象");
+
+        // "实际输出了什么"
+        let r = addon_show(&ctx, "soc_limit");
+        let Response::Ok { data: Some(d), .. } = r else {
+            panic!("limit show 应当返回数据，实际：{r:?}");
+        };
+        let actual = d.as_object().expect("输出应当是 JSON 对象");
+
+        let missing: Vec<&String> = expected_obj
+            .keys()
+            .filter(|k| !actual.contains_key(*k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "这些字段在 `AddonStatus` 里有，但 `addon_show` 没输出：{missing:?} —— \
+             `ctl limit show` 会缺这些信息（界面上却看得到）"
+        );
+    }
+
+    /// 使用前提必须同时出现在 `spec` 与 CLI 输出里（用户要求 2026-10-16）
+    ///
+    /// 这条与上一条的差别：上一条防**漏字段**，这条防**字段是空的**——
+    /// 建了字段却忘记赋值，比对测试照样通过。
+    #[test]
+    fn 使用前提必须真的输出到命令行() {
+        let (ctx, ..) = ctx_with(ConfigStore::with_defaults("x"));
+
+        let r = addon_show(&ctx, "soc_limit");
+        let Response::Ok { data: Some(d), .. } = r else {
+            panic!("limit show 应当返回数据");
+        };
+
+        let requires = d["requires"]
+            .as_str()
+            .expect("`limit show` 必须输出使用前提（不能是 null）");
+        assert!(
+            requires.contains("电池保护") || requires.contains("电池健康保护"),
+            "使用前提要点名那个系统开关，实得：{requires}"
         );
     }
 }

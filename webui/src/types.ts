@@ -161,6 +161,18 @@ export interface SocLimitDetail {
   warn_on_hypersc: boolean;
   /** 累计写入次数 */
   write_count: number;
+  /**
+   * **系统设置界面显示的百分比不会同步**的说明
+   *
+   * HyperSC 靠 hook `ChargeProtectFragment` 把系统设置页上的 80% 改掉；
+   * 本模块是纯 root + sysfs，**没有 hook 层**，改不了系统界面。
+   *
+   * 不说清楚的话：用户设了 90%，进系统设置一看仍写着 80%，
+   * 判断成"没生效" —— 而实际上限制**已经生效**（写的是同一个节点）。
+   *
+   * ⚠️ 文案来自后端，前端只管显示。
+   */
+  note_ui_not_synced?: string;
 }
 
 /** 附加功能状态 */
@@ -177,6 +189,18 @@ export interface AddonStatus {
   origin: string;
   /** 探测结果描述 */
   probe: string;
+  /**
+   * **使用前提**（给用户看的提示）
+   *
+   * 🔴 用户要求（2026-10-16）：「加上提示：此模块需打开电池健康保护功能」。
+   *
+   * ⚠️ 与后端 `AddonSpec::requires` **同源** —— 服务端已在 `AddonStatus`
+   *    里展开，前端只管显示，**不要在这里再写一份文案**
+   *    （两处各写一份，迟早会不一致）。
+   *
+   * `undefined` = 该功能没有特殊前提（或后端版本较老）。
+   */
+  requires?: string;
   summary: string;
   supported: boolean;
   ticks: number;

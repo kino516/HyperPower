@@ -1237,6 +1237,9 @@ function mockLimit(): AddonStatus {
       verify_s: 15,
       warn_on_hypersc: true,
       write_count: 3,
+      // 与后端 `NOTE_UI_NOT_SYNCED` 同款文案（演示模式要能看出这块提示的样子）
+      note_ui_not_synced:
+        "系统设置里显示的百分比不会跟着变（那是系统自己的文案）。以本页的「已生效」为准。",
     },
     enabled: demo.limitEnabled,
     errors: 0,
@@ -1246,6 +1249,9 @@ function mockLimit(): AddonStatus {
     last_error: null,
     origin: "节点机制来自 HyperSC 逆向；本模块独立实现",
     probe: "命中 smart_chg",
+    // 与后端 `REQUIRES_BATTERY_PROTECT` 同款文案
+    requires:
+      "需先在系统设置中打开「电池健康保护」（设置 → 省电与电池 → 电池保护）",
     summary: "充到指定电量即停止，保护电池寿命",
     supported: true,
     ticks: 5,

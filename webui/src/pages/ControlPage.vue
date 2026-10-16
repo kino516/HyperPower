@@ -652,6 +652,28 @@ const limitEnabled = computed(() => limitInfo.value?.enabled ?? false);
 const socTarget = computed(() => limitInfo.value?.detail.soc_target ?? 80);
 const socActive = computed(() => limitInfo.value?.detail.soc_active ?? null);
 
+/**
+ * **使用前提**（后端 `spec.requires`）—— 卡片顶部那块提示
+ *
+ * 🔴 用户要求（2026-10-16）：「加上提示：此模块需打开电池健康保护功能」。
+ *
+ * ⚠️ 文案**来自后端**（`soc_limit::REQUIRES_BATTERY_PROTECT`），不在这里
+ *    硬编码 —— `limit show` 输出的是同一份，两处各写一份必然会有一天对不上。
+ *
+ * `null`（后端未提供）时整块提示不渲染，因此对不支持前提的老版本也安全。
+ */
+const limitRequires = computed(() => limitInfo.value?.requires ?? null);
+
+/**
+ * **系统界面不会同步**的说明（后端 `detail.note_ui_not_synced`）
+ *
+ * 设了 90% 但系统设置页仍显示 80% —— 用户会误判成"没生效"。
+ * 必须主动说明，否则这是"看起来失败其实成功了"的典型陷阱。
+ */
+const limitUiNote = computed(
+  () => limitInfo.value?.detail.note_ui_not_synced ?? null,
+);
+
 /** 本机支持的电量区间（不写死 60~100，机型不同范围不同） */
 const socMin = computed(() => socRange.value[0]);
 const socMax = computed(() => socRange.value[1]);
@@ -1134,6 +1156,17 @@ async function applySoc(): Promise<void> {
     <MiuixSmallTitle text="充电上限" />
     <MiuixCard v-if="!loading && !limitSupported">
       <MiuixText type="title4">本机不支持</MiuixText>
+      <!--
+        ⚠️ 不支持时**必须先提示检查系统开关**
+
+        节点找不到有两种原因，表象完全相同：
+          · 系统「电池健康保护」没打开 —— 用户花 10 秒就能解决
+          · 机型真的不支持 —— 无解
+
+        若只写"本机型不支持"，绝大多数用户会直接放弃，
+        而他们很可能只是少开了一个开关。后端的 `probe` 文案已经把
+        开关检查放在第一位，这里原样透出即可。
+      -->
       <MiuixText
         type="footnote1"
         color="var(--m-color-on-surface-secondary)"
@@ -1144,6 +1177,30 @@ async function applySoc(): Promise<void> {
     </MiuixCard>
 
     <MiuixCard v-else>
+      <!--
+        ┌─ 使用前提（用户要求，2026-10-16）─────────────────────────┐
+
+        用户原话：「加上提示：此模块需打开电池健康保护功能」。
+
+        为什么必须**置于卡片顶部**而不是折在末尾：
+        少了这个开关，整个功能都不会生效。用户如果先看到开关、
+        设好 90%、结果没生效，再回头找原因 —— 这个体验很糟。
+        把前提放在动手之前，就不会走这段弯路。
+
+        文案来自后端 `spec.requires`（与 `limit show` 同一份），
+        不在前端硬编码 —— 两处各写一份必然有一天会不一致。
+      -->
+      <div v-if="limitRequires" class="notice notice--warn">
+        <MiuixText type="body2" color="var(--m-color-on-tertiary-container)">
+          <b>使用前提</b>
+        </MiuixText>
+        <MiuixText type="footnote1" color="var(--m-color-on-tertiary-container)">
+          {{ limitRequires }}
+        </MiuixText>
+      </div>
+
+      <MiuixDivider class="gap" />
+
       <!-- 总开关 -->
       <div class="row">
         <div class="row__text">
@@ -1231,6 +1288,25 @@ async function applySoc(): Promise<void> {
         <MiuixText type="footnote1">
           <b>关闭开关不会改写驱动里的限制值</b> —— 手机会继续停在当前上限。
           想恢复满充，把目标调成 {{ socMax }}% 即可。
+        </MiuixText>
+      </div>
+
+      <!--
+        ┌─ 系统界面不会同步（HyperSC 逆向里列为"必须处理的边界"）─────┐
+
+        HyperSC 靠 hook `ChargeProtectFragment` 把系统设置页上的 80%
+        改成用户设的值；本模块是**纯 root + sysfs，没有 hook 层**，
+        改不了系统界面的文案。
+
+        不说清楚的话：用户设了 90%，进系统设置一看仍写着 80%，
+        判断成"没生效" —— 而实际上限制**已经生效**（写的是同一个节点）。
+        这是"看起来失败其实成功了"的典型，必须在界面上说透。
+
+        文案来自后端 `detail.note_ui_not_synced`，与 `limit show` 同源。
+      -->
+      <div v-if="limitUiNote" class="notice">
+        <MiuixText type="footnote1" color="var(--m-color-on-surface-secondary)">
+          {{ limitUiNote }}
         </MiuixText>
       </div>
       <InfoRow

@@ -26,6 +26,25 @@ pub struct AddonSpec {
     pub origin: &'static str,
     /// 默认巡检间隔（秒）
     pub default_interval_s: u32,
+    /// **使用前提**（给用户看的提示）；`None` = 无特殊前提
+    ///
+    /// # 为什么需要它（2026-10-16 用户要求）
+    ///
+    /// 有的附加功能**不是自包含**的 —— 它依赖系统里的某个开关处于打开状态
+    /// 才有意义。最典型的就是充电上限：它写的 `smart_charge/smart_chg`
+    /// 节点属于系统「电池保护」功能的实现，开关关掉时行为不可靠。
+    ///
+    /// 这类前提必须**主动告诉用户**，否则用户会：
+    ///
+    /// | 用户做了什么 | 会得出什么错误结论 |
+    /// |---|---|
+    /// | 开关没开、功能无效 | "模块坏了" |
+    /// | 开关没开、恰好也没充电 | "看不出效果，大概是没用" |
+    ///
+    /// 而真实原因只是**少打开了一个系统开关** —— 一句话就能解决。
+    ///
+    /// ⚠️ 界面上要**置于该功能卡片显眼处**，不能塞进折叠区或详情末尾。
+    pub requires: Option<&'static str>,
 }
 
 /// 能力探测结果
@@ -175,6 +194,13 @@ pub struct AddonStatus {
     pub interval_s: u32,
     /// 探测详情
     pub probe: String,
+    /// **使用前提**（给用户看的提示）；`None` = 无特殊前提
+    ///
+    /// 与 [`AddonSpec::requires`] 同源 —— 这里展开出来是为了让
+    /// `limit show` / `addon list` 与界面拿到**同一份文案**，
+    /// 不必各自硬编码一份（两处不一致时必然有一处是错的）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires: Option<String>,
     /// 各自的细节（由功能自定义，便于前端展示）
     pub detail: serde_json::Value,
 }

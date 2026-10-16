@@ -409,6 +409,120 @@ fn 节点不存在时判定为不支持() {
     assert!(addon.node_ctrl().is_none());
 }
 
+// ============================================================
+//  ⑨ 使用前提（用户要求 2026-10-16 新增）
+//
+//  「加上提示：此模块需打开电池健康保护功能」
+// ============================================================
+
+/// 功能必须**自报使用前提**，且界面与 CLI 拿的是同一份文案
+///
+/// # 为什么这是个必须锁死的契约
+///
+/// `smart_charge/*` 这组节点属于系统「电池保护」功能的实现 ——
+/// 系统设置里的「智能断充」（默认 80%）改的就是同一个节点。
+/// 开关关掉时驱动是否仍执行 SOC 限制**不可依赖**。
+///
+/// 这个前提如果只写在 README 里，用户看不到（多数人是直接刷模块）；
+/// 只写在前端里，`limit show` 又看不到。因此必须在 `spec()` 里，
+/// 由服务端展开给两边共用。
+#[test]
+fn 功能自报使用前提() {
+    let addon = SocLimit::new(SocLimitConfig::default());
+    let requires = addon.spec().requires.expect("充电上限必须有使用前提");
+
+    // 必须点名那个系统开关 —— 只说"需打开某功能"等于没说
+    assert!(
+        requires.contains("电池健康保护") || requires.contains("电池保护"),
+        "前提文案要点名系统开关，实得：{requires}"
+    );
+    // 必须给出**路径**，否则用户不知道去哪找
+    assert!(
+        requires.contains("省电与电池"),
+        "前提文案要给出设置路径，实得：{requires}"
+    );
+}
+
+/// `status().requires` 必须与 `spec().requires` **逐字一致**
+///
+/// 服务端展开一份、前端再硬编码一份的话，迟早有一天会对不上 ——
+/// 而对不上时，用户看到的提示与 CLI 输出的提示互相矛盾。
+#[test]
+fn 状态里的前提与自我介绍一致() {
+    let mut io = FakeIo::hyperos();
+    let addon = probed(SocLimitConfig::default(), &mut io);
+
+    let spec = addon.spec();
+    let status = addon.status();
+
+    assert_eq!(
+        status.requires.as_deref(),
+        spec.requires,
+        "status().requires 必须与 spec().requires 同源"
+    );
+}
+
+/// 系统界面不会同步 —— 必须主动说明
+///
+/// HyperSC 靠 hook `ChargeProtectFragment` 改系统设置页的文案；
+/// 本模块是纯 root + sysfs，**没有 hook 层**。
+///
+/// 不说清楚的话：用户设了 90%、进系统设置一看仍写着 80%，
+/// 会判断成"没生效" —— 而实际上限制**已经生效**。
+/// 这是"看起来失败其实成功了"的典型，必须在界面上说透。
+#[test]
+fn 说明系统界面不会同步() {
+    let mut io = FakeIo::hyperos();
+    let addon = probed(SocLimitConfig::default(), &mut io);
+    let note = addon.status().detail["note_ui_not_synced"]
+        .as_str()
+        .expect("必须提供「系统界面不会同步」的说明")
+        .to_string();
+
+    assert!(
+        note.contains("不会") || note.contains("以本页"),
+        "说明要点出「系统显示不会同步」，实得：{note}"
+    );
+}
+
+/// 探测失败时**先让用户查系统开关**，而不是一句"机型不支持"
+///
+/// 两种原因（开关没开 / 机型不支持）表象完全相同，但处理成本差一个
+/// 数量级：前者花 10 秒，后者无解。若只写"本机型不支持"，
+/// 绝大多数用户会直接放弃 —— 而他们很可能只是少开了一个开关。
+#[test]
+fn 探测失败时优先提示检查系统开关() {
+    let mut io = FakeIo::default(); // 空节点树
+    let mut addon = SocLimit::new(SocLimitConfig::default());
+    let outcome = addon.probe(&mut io);
+
+    let msg = outcome.message();
+    assert!(
+        msg.contains("电池保护"),
+        "失败原因里要先提示检查系统开关，实得：{msg}"
+    );
+    // 但也不能只提开关 —— 真不支持的机型也要能得出结论
+    assert!(
+        msg.contains("机型") || msg.contains("不支持"),
+        "也要保留「机型可能不支持」的判断依据，实得：{msg}"
+    );
+}
+
+/// `soc_in_effect` 如实反映"目标与驱动的生效值是否一致"
+///
+/// ⚠️ 判据必须是读 `soc_limit` 得到的值 —— `smart_chg` 的读值在
+///    16/17/80 之间漂移，与写入值无稳定对应关系（真机实测确证）。
+#[test]
+fn 生效判据取自soc_limit读数() {
+    let mut io = FakeIo::hyperos(); // 生效值当前是 80
+    let addon = probed(enabled_config(80), &mut io);
+
+    // 未经 tick，last_seen 还是 None ⇒ 不能谎报"已生效"
+    let s = addon.status();
+    assert_eq!(s.detail["soc_target"], 80);
+    assert_eq!(s.detail["soc_in_effect"], false, "还没读到就不该说已生效");
+}
+
 #[test]
 fn 命中候选路径并推出读取节点() {
     let mut io = FakeIo::hyperos();
