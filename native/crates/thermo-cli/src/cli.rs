@@ -941,7 +941,7 @@ pub fn run_probe(official: bool, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("=== 档位表（设备树直读）===");
+    println!("=== 档位上限 ===");
     match crate::sysfs::GearTable::detect() {
         Ok((t, path)) => {
             println!("路径    : {path}");
@@ -959,8 +959,35 @@ pub fn run_probe(official: bool, json: bool) -> Result<()> {
         Err(e) => {
             // 候选路径的逐条探测统一在 `print_candidate_tables()` 输出
             // （这里只说明失败本身，避免重复刷屏）
-            println!("读取失败（将退回档案边界）: {e:#}");
-            println!("（候选路径的逐条探测见下方「候选路径探测总表」）");
+            //
+            // ⚠️ 2026-10-19：**没有档位表节点不等于失败**
+            //
+            // 标准 `power_supply` 框架的机型本来就没有档位表，它的档位
+            // 上限由 `charge_control_limit_max` 给出。旧文案一律写
+            // "读取失败"，让用户以为自己的机器坏了 —— 而真相是
+            // "这个机型用的是另一套接口"。
+            let has_node = crate::sysfs::GEAR_TABLE_CANDIDATES
+                .iter()
+                .any(|p| crate::sysfs::Node::new(*p).exists());
+            if has_node {
+                println!("读取失败（将退回档案边界）: {e:#}");
+            } else {
+                println!("本机型没有档位表节点（不是故障）—— 档位上限改由节点给出：");
+                let mut shown = false;
+                for p in crate::sysfs::GEAR_MAX_CANDIDATES {
+                    if let Ok(raw) = std::fs::read(p) {
+                        if let Ok(s) = std::str::from_utf8(&raw) {
+                            println!("  {p} = {}", s.trim());
+                            shown = true;
+                            break;
+                        }
+                    }
+                }
+                if !shown {
+                    println!("  连 charge_control_limit_max 也没读到 ⇒ 档位上限暂按 0~30 处理");
+                }
+                println!("（候选路径的逐条探测见下方「候选路径探测总表」）");
+            }
         }
     }
 
@@ -1082,8 +1109,6 @@ fn pad_path(p: &str, width: usize) -> String {
 ///
 /// ⚠️ 只读：`exists()` / `is_writable()` 都只读元信息，不碰节点内容。
 fn print_candidate_tables() {
-    use crate::sysfs;
-
     println!();
     println!("=== 候选路径探测总表（路径因机型而异，换机型时看这里）===");
 
@@ -1092,10 +1117,14 @@ fn print_candidate_tables() {
     // 这些常量都是 `&[&str]`，语义统一，可以一起处理。
     let groups: &[(&str, &[&str], bool)] = &[
         // (名称, 候选表, 是否要求可写)
-        ("充电上限控制字", sysfs::SMART_CHG_CANDIDATES, true),
-        ("档位表（设备树）", sysfs::GEAR_TABLE_CANDIDATES, false),
-        ("电荷泵温度", sysfs::CP_DIE_TEMP_CANDIDATES, false),
-        ("硬件保护温度", sysfs::HW_MAX_TEMP_CANDIDATES, false),
+        ("充电上限控制字", crate::sysfs::SMART_CHG_CANDIDATES, true),
+        (
+            "档位表（设备树）",
+            crate::sysfs::GEAR_TABLE_CANDIDATES,
+            false,
+        ),
+        ("电荷泵温度", crate::sysfs::CP_DIE_TEMP_CANDIDATES, false),
+        ("硬件保护温度", crate::sysfs::HW_MAX_TEMP_CANDIDATES, false),
         // ⚠️ 这里原有「系统场景」（`SCENE_CANDIDATES`），已删除
         //    （2026-10-17 用户要求）。它既不参与决策、又翻译不出模式名，
         //    留在"换机型排查表"里只是占一行。
@@ -1106,16 +1135,16 @@ fn print_candidate_tables() {
     // 写死过 68，结果两条 71~73 字符的设备树路径仍不齐 ——
     // 而那两条恰好是换机型时最需要看清的（硬件保护温度）。
     // 硬编码任何宽度都会在某个机型上失效。
-    let mut w = sysfs::DECRYPT_TXT.chars().count();
+    let mut w = crate::sysfs::DECRYPT_TXT.chars().count();
     for (_, cands, _) in groups {
         for c in cands.iter() {
             w = w.max(c.chars().count());
         }
     }
-    for d in sysfs::CTRL_DIRS
+    for d in crate::sysfs::CTRL_DIRS
         .iter()
-        .chain(sysfs::BATTERY_DIRS)
-        .chain(sysfs::OFFICIAL_PARA_DIRS)
+        .chain(crate::sysfs::BATTERY_DIRS)
+        .chain(crate::sysfs::OFFICIAL_PARA_DIRS)
     {
         w = w.max(d.chars().count());
     }
@@ -1130,7 +1159,7 @@ fn print_candidate_tables() {
             continue;
         }
         for c in cands.iter() {
-            let n = sysfs::Node::new(*c);
+            let n = crate::sysfs::Node::new(*c);
             let mark = if !n.exists() {
                 "不存在"
             } else if *need_write && !n.is_writable() {
@@ -1144,23 +1173,31 @@ fn print_candidate_tables() {
 
     // ── ② 目录型候选（`xm_power` / `charger` / `power_supply` 三种命名）──
     //
-    // 这些是**目录**，实际节点由 `目录/固定名` 拼出来，因此单独处理。
+    // 这些是**目录**，实际节点由 `目录/候选名` 拼出来，因此单独处理。
     println!();
-    println!("  [控制节点目录] 实际节点 = 目录 + 固定文件名");
-    for d in sysfs::CTRL_DIRS {
-        let n = sysfs::Node::new(format!("{d}/wired_ctrl_limit"));
-        let mark = if n.exists() {
-            "✓ 目录有效"
-        } else {
-            "不存在"
+    println!("  [控制节点目录] 实际节点 = 目录 + 候选文件名");
+    for d in crate::sysfs::CTRL_DIRS {
+        // ⚠️ 判据必须涵盖**所有**名字候选（2026-10-19 修复）
+        //
+        // 原来只试 `wired_ctrl_limit`（小米封装层的名字），于是标准
+        // `power_supply` 框架的 `/sys/class/power_supply/battery`
+        // 被报成"不存在" —— 而同一份输出的下一段「[电池节点目录]」
+        // 里它明明是 ✓ 目录有效，自相矛盾。
+        let hit = crate::sysfs::CTRL_NAMES
+            .iter()
+            .chain(crate::sysfs::CURR_NAMES.iter())
+            .find(|n| crate::sysfs::Node::new(format!("{d}/{n}")).exists());
+        let mark = match hit {
+            Some(n) => format!("✓ 目录有效（{n}）"),
+            None => "不存在".to_string(),
         };
         println!("    {}{mark}", pad_path(d, w));
     }
 
     println!();
     println!("  [电池节点目录]");
-    for d in sysfs::BATTERY_DIRS {
-        let n = sysfs::Node::new(format!("{d}/temp"));
+    for d in crate::sysfs::BATTERY_DIRS {
+        let n = crate::sysfs::Node::new(format!("{d}/temp"));
         let mark = if n.exists() {
             "✓ 目录有效"
         } else {
@@ -1172,18 +1209,18 @@ fn print_candidate_tables() {
     // ── ③ 官方热控表（单文件）──
     println!();
     println!("  [官方温控表]（单文件，不是候选表）");
-    let f = std::path::Path::new(sysfs::DECRYPT_TXT);
+    let f = std::path::Path::new(crate::sysfs::DECRYPT_TXT);
     let mark = if f.is_file() {
         "✓ 命中"
     } else {
         "不存在"
     };
-    println!("    {}{mark}", pad_path(sysfs::DECRYPT_TXT, w));
+    println!("    {}{mark}", pad_path(crate::sysfs::DECRYPT_TXT, w));
 
     // ── ④ 官方充电曲线目录 ──
     println!();
     println!("  [官方充电曲线目录]");
-    for d in sysfs::OFFICIAL_PARA_DIRS {
+    for d in crate::sysfs::OFFICIAL_PARA_DIRS {
         let mark = if std::path::Path::new(d).is_dir() {
             "✓ 目录有效"
         } else {
@@ -1198,31 +1235,41 @@ fn print_candidate_tables() {
     println!();
     println!("  ── 汇总：本机**没探到**的功能 ──");
     let mut missing: Vec<String> = Vec::new();
-    if sysfs::SMART_CHG_CANDIDATES
+    if crate::sysfs::SMART_CHG_CANDIDATES
         .iter()
-        .all(|c| !sysfs::Node::new(*c).is_writable())
+        .all(|c| !crate::sysfs::Node::new(*c).is_writable())
     {
         missing.push("充电上限（SOC 上限）".to_string());
     }
-    if sysfs::GEAR_TABLE_CANDIDATES
+    if crate::sysfs::GEAR_TABLE_CANDIDATES
         .iter()
-        .all(|c| !sysfs::Node::new(*c).exists())
+        .all(|c| !crate::sysfs::Node::new(*c).exists())
     {
-        missing.push("档位表（档位边界将退回兜底）".to_string());
+        // ⚠️ 没有档位表**不一定是缺功能**（2026-10-19）
+        //
+        // 标准 `power_supply` 框架的机型本来就没有档位表，档位上限由
+        // `charge_control_limit_max` 给出。只有**两者都没有**时，
+        // 档位边界才真的要靠兜底 —— 那时才值得报进这一节。
+        let has_max_node = crate::sysfs::GEAR_MAX_CANDIDATES
+            .iter()
+            .any(|p| crate::sysfs::Node::new(*p).exists());
+        if !has_max_node {
+            missing.push("档位上限（档位表与节点都没有，将退回兜底）".to_string());
+        }
     }
-    if sysfs::CP_DIE_TEMP_CANDIDATES
+    if crate::sysfs::CP_DIE_TEMP_CANDIDATES
         .iter()
-        .all(|c| !sysfs::Node::new(*c).exists())
+        .all(|c| !crate::sysfs::Node::new(*c).exists())
     {
         missing.push("电荷泵温度（少一项观测，不影响控制）".to_string());
     }
-    if sysfs::HW_MAX_TEMP_CANDIDATES
+    if crate::sysfs::HW_MAX_TEMP_CANDIDATES
         .iter()
-        .all(|c| !sysfs::Node::new(*c).exists())
+        .all(|c| !crate::sysfs::Node::new(*c).exists())
     {
         missing.push("硬件保护温度（将改用官方热控表兜底）".to_string());
     }
-    if !std::path::Path::new(sysfs::DECRYPT_TXT).is_file() {
+    if !std::path::Path::new(crate::sysfs::DECRYPT_TXT).is_file() {
         missing.push("官方温控表（官方策略不可见，但控制不受影响）".to_string());
     }
 

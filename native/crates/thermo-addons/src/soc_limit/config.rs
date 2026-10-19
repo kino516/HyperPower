@@ -34,7 +34,29 @@ pub const SOC_PHYSICAL_MIN: u8 = 20;
 pub const SOC_PHYSICAL_MAX: u8 = 100;
 
 /// 兜底下限（%）—— 检测未跑过时使用
-pub const SOC_FALLBACK_MIN: u8 = 60;
+///
+/// # 55 不是随便定的（2026-10-19 真机证据）
+///
+/// K70 Pro 的驱动在拒绝越界写入时，dmesg 会明确打出允许区间：
+///
+/// ```text
+/// BATTERY_CHG: battery_psy_set_charge_end_threshold:
+///              Charge control end_threshold should be within [55 100]
+/// ```
+///
+/// 也就是说标准 `power_supply` 系的**下限是 55**，不是老机型
+/// （小米 `smart_chg`）那套的 60。
+///
+/// | 值 | 后果 |
+/// |---|---|
+/// | 写 50 | 被驱动拒绝（`write: Invalid argument`） |
+/// | 写 0 | 同样被拒绝 —— **0 不是"不限制"，而是非法值** |
+///
+/// ⚠️ 取 55 而不是 60：给到 60 会把"55~59"这段本来能用的区间白丢掉，
+///    用户想设 58% 会被界面直接挡住。宁可放开，越界时驱动会如实报错。
+/// ⚠️ 不同机型下限可能不同（有的 50、有的 60）。这里只是**检测未跑过
+///    时的兜底**；检测跑过之后用档案里的值。
+pub const SOC_FALLBACK_MIN: u8 = 55;
 /// 兜底上限（%）
 pub const SOC_FALLBACK_MAX: u8 = 100;
 

@@ -585,6 +585,9 @@ fn device(ctx: &Ctx<'_>, args: &Value) -> Response {
                     "method": p.probe_meta.method,
                     "needs_charge_for": p.probe_meta.needs_charge_for,
                     "failed_items": p.probe_meta.failed_items,
+                    // 待补测（因插电状态不满足而主动跳过的项）——
+                    // 与 `failed_items` 分开，界面用中性语气显示
+                    "pending_items": p.probe_meta.pending_items,
                     "notes": p.probe_meta.notes,
                 },
             }))

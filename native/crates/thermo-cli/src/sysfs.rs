@@ -60,6 +60,94 @@ fn with_root(p: &str) -> PathBuf {
     PathBuf::from(format!("{root}/{}", p.trim_start_matches('/')))
 }
 
+/// **调试模式**用的「外部环境快照」
+///
+/// # 为什么需要它
+///
+/// 决策链（`trace`）记录的都是**模块自己的视角**：温度、电流、决策结果。
+/// 但 2026-10-17 排查「充电功率异常」时发现，真正缺的是**外部环境**：
+///
+/// | 缺的信息 | 那次排查里的作用 |
+/// |---|---|
+/// | **充电器实际输出电压 / 电流** | 一眼看出充电器是否**降级**（9V→5V） |
+/// | **屏幕状态** | 用户怀疑「息屏功率低」，需要证据排除/确认 |
+/// | **`sconfig`（温控场景）** | 场景切换会让官方策略大变（实测 -1 ↔ 0） |
+///
+/// 没有这三样，只能像那次一样靠临时脚本 + adb 现场采集 —— 而问题往往
+/// 在用户不方便连接电脑的时候出现。
+///
+/// # ⚠️ 全部**尽力而为**
+///
+/// 每一项都返回 `Option`：机型不同、节点缺失、权限不足都很正常。
+/// **读不到就是 `None`**，绝不影响控制循环 —— 这是观测数据，
+/// 不是决策输入（与 `EventLog` / `HistoryStore` 同一套纪律）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvSnapshot {
+    /// 屏幕是否亮着
+    ///
+    /// 判据是 `/sys/class/backlight/*/bl_power`（标准 framebuffer 接口）：
+    /// `0` = 亮，非 `0` = 灭（`4` 即 `FB_BLANK_POWERDOWN`）。
+    ///
+    /// ⚠️ 不用 `brightness` 判断：实测息屏时它仍可能是非零残留值
+    /// （本机见过 `6`），拿它当判据会**始终判成亮屏**。
+    pub screen_on: Option<bool>,
+    /// 充电器（USB 侧）输出电压（μV）
+    pub usb_voltage_uv: Option<i64>,
+    /// 充电器（USB 侧）输出电流（μA）
+    pub usb_current_ua: Option<i64>,
+    /// 充电器类型原文（如 `USB_PD` / `USB` / `Unknown`）
+    pub usb_type: Option<String>,
+    /// 小米温控框架的场景编号（`-1` = 未设置）
+    pub sconfig: Option<i64>,
+}
+
+impl EnvSnapshot {
+    /// 读一次环境快照（**只读，任何一项失败都只是 `None`**）
+    pub fn read() -> Self {
+        Self {
+            screen_on: read_screen_on(),
+            usb_voltage_uv: read_i64_node("/sys/class/power_supply/usb/voltage_now"),
+            usb_current_ua: read_i64_node("/sys/class/power_supply/usb/current_now"),
+            usb_type: read_str_node("/sys/class/power_supply/usb/type"),
+            sconfig: read_i64_node("/sys/class/thermal/thermal_message/sconfig"),
+        }
+    }
+}
+
+/// 读一个整数节点（失败 → `None`）
+fn read_i64_node(path: &str) -> Option<i64> {
+    std::fs::read_to_string(with_root(path))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// 读一个字符串节点（失败 → `None`）
+fn read_str_node(path: &str) -> Option<String> {
+    let s = std::fs::read_to_string(with_root(path)).ok()?;
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// 屏幕是否亮着
+///
+/// 遍历 `/sys/class/backlight/` 下的设备目录，读第一个能读到的 `bl_power`。
+///
+/// ⚠️ 不写死 `panel0-backlight`：那个名字是**机型特定**的
+/// （高通平台常见 `panel0-backlight`，联发科可能是别的）。
+fn read_screen_on() -> Option<bool> {
+    let dir = with_root("/sys/class/backlight");
+    let entries = std::fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        let p = e.path().join("bl_power");
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            // 0 = 亮；非 0 = 灭（1~4 对应各级 blank）
+            return Some(s.trim() == "0");
+        }
+    }
+    None
+}
 /// 把「机身温度」节点的原始读数换算成 ℃
 ///
 /// # 为什么需要兼容两种单位
@@ -308,6 +396,55 @@ pub const CTRL_DIRS: &[&str] = &[
     "/sys/class/xm_power/charger/charger_thermal",
     "/sys/class/charger/charger_thermal",
     "/sys/class/power_supply/wired/charger_thermal",
+    // 标准 Linux `power_supply` 框架（控制节点直接挂在电池节点下）
+    //
+    // ⚠️ **不写具体机型** —— 这一套是上游内核的标准接口，任何
+    //    「没有小米 `charger_thermal` 封装层」的机型都可能命中。
+    //    实测 2026-10-19 的 K70 Pro（hyperOS 3）就属于这一类：
+    //    档位是 `charge_control_limit`（0~16）、电流是
+    //    `constant_charge_current`（μA），都在这个目录下。
+    "/sys/class/power_supply/battery",
+];
+
+/// 控制节点组里「档位」的**文件名候选**（按优先级）
+///
+/// | 名字 | 出处 |
+/// |---|---|
+/// | `wired_ctrl_limit` | 小米 `charger_thermal` 封装层（hyperOS 4 一类） |
+/// | `charge_control_limit` | 标准 Linux `power_supply` 接口 |
+pub const CTRL_NAMES: &[&str] = &["wired_ctrl_limit", "charge_control_limit"];
+
+/// 控制节点组里「电流」的**文件名候选**（按优先级）
+///
+/// | 名字 | 出处 |
+/// |---|---|
+/// | `wired_chg_curr` | 小米封装层 |
+/// | `constant_charge_current` | 标准 `power_supply`（单位 μA） |
+pub const CURR_NAMES: &[&str] = &["wired_chg_curr", "constant_charge_current"];
+
+/// 控制节点组里「第二路电流」的**文件名候选**
+///
+/// 只有小米封装层（双电荷泵）才有。标准框架找不到时 `curr2 = None`，
+/// 由 `apply_dual` 自动退化为单写（见那里的说明）。
+pub const CURR2_NAMES: &[&str] = &["wired_chg_curr2"];
+
+/// 控制节点组里「移除全部限流」的**文件名候选**
+///
+/// | 名字 | 出处 |
+/// |---|---|
+/// | `wired_thermal_remove` | 小米封装层 |
+/// | `thermal_remove` | 小米 `qcom-battery` 扩展节点 |
+pub const REMOVE_NAMES: &[&str] = &["wired_thermal_remove", "thermal_remove"];
+
+/// **机身温度**节点候选
+///
+/// 小米封装层的机型把 `board_temp` 放在 `smart_charge/` 同目录（见
+/// `detect` 里的拼接逻辑）；而标准框架下它在 `qcom-battery` 扩展里。
+///
+/// 单位 `0.1℃`（与 `battery/temp` 一致，换算见 [`board_temp_to_c`]）。
+pub const BOARD_TEMP_CANDIDATES: &[&str] = &[
+    "/sys/class/qcom-battery/thermal_board_temp",
+    "/sys/class/power_supply/battery/board_temp",
 ];
 
 /// 电池观测节点所在目录的候选
@@ -324,6 +461,31 @@ pub const SMART_CHG_CANDIDATES: &[&str] = &[
     "/sys/class/xm_power/charger/smart_charge/smart_chg",
     "/sys/class/charger/smart_charge/smart_chg",
     "/sys/class/power_supply/smart_charge/smart_chg",
+    // 标准 `power_supply` 的充电截止阈值：`0` = 不限制，`1~100` = SOC 上限
+    //
+    // ⚠️ 语义与 `smart_chg` 的控制字**不同**（那个是打包编码），
+    //    但都是"限制充到百分之几"这一个能力，因此同表候选。
+    //    写值时的编码转换在 `soc_limit` 那层处理。
+    "/sys/class/power_supply/battery/charge_control_end_threshold",
+];
+
+/// **档位上限**（不是档位表）的候选节点
+///
+/// # 为什么需要单独的候选
+///
+/// 档位上限原本只能从**档位表行数**推导（见 `GEAR_TABLE_CANDIDATES`）。
+/// 但部分机型（2026-10-19 实测：走标准 `power_supply` 的那一类）**根本没有
+/// 档位表** —— 它的档位是标准接口 `charge_control_limit`，上限直接由
+/// `charge_control_limit_max` 给出（本机为 `16`）。
+///
+/// ⇒ 没有档位表时，退到这张表读"最多到第几档"。
+///
+/// ⚠️ 读不到也没有关系：此时用 `profile.rs` 里的**暂定区间**
+///    （用户 2026-10-19 定：`0~30`）。宁可范围给大，也不能给小 ——
+///    给小了会白白损失调节档位。
+pub const GEAR_MAX_CANDIDATES: &[&str] = &[
+    "/sys/class/power_supply/battery/charge_control_limit_max",
+    "/sys/class/qcom-battery/charge_control_limit_max",
 ];
 
 /// 档位→电流映射表的设备树路径候选
@@ -422,6 +584,47 @@ pub const HW_MAX_TEMP_CANDIDATES: &[&str] = &[
     "/sys/firmware/devicetree/base/soc/mca_strategy_buckchg_class/ffc_temp_high",
     // ② 他机型的可能位置（本机不存在）
     "/sys/firmware/devicetree/base/soc/mca_charger_thermal/wired_thermal_max_temp",
+    // ③ 标准 / `qcom-battery` 扩展：**电池最高工作温度**
+    //
+    // 实测 2026-10-19（没有 `mca_*` 设备树、走标准 `power_supply` 的机型）：
+    //   max_life_temp = 44      ← 电池允许的最高工作温度（℃）
+    //   fg1_temp_max  = 44      ← 同上（电量计侧的同义节点）
+    //
+    // ⚠️ 单位是**整数 ℃**（与设备树的 `ffc_temp_high = 48` 一致），
+    //    不是 `battery/temp` 那种 0.1℃。
+    //
+    // ⚠️ 语义核对：这两个都是"电池能承受多热"，与 ① 的
+    //    "有线快充时电池允许多少度"是同一条线 —— 符合上面的教训。
+    //    不要加入 `connector_temp`（那是接口温度，语义不同）。
+    "/sys/class/qcom-battery/max_life_temp",
+    "/sys/class/qcom-battery/fg1_temp_max",
+];
+
+/// 硬件温度候选表里**允许出现**的非设备树路径（白名单）
+///
+/// # 为什么要白名单
+///
+/// 原来有一条守门测试：候选路径**必须**在 `/sys/firmware/devicetree/` 下。
+/// 那条规则背后的意图是对的 —— **设备树的属性名可以直接读出语义**
+/// （`ffc_temp_high` 一看就是"快充时电池温度上限"），而随意挑一个
+/// 「数值看起来合理」的 sysfs 节点则无法保证语义（历史上就这么误用过
+/// 主板温度和无线反充温度，见 [`HW_MAX_TEMP_REJECTED`]）。
+///
+/// 但"只有设备树"这个**形式**限制在新机型上站不住了：部分机型根本不
+/// 导出 `mca_*` 设备树节点，温度上限只以 sysfs 节点形式存在。
+///
+/// ⇒ 把规则从"必须在设备树下"改成"**要么在设备树下，要么在本白名单里**"：
+///   想新增一个 sysfs 来源，必须在这里显式登记 —— 而登记的动作本身
+///   就是一次"我读过它的语义了"的确认。
+///
+/// ⚠️ 只在测试里用（生产路径不需要知道"哪些允许"）——
+///    与 [`HW_MAX_TEMP_REJECTED`] 同一性质，因此标记 `cfg(test)`。
+#[cfg(test)]
+pub const HW_MAX_TEMP_SYSFS_OK: &[&str] = &[
+    // 电池最高工作温度（实测 44℃）。语义：电池能承受多热。
+    "/sys/class/qcom-battery/max_life_temp",
+    // 电量计侧的同义节点（实测同为 44℃）。
+    "/sys/class/qcom-battery/fg1_temp_max",
 ];
 
 /// ⚠️ **不要**把这些用作兜底（曾经列在候选表里，2026-10-14 移除）
@@ -476,6 +679,17 @@ fn pick_writable(candidates: &[String]) -> Option<Node> {
 }
 
 /// 把 `dir/name` 拼成候选列表
+/// 在**一个目录**里，按名字候选依次找第一个**可写**的节点
+///
+/// 与 [`join_candidates`] + [`pick_writable`] 的区别：
+/// 那个是"多目录 × 单名字"，这个是"单目录 × 多名字"。
+/// 控制节点组（档位/电流/移除）始终同目录，所以用这个。
+fn pick_writable_by_names(dir: &str, names: &[&str]) -> Option<Node> {
+    names
+        .iter()
+        .find_map(|n| pick_writable(&[format!("{dir}/{n}")]))
+}
+
 fn join_candidates(dirs: &[String], name: &str) -> Vec<String> {
     dirs.iter().map(|d| format!("{d}/{name}")).collect()
 }
@@ -565,17 +779,24 @@ impl Nodes {
             .chain(CTRL_DIRS.iter().map(|s| (*s).to_string()))
             .collect();
 
+        // ⚠️ 命中判据必须涵盖**所有**名字候选
+        //
+        // 否则标准 `power_supply` 框架的机型（只有 `charge_control_limit`
+        // 与 `constant_charge_current`）在这一步就不会被认作"控制节点组"，
+        // 后面的成员探测**根本不会跑** —— 表现就是"控速节点不可用"。
         let ctrl_dir = ctrl_dirs.iter().find(|d| {
-            Node::new(format!("{d}/wired_ctrl_limit")).exists()
-                || Node::new(format!("{d}/wired_chg_curr")).exists()
+            CTRL_NAMES
+                .iter()
+                .chain(CURR_NAMES.iter())
+                .any(|n| Node::new(format!("{d}/{n}")).exists())
         });
 
         let (mut ctrl, mut curr, mut curr2, mut remove) = (None, None, None, None);
         if let Some(dir) = ctrl_dir {
-            ctrl = pick_writable(&[format!("{dir}/wired_ctrl_limit")]);
-            curr = pick_writable(&[format!("{dir}/wired_chg_curr")]);
-            curr2 = pick_writable(&[format!("{dir}/wired_chg_curr2")]);
-            remove = pick_writable(&[format!("{dir}/wired_thermal_remove")]);
+            ctrl = pick_writable_by_names(dir, CTRL_NAMES);
+            curr = pick_writable_by_names(dir, CURR_NAMES);
+            curr2 = pick_writable_by_names(dir, CURR2_NAMES);
+            remove = pick_writable_by_names(dir, REMOVE_NAMES);
         }
         // 档案若给了完整路径，优先采用（即使在候选目录里没探测到）
         if let Some(p) = profile_nodes {
@@ -598,11 +819,29 @@ impl Nodes {
             .chain(SMART_CHG_CANDIDATES.iter().map(|s| (*s).to_string()))
             .collect();
         let soc_ctrl = pick_writable(&soc_cands);
-        // 读取节点 = 控制节点**同目录**的 soc_limit（契约 §1.2.1 规则 2）
-        let soc_read = soc_ctrl.as_ref().and_then(|c| {
-            Path::new(c.path())
-                .parent()
-                .map(|d| Node::new(d.join("soc_limit").display().to_string()))
+        // 读取节点 = **生效值**所在的节点
+        //
+        // ⚠️ 这里**因充电框架而异**（2026-10-19 修复）：
+        //
+        // | 框架 | 控制节点 | 生效值在哪 |
+        // |---|---|---|
+        // | 小米 `smart_charge` | `smart_chg`（**打包控制字**） | 同目录的 `soc_limit` |
+        // | 标准 `power_supply` | `charge_control_end_threshold` | **控制节点自己**（写 80 读回 80） |
+        //
+        // 旧实现无条件拼 `soc_limit`，于是标准框架的机型拿到的是一条
+        // **根本不存在的路径** —— `ctl nodes` 里显示"已映射"，实际
+        // 每一次读都失败；而 `can_limit_soc()` 只看 `is_some()`，
+        // 于是据此判定"支持"，理由却是错的。
+        let soc_read = soc_ctrl.as_ref().map(|c| {
+            // 标准接口：控制节点自己就是生效值
+            if c.path_str().ends_with("charge_control_end_threshold") {
+                return c.clone();
+            }
+            // 小米控制字：取同目录的 `soc_limit`
+            Path::new(c.path()).parent().map_or_else(
+                || c.clone(),
+                |d| Node::new(d.join("soc_limit").display().to_string()),
+            )
         });
 
         // ── 电池观测节点 ──
@@ -635,6 +874,10 @@ impl Nodes {
                     .parent()
                     .map(|d| d.join("board_temp").display().to_string())
             }))
+            .collect();
+        let board_cands: Vec<String> = board_cands
+            .into_iter()
+            .chain(BOARD_TEMP_CANDIDATES.iter().map(|s| (*s).to_string()))
             .collect();
         let board_temp = pick_existing(&board_cands);
 
@@ -1460,10 +1703,23 @@ impl PowerSource {
                 .filter(|s| !s.is_empty())
         };
 
-        let usb_type = read_trim("/sys/class/power_supply/usb/type");
+        // USB 类型：标准接口 `usb/type`，部分机型只在 `qcom-battery` 扩展里
+        // 提供同义节点（`USB_PD` / `USB` / `Unknown`…）。读不到就留 `None`。
+        const USB_TYPE_CANDIDATES: &[&str] = &[
+            "/sys/class/power_supply/usb/type",
+            "/sys/class/qcom-battery/usb_real_type",
+            "/sys/class/qcom-battery/real_type",
+        ];
+        let usb_type = USB_TYPE_CANDIDATES.iter().find_map(|p| read_trim(p));
 
         // 充电协议：小米机型的节点优先
         const PROTOCOL_CANDIDATES: &[&str] = &[
+            // 标准 / `qcom-battery` 扩展：`PD` / `HVDCP` / `Unknown` …
+            //
+            // ⚠️ 放在**最前**：它是上游标准接口，语义最明确；
+            //    小米封装层的 `real_type` 是同一套枚举的别名。
+            "/sys/class/qcom-battery/real_type",
+            "/sys/class/qcom-battery/usb_real_type",
             "/sys/class/xm_power/charger/charger_common/real_type",
             "/sys/class/xm_power/charger/charger_common/quick_charge_type",
             "/sys/class/power_supply/usb/real_type",
@@ -1471,9 +1727,24 @@ impl PowerSource {
         let protocol = PROTOCOL_CANDIDATES.iter().find_map(|p| read_trim(p));
 
         // 协商功率：小米机型节点（未协商出快充时为 0 或读不到）
-        let power_max_w = read_trim("/sys/class/xm_power/charger/charger_common/power_max")
-            .and_then(|s| s.parse::<u16>().ok())
-            .filter(|w| *w > 0);
+        // 协商功率：**充电头能提供多少瓦**（不是手机实际吃多少）
+        //
+        // ⚠️ 路径因充电框架而异（2026-10-19 实测）：
+        //   小米 `xm_power` 封装层  → charger_common/power_max   (100)
+        //   标准 / `qcom-battery`    → qcom-battery/power_max    (120)
+        //                              qcom-battery/apdo_max     (120，同义)
+        // 读不到时保持 `None` ⇒ 界面显示「未协商」（那是诚实的说法：
+        // 确实没从节点读到协商结果，而不是"协商成了 0"）。
+        const POWER_MAX_CANDIDATES: &[&str] = &[
+            "/sys/class/xm_power/charger/charger_common/power_max",
+            "/sys/class/qcom-battery/power_max",
+            "/sys/class/qcom-battery/apdo_max",
+        ];
+        let power_max_w = POWER_MAX_CANDIDATES.iter().find_map(|p| {
+            read_trim(p)
+                .and_then(|s| s.parse::<u16>().ok())
+                .filter(|w| *w > 0)
+        });
 
         // ⚠️ 以**协议**为主判据，`usb/type` 只作兜底
         //
@@ -1717,8 +1988,8 @@ algo_type\tmonitor
         for p in HW_MAX_TEMP_CANDIDATES {
             assert!(p.starts_with('/'), "必须绝对路径：{p}");
             assert!(
-                p.contains("devicetree"),
-                "设备树属性应在 devicetree 下：{p}"
+                p.contains("devicetree") || HW_MAX_TEMP_SYSFS_OK.contains(p),
+                "硬件温度必须是设备树属性，或在 HW_MAX_TEMP_SYSFS_OK 里显式登记：{p}"
             );
         }
 
@@ -1769,8 +2040,9 @@ algo_type\tmonitor
                 "官方表（随场景变化）不得作为硬件温度候选：{p}"
             );
             assert!(
-                p.contains("devicetree"),
-                "硬件温度只能来自设备树（硬件参数，不随场景变）：{p}"
+                p.contains("devicetree") || HW_MAX_TEMP_SYSFS_OK.contains(p),
+                "硬件温度只能来自设备树（硬件参数，不随场景变），\
+                 或在 HW_MAX_TEMP_SYSFS_OK 里显式登记：{p}"
             );
         }
     }

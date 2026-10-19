@@ -126,6 +126,37 @@ const currentMode = ref("");
 /** 刚点下、还没被后端确认的模式：用来让高亮**立刻**跟手 */
 const pendingMode = ref<string | null>(null);
 
+/**
+ * 当前是否处于**官方**模式（"模块完全不插手"）
+ *
+ * # 为什么这个开关要锁住下面的温控项（用户 2026-10-19 要求）
+ *
+ * 「官方」的语义是：模块撤销自己加过的限制，之后**只管看、不管控** ——
+ * 速度、温度、充到多少全交回系统。
+ *
+ * 既然不参与控制，那下面「开始降速的温度 / 恢复全速 / 过渡区间 /
+ * 降到多少」这几个滑块就**没有任何意义**：
+ *
+ * | 放着的后果 | 说明 |
+ * |---|---|
+ * | 误导 | 用户以为调了就会生效，实际一点作用都没有 |
+ * | 白折腾 | 调完点「应用」写进配置，但官方模式下不读这些值 |
+ * | 看不出真相 | 用户以为是"设了但没生效"，而不是"根本没在用" |
+ *
+ * ⇒ 灰掉，并说明**当前以模块读到的数据为准**（只读展示）。
+ *
+ * ⚠️ 用 `pendingMode ?? currentMode`：点下「官方」的那一刻就锁住，
+ *    不等后端确认 —— 否则会有一个"已经点了但还能拖"的窗口。
+ */
+const isOfficial = computed(
+  () => (pendingMode.value ?? currentMode.value) === "official",
+);
+
+/** 温控输入是否锁定（官方模式 / 加载中 / 提交中） */
+const thermalLocked = computed(
+  () => loading.value || busy.value || isOfficial.value,
+);
+
 // ── 卡片 2：温度与降速 ──
 const thermal = ref<ThermalSection | null>(null);
 /** 本机硬件保护温度（℃），检测得来 —— 收紧滑块的上限由它决定 */
@@ -827,6 +858,25 @@ async function applySoc(): Promise<void> {
     <!-- ── 卡片 2：温度与降速 ── -->
     <MiuixSmallTitle text="温度控制" />
     <MiuixCard>
+      <!--
+        ┌─ 官方模式：整张卡片只读 ──────────────────────────────────┐
+
+        🔴 用户要求（2026-10-19）：「充电模式选择官方的时候下方的温控
+           全部显示灰色不可调整，具体数据以模块读到的数据为准」
+
+        为什么这是对的：官方模式 = 模块完全不插手。此时这几项**不被读取**，
+        放着可拖只会让用户以为"调了会生效"，实际一点作用都没有。
+        灰掉 + 说清楚，用户才知道"现在没人管这些"。
+      -->
+      <div v-if="isOfficial" class="notice">
+        <MiuixText type="footnote1">
+          <b>当前是官方模式</b>：模块不参与充电控制，下面的参数
+          <b>不会生效</b>，因此不可调整。显示的是本机已保存的数值，仅供查看 ——
+          充电速度、温度与充到多少全部由系统自己决定。
+          需要接管时切回「保守」「极速」或「自定义」。
+        </MiuixText>
+      </div>
+
       <MiuixText
         type="footnote1"
         color="var(--m-color-on-surface-secondary)"
@@ -856,7 +906,7 @@ async function applySoc(): Promise<void> {
           :min="TEMP_FLOOR"
           :max="tightMax"
           :step="1"
-          :disabled="loading || busy"
+          :disabled="thermalLocked"
           @update:model-value="pendingTighten = $event"
         />
         <div class="scale">
@@ -896,7 +946,7 @@ async function applySoc(): Promise<void> {
           :min="TEMP_FLOOR"
           :max="relaxMax"
           :step="1"
-          :disabled="loading || busy"
+          :disabled="thermalLocked"
           @update:model-value="onRelaxMove"
         />
         <div class="scale">
@@ -947,7 +997,7 @@ async function applySoc(): Promise<void> {
           :min="RAMP_MIN_C"
           :max="RAMP_MAX_C"
           :step="RAMP_STEP_C"
-          :disabled="loading || busy"
+          :disabled="thermalLocked"
           @update:model-value="pendingRamp = $event"
         />
         <div class="scale">
@@ -1018,7 +1068,7 @@ async function applySoc(): Promise<void> {
             type="button"
             class="chip chip--pick"
             :class="{ 'chip--on': power === p.w }"
-            :disabled="loading || busy"
+            :disabled="thermalLocked"
             @click="pendingPower = p.w"
           >
             {{ p.label }}
@@ -1032,7 +1082,7 @@ async function applySoc(): Promise<void> {
           :step="POWER_STEP_W"
           :show-key-points="true"
           :key-points="powerKeyPoints"
-          :disabled="loading || busy"
+          :disabled="thermalLocked"
           @update:model-value="pendingPower = $event"
         />
         <div class="scale">
@@ -1116,7 +1166,7 @@ async function applySoc(): Promise<void> {
           :min="0"
           :max="hwMaxW"
           :step="1"
-          :disabled="loading || busy || !powerReady"
+          :disabled="thermalLocked || !powerReady"
           @update:model-value="pendingW = $event"
         />
         <div class="scale">
@@ -1190,7 +1240,7 @@ async function applySoc(): Promise<void> {
         </div>
         <MiuixSwitch
           :model-value="limitEnabledShown"
-          :disabled="loading || busy"
+          :disabled="thermalLocked"
           @update:model-value="onToggleLimit"
         />
       </div>
@@ -1308,6 +1358,12 @@ async function applySoc(): Promise<void> {
 
         ⚠️ 若将来发现"不支持"是常见情形，应把它挪回去 ——
            `limitSupported` 为 false 时走的是另一张卡片（顶部已有提示）。
+
+        ⚠️ 2026-10-19：文案内容**按机型变化**
+           · 小米 `smart_chg` 机型 → "需先打开电池健康保护"
+           · 标准 `charge_control_end_threshold` 机型 → "与那个开关无关"
+           两者都由后端 `spec.requires` 给出。前端**不要**判断文案内容，
+           也不要假定它一定提到某个开关（见 types.ts 的说明）。
       -->
       <div v-if="limitRequires" class="notice notice--warn">
         <MiuixText type="footnote1" color="var(--m-color-on-tertiary-container)">

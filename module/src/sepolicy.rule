@@ -1,0 +1,58 @@
+# ThermoCharge 的 SELinux 规则
+#
+# # 为什么需要这个文件
+#
+# 模块要写**充电控制节点**（电流 / 档位 / SOC 上限 / 移除温度限制）。
+# 这些节点的文件权限通常是 `-rw-r--r-- root root` —— 从 Unix 权限看
+# root 就能写。但 SELinux 是**叠加**在文件权限之上的第二道门：
+#
+#   实测 2026-10-19（标准 power_supply 框架的机型）：
+#     getenforce            = Enforcing
+#     节点标签               = u:object_r:vendor_sysfs_battery_supply:s0
+#     模块进程 / su 的域     = u:r:ksu:s0
+#     ⇒ 写入被拒（Permission denied），即使进程已是 uid=0
+#
+# 换到另一台机型时反而能写 —— 因为那台的充电节点用的是**另一个
+# SELinux 类型**（对 `ksu` 域本来就放行）。所以规则要按**类型**写，
+# 不能按机型写。
+#
+# # 生效方式
+#
+# KernelSU 在 `post-fs-data` 阶段应用本文件。
+# ⚠️ **改动本文件后必须重启手机**才生效 —— 模块更新不会热加载它。
+#
+# # 权限说明
+#
+# | 操作 | 需要的 perm |
+# |---|---|
+# | 读（`cat` 节点） | `open` `read` `getattr` |
+# | 写（`echo >` 节点） | `open` `write` `getattr` |
+#
+# 模块两种都做（读回校验），因此给全。
+
+# 标准 Linux `power_supply` 框架的电池节点
+#
+# 覆盖：constant_charge_current / charge_control_limit /
+#       charge_control_end_threshold / temp / current_now / ...
+allow ksu vendor_sysfs_battery_supply:file { open read write getattr };
+
+# 小米 `qcom-battery` 扩展节点
+#
+# 覆盖：thermal_remove（移除温度限制）/ thermal_board_temp（机身温度）/
+#       smart_chg（SOC 控制字）等。
+#
+# ⚠️ 这个类型在部分机型上可能不存在 —— 不存在的类型会被 KernelSU
+#    忽略（不会报错），所以留着是安全的。
+# ⚠️ 类型名必须**逐字对上** `ls -lZ` 的结果，否则规则静默失效。
+#    实测 2026-10-19 第一次写成了 `vendor_sysfs_battery`（少了 `qcom_`），
+#    于是 `qcom-battery/smart_chg` 依旧写不进去。
+allow ksu vendor_sysfs_qcom_battery:file { open read write getattr };
+
+# 兜底：部分机型可能用不带 `qcom_` 前缀的类型名（不存在会被忽略）。
+allow ksu vendor_sysfs_battery:file { open read write getattr };
+
+# 小米 `xm_power` 封装层（`charger_thermal/` 那一套）
+#
+# 这一套在出厂时通常已经对 root 放行，但显式声明一次更稳：
+# 万一某台机型的策略收紧了，模块不至于"突然写不进去"。
+allow ksu sysfs_charger:file { open read write getattr };

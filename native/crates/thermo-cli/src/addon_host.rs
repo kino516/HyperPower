@@ -75,14 +75,21 @@ impl AddonIo for SysfsIo {
     /// 返回 `true`（保守）：宁可多巡检，也不要因为节点读不到而
     /// 让功能静默失效。
     fn is_plugged(&mut self) -> bool {
-        const STATUS: &str = "/sys/class/power_supply/battery/status";
-        match std::fs::read_to_string(crate::sysfs::rooted(STATUS)) {
-            Ok(s) => {
-                let s = s.trim();
-                matches!(s, "Charging" | "Full" | "Not charging")
-            }
-            Err(_) => true,
+        // ⚠️ 走 `BATTERY_DIRS` 候选，而不是写死 `power_supply/battery`
+        //
+        // 虽然 `battery` 是绝大多数机型的位置，但 `bms` / `main` 也存在
+        // （见 `sysfs::BATTERY_DIRS`）。少一个候选就少一分"读不到 ⇒
+        // 一直保守返回 true ⇒ 巡检永不停止"的可能。
+        for dir in crate::sysfs::BATTERY_DIRS {
+            let p = format!("{dir}/status");
+            let Ok(s) = std::fs::read_to_string(crate::sysfs::rooted(&p)) else {
+                continue;
+            };
+            let s = s.trim();
+            return matches!(s, "Charging" | "Full" | "Not charging");
         }
+        // 全都读不到：保守返回 true（宁可多巡检）
+        true
     }
 
     fn write(&mut self, path: &str, value: &str) -> Result<(), String> {

@@ -23,6 +23,21 @@ use thermo_addons::soc_limit::{logic, SocLimit, SocLimitConfig};
 const CTRL: &str = "/sys/class/xm_power/charger/smart_charge/smart_chg";
 const READ: &str = "/sys/class/xm_power/charger/smart_charge/soc_limit";
 
+/// 标准 Linux `power_supply` 框架的控制节点（2026-10-19 真机那一类）
+///
+/// ⚠️ 与小米的两个关键差异，正是本轮改动的全部理由：
+/// | 差异 | 小米 | 标准 |
+/// |---|---|---|
+/// | 写入格式 | 控制字 `0x500011` | **纯百分比** `80` |
+/// | 生效值在哪 | 同目录的 `soc_limit` | **控制节点自己** |
+const STD_CTRL: &str = "/sys/class/power_supply/battery/charge_control_end_threshold";
+
+/// **使能节点**（高通标准框架）
+///
+/// ⚠️ 这个节点是 2026-10-19 真机（K70 Pro）查出来的关键：
+///    它不为 `1` 时，写 [`STD_CTRL`] **表面成功、实际被吞**。
+const STD_EN: &str = "/sys/class/qcom-battery/charge_control_en";
+
 #[derive(Debug, Default)]
 struct FakeIo {
     files: HashMap<String, String>,
@@ -47,6 +62,44 @@ impl FakeIo {
         Self {
             files,
             writable: vec![CTRL.to_string()],
+            write_ignored: false,
+            write_log: Vec::new(),
+            plugged: true,
+        }
+    }
+
+    /// 标准 `power_supply` 框架的节点树（**没有** `soc_limit`，当前不限制）
+    ///
+    /// `charge_control_end_threshold` 的 `100` 表示"不限制"，
+    /// 与小米驱动里 `soc_limit = 100` 的语义一致。
+    fn standard_psys() -> Self {
+        let mut files = HashMap::new();
+        files.insert(STD_CTRL.to_string(), "100".to_string());
+        Self {
+            files,
+            writable: vec![STD_CTRL.to_string()],
+            write_ignored: false,
+            write_log: Vec::new(),
+            plugged: true,
+        }
+    }
+
+    /// **K70 Pro 的真实节点树**（2026-10-19 真机实测）
+    ///
+    /// 与 [`standard_psys`](Self::standard_psys) 的区别：多一个
+    /// `charge_control_en` 使能节点，且**未开使能时写入会被驱动吞掉**。
+    ///
+    /// | `en` | 写 threshold=95 | 读回 |
+    /// |---|---|---|
+    /// | `0` | `write()` 返回**成功**（谎报） | **0** |
+    /// | `1` | 成功 | **95** |
+    fn k70pro() -> Self {
+        let mut files = HashMap::new();
+        files.insert(STD_CTRL.to_string(), "0".to_string());
+        files.insert(STD_EN.to_string(), "0".to_string());
+        Self {
+            files,
+            writable: vec![STD_CTRL.to_string(), STD_EN.to_string()],
             write_ignored: false,
             write_log: Vec::new(),
             plugged: true,
@@ -91,6 +144,41 @@ impl AddonIo for FakeIo {
         self.write_log.push((path.to_string(), value.to_string()));
 
         if self.write_ignored {
+            return Ok(());
+        }
+
+        // ── 使能节点：纯 0/1，直接保存 ──
+        //
+        // ⚠️ 不处理它的话会掉进下面的 `parse_word`（它没有 `0x` 前缀
+        //    ⇒ 返回 None ⇒ 静默 Ok 且不更新文件）—— 于是"写使能"看起来
+        //    成功、实际没变，测试会测出假的"回读不符"。
+        if path.ends_with("charge_control_en") {
+            self.files
+                .insert(path.to_string(), value.trim().to_string());
+            return Ok(());
+        }
+
+        // ── 标准框架：写入的是**纯百分比**，节点自己就是生效值 ──
+        //
+        // ⚠️ 必须与小米分支分开：若照小米那套 `parse_word` 解析 `"80"`，
+        //    会因为缺少 `0x` 前缀而直接返回 Ok 且**不更新任何文件** ——
+        //    于是回读永远是旧值、每拍都报"回读不符"，而假驱动其实
+        //    什么都没做。那样测出来的"失败"是假的。
+        if path.ends_with("charge_control_end_threshold") {
+            // 🔴 **复现 K70 Pro 的真机行为**：使能位不为 1 时写入被吞
+            //
+            // `write()` 仍返回 Ok（驱动谎言），但值不保存、读回不变。
+            // 这正是模块曾经误判"回读不符 → 有程序在抢 → 熔断"的根因。
+            let en_on = self
+                .files
+                .get(STD_EN)
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            if en_on {
+                if let Ok(v) = value.trim().parse::<u8>() {
+                    self.files.insert(path.to_string(), v.to_string());
+                }
+            }
             return Ok(());
         }
 
@@ -191,7 +279,9 @@ fn 荒谬区间退回兜底() {
 
 #[test]
 fn 兜底钳位与物理常量一致() {
-    assert_eq!(logic::clamp_soc_default(10), 60);
+    // 兜底下限 = 55（2026-10-19 真机 dmesg 实测：
+    //   `Charge control end_threshold should be within [55 100]`）
+    assert_eq!(logic::clamp_soc_default(10), 55);
     assert_eq!(logic::clamp_soc_default(80), 80);
     assert_eq!(logic::clamp_soc_default(200), 100);
 }
@@ -649,6 +739,282 @@ fn 命中候选路径并推出读取节点() {
         Some(READ),
         "读取节点取同目录的 soc_limit"
     );
+}
+
+// ============================================================
+//  ⑦ 标准 `power_supply` 框架（2026-10-19 新增支持）
+//
+//  这类机型**没有** `smart_chg`、**没有** `soc_limit`，只有上游内核的
+//  `charge_control_end_threshold`（纯百分比）。三条差异都必须成立：
+//
+//  | # | 差异 | 弄错的后果 |
+//  |---|---|---|
+//  | 1 | 探测要能命中它 | 界面直接报"本机不支持" |
+//  | 2 | 写入要用纯百分比 | 写 `0x500011` 进去，驱动当成非法值 |
+//  | 3 | 生效值读控制节点自己 | 读不存在的 `soc_limit` ⇒ 每拍失败 |
+// ============================================================
+
+/// 标准框架的节点必须被探测到，且生效值就是控制节点自己
+#[test]
+fn 标准框架命中百分比节点() {
+    let mut io = FakeIo::standard_psys();
+    let mut addon = SocLimit::new(SocLimitConfig::default());
+    let outcome = addon.probe(&mut io);
+
+    assert!(
+        outcome.is_supported(),
+        "标准框架的 charge_control_end_threshold 应被认作支持：{}",
+        outcome.message()
+    );
+    assert_eq!(addon.node_ctrl(), Some(STD_CTRL));
+    assert_eq!(
+        addon.node_read(),
+        Some(STD_CTRL),
+        "标准框架下控制节点自己就是生效值（没有同目录的 soc_limit 可读）"
+    );
+}
+
+/// 写入必须是**纯百分比**，不能是小米的控制字
+#[test]
+fn 标准框架写入纯百分比() {
+    let mut io = FakeIo::standard_psys();
+    let mut addon = probed(enabled_config(80), &mut io);
+
+    let outcome = addon.tick(&mut io, 0);
+
+    assert!(outcome.wrote, "当前 100%，目标 80% ⇒ 应当写");
+    assert!(
+        outcome.is_ok(),
+        "回读应当通过（读的是控制节点自己）：{:?}",
+        outcome.error
+    );
+    assert_eq!(io.write_log.len(), 1);
+    assert_eq!(
+        io.write_log[0].1, "80",
+        "标准框架要写纯百分比，不能写小米的控制字"
+    );
+    assert_eq!(
+        io.files.get(STD_CTRL).map(String::as_str),
+        Some("80"),
+        "生效值应已变为 80"
+    );
+    assert_eq!(addon.last_seen(), Some(80));
+}
+
+/// 已一致 → 零写入（标准框架同样适用）
+#[test]
+fn 标准框架已一致时不写() {
+    let mut io = FakeIo::standard_psys();
+    io.files.insert(STD_CTRL.to_string(), "80".to_string());
+    let mut addon = probed(enabled_config(80), &mut io);
+
+    let outcome = addon.tick(&mut io, 0);
+
+    assert!(!outcome.wrote, "已一致不该写");
+    assert_eq!(io.writes(), 0);
+}
+
+/// 标准框架的前提文案**不得**让人去找「电池健康保护」开关
+///
+/// # 为什么这条要单独锁
+///
+/// `charge_control_end_threshold` 是上游内核的通用接口，**不受**系统
+/// 「电池健康保护」开关控制。照抄小米那句会带来两种坏结果：
+///
+/// | 用户的机型 | 会发生什么 |
+/// |---|---|
+/// | 设置里**有**那个开关 | 白折腾一趟（本来就没关） |
+/// | 设置里**没有**那个开关 | 以为缺了前提，白白放弃功能 |
+#[test]
+fn 标准框架的前提文案不点名电池健康保护() {
+    let mut io = FakeIo::standard_psys();
+    let mut addon = SocLimit::new(SocLimitConfig::default());
+    addon.probe(&mut io);
+
+    let requires = addon
+        .spec()
+        .requires
+        .expect("充电上限必须有使用前提（哪怕是「无需设置」）");
+
+    assert!(
+        requires.contains("标准"),
+        "要点出本机走的是标准接口，实得：{requires}"
+    );
+    assert!(
+        !requires.contains("电池健康保护"),
+        "标准框架不归「电池健康保护」开关管，不能叫用户去打开它，实得：{requires}"
+    );
+    // 小米方言仍要保留原来的提示（防回归：别把两边都改掉）
+    let mut hyper_io = FakeIo::hyperos();
+    let mut hyper = SocLimit::new(SocLimitConfig::default());
+    hyper.probe(&mut hyper_io);
+    let hyper_requires = hyper.spec().requires.expect("小米方言必须有使用前提");
+    assert!(
+        hyper_requires.contains("电池健康保护"),
+        "小米方言仍要说清那个开关，实得：{hyper_requires}"
+    );
+}
+
+// ============================================================
+//  ⑧ 使能节点（2026-10-19 K70 Pro 真机踩坑，最贵的一个）
+//
+//  「充电上限完全不可用，界面报不支持」的**真正原因**：
+//  `charge_control_en = 0` 时写 `charge_control_end_threshold` 返回
+//  成功但值被吞 ⇒ 回读永远 0 ⇒ 连续三次判"有程序在抢"⇒ 熔断。
+//
+//  ⇒ 必须：写目标值**之前**先把使能位置 1。
+// ============================================================
+
+/// 探测时必须认出使能节点（否则 tick 里无从开它）
+#[test]
+fn 探测能识别使能节点() {
+    let mut io = FakeIo::k70pro();
+    let mut addon = SocLimit::new(SocLimitConfig::default());
+    let outcome = addon.probe(&mut io);
+
+    assert!(outcome.is_supported());
+    assert!(
+        outcome.message().contains("使能"),
+        "探测结果应交代使能节点，实得：{}",
+        outcome.message()
+    );
+}
+
+/// **核心回归**：使能位为 0 时，写入必须先把使能位置 1，才能生效
+///
+/// # 不修这条会发生什么（真机实测）
+///
+/// ```text
+/// 写 threshold=95  → write() 返回 Ok
+/// 读回             → 0
+/// 模块判断          → "回读不符" ×3
+/// 结果             → 误报"有另一个程序在抢" + 熔断
+/// 界面             → 充电上限不可用
+/// ```
+#[test]
+fn 使能位为0时先开使能再写阈值() {
+    let mut io = FakeIo::k70pro();
+    let mut addon = probed(enabled_config(95), &mut io);
+
+    let outcome = addon.tick(&mut io, 0);
+
+    // ① 必须写成功，且回读通过（不该再报"回读不符"）
+    assert!(
+        outcome.is_ok(),
+        "开了使能位之后写入应当生效：{:?}",
+        outcome.error
+    );
+    assert_eq!(
+        io.files.get(STD_EN).map(String::as_str),
+        Some("1"),
+        "必须把使能位打开"
+    );
+    assert_eq!(
+        io.files.get(STD_CTRL).map(String::as_str),
+        Some("95"),
+        "阈值应真正写入（不再是 0）"
+    );
+
+    // ② 写入顺序：先使能、后阈值
+    assert_eq!(
+        io.write_log[0].0, STD_EN,
+        "第一次写必须是使能节点（否则阈值会被吞掉）"
+    );
+    assert_eq!(io.write_log[1].0, STD_CTRL, "第二次写才是阈值");
+    assert_eq!(addon.last_seen(), Some(95));
+}
+
+/// 已经开过使能 → 后续拍不重复写它（sysfs 写有 I2C 开销）
+#[test]
+fn 使能位只写一次() {
+    let mut io = FakeIo::k70pro();
+    let mut addon = probed(enabled_config(95), &mut io);
+
+    addon.tick(&mut io, 0); // 开使能 + 写 95
+    let after_first = io.writes();
+
+    // 改成 90 → 再跑一拍
+    addon.set_config(enabled_config(90));
+    addon.tick(&mut io, 15);
+
+    let en_writes = io.write_log.iter().filter(|(p, _)| p == STD_EN).count();
+    assert_eq!(en_writes, 1, "使能节点只该写一次，实得 {en_writes} 次");
+    assert_eq!(io.writes(), after_first + 1, "第二拍只写阈值");
+    assert_eq!(io.files.get(STD_CTRL).map(String::as_str), Some("90"));
+}
+
+/// 使能位本来就为 1 → 不写它（省一次 I2C）
+#[test]
+fn 使能位已为1时不再写() {
+    let mut io = FakeIo::k70pro();
+    io.files.insert(STD_EN.to_string(), "1".to_string());
+    let mut addon = probed(enabled_config(95), &mut io);
+
+    let outcome = addon.tick(&mut io, 0);
+
+    assert!(outcome.is_ok());
+    assert!(
+        !io.write_log.iter().any(|(p, _)| p == STD_EN),
+        "已经是 1 就不该再写：{:?}",
+        io.write_log
+    );
+    assert_eq!(io.files.get(STD_CTRL).map(String::as_str), Some("95"));
+}
+
+/// 关闭功能时必须把使能位**关回去**（否则"关了但没关"）
+///
+/// # 为什么这条重要
+///
+/// 小米那套 `release` 是零写入（不写就保持原状）。但标准框架的
+/// `charge_control_en` 是**我们主动打开的** —— 不关它，用户关掉功能后
+/// 驱动仍在执行我们上次写入的阈值。
+#[test]
+fn 关闭功能时把使能位关回去() {
+    let mut io = FakeIo::k70pro();
+    let mut addon = probed(enabled_config(95), &mut io);
+
+    addon.tick(&mut io, 0); // 开使能
+    assert_eq!(io.files.get(STD_EN).map(String::as_str), Some("1"));
+
+    addon.release(&mut io);
+    assert_eq!(
+        io.files.get(STD_EN).map(String::as_str),
+        Some("0"),
+        "关闭功能必须把使能位交还系统"
+    );
+}
+
+/// 从未开过使能 → `release` 仍是零写入（不能凭空写一个 0）
+#[test]
+fn 未开过使能时释放不写() {
+    let mut io = FakeIo::k70pro();
+    let mut addon = probed(enabled_config(95), &mut io);
+
+    // 不 tick，直接 release
+    let outcome = addon.release(&mut io);
+
+    assert!(!outcome.wrote, "没开过就不该写");
+    assert_eq!(io.writes(), 0);
+}
+
+/// 没有使能节点的机型（`standard_psys`）行为不变
+///
+/// ⚠️ 防回归：别把"必须开使能"当成所有标准框架的硬要求 ——
+///    有的机型**只有** threshold 节点，没有 en。
+#[test]
+fn 没有使能节点的机型照常工作() {
+    let mut io = FakeIo::standard_psys();
+    let mut addon = probed(enabled_config(80), &mut io);
+
+    let outcome = addon.tick(&mut io, 0);
+
+    assert!(outcome.is_ok(), "无使能节点时也该正常：{:?}", outcome.error);
+    assert_eq!(
+        io.write_log.len(),
+        1,
+        "只写阈值，不该试图写不存在的使能节点"
+    );
+    assert_eq!(io.files.get(STD_CTRL).map(String::as_str), Some("80"));
 }
 
 #[test]

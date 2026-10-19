@@ -444,6 +444,16 @@ impl Engine {
         if !crate::debug_log::is_enabled() {
             return;
         }
+        // ── 外部环境快照（调试模式专用）──
+        //
+        // 决策链记的都是**模块自己的视角**，而排查 2026-10-17 那次
+        // 「充电功率异常」时真正缺的是外部信息：充电器是不是降级了、
+        // 屏幕是不是灭的、温控场景有没有切。
+        //
+        // ⚠️ 全部尽力而为（见 `sysfs::EnvSnapshot`）—— 读不到就是 null，
+        //    绝不影响控制。这四个读操作**只在调试模式开启时**发生。
+        let env = crate::sysfs::EnvSnapshot::read();
+
         crate::debug_log::write(
             "trace",
             json!({
@@ -461,6 +471,23 @@ impl Engine {
                 "should_write": decision.should_write,
                 "release": decision.release,
                 "peak_c": self.state.peak_c,
+                // ── 外部环境（2026-10-17 新增）──
+                //
+                // | 字段 | 用途 |
+                // |---|---|
+                // | `screen` | 用户怀疑「息屏降速」时要能自证/排除 |
+                // | `usb_v` / `usb_a` | **一眼看出充电器是否降级**（实测 9V→5V 时功率掉到 1/6） |
+                // | `usb_type` | 协议（`USB_PD` / `USB` / `Unknown`） |
+                // | `sconfig` | 温控场景编号（实测 `-1` ↔ `0` 时官方策略完全不同） |
+                "screen": env.screen_on.map(|on| if on { "on" } else { "off" }),
+                "usb_v": env
+                    .usb_voltage_uv
+                    .map(|v| crate::observability::round_json(v as f64 / 1e6, 3)),
+                "usb_a": env
+                    .usb_current_ua
+                    .map(|v| crate::observability::round_json(v as f64 / 1e6, 3)),
+                "usb_type": env.usb_type,
+                "sconfig": env.sconfig,
             }),
         );
     }
@@ -1479,6 +1506,88 @@ mod tests {
             assert_eq!(table.max_power_gear(), Some(0));
             assert_eq!(table.current_limit_ua(0), Some(13_500_000));
         });
+    }
+
+    /// 标准 `power_supply` 框架的假节点树（2026-10-19 真机那一类）
+    ///
+    /// 与 [`FakeSysfs`] 的关键区别：**没有** `xm_power` 封装层，
+    /// **没有**档位表，**没有** `soc_limit`。全部能力都由电池节点自己提供：
+    ///
+    /// | 能力 | 节点 |
+    /// |---|---|
+    /// | 档位 | `battery/charge_control_limit`（0~16） |
+    /// | 档位上限 | `battery/charge_control_limit_max` |
+    /// | 电流 | `battery/constant_charge_current`（μA） |
+    /// | SOC 上限 | `battery/charge_control_end_threshold`（百分比） |
+    fn make_standard_power_supply_tree(tag: &str) -> std::path::PathBuf {
+        let mut root = std::env::temp_dir();
+        root.push(format!("thermo_std_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        const DIR: &str = "sys/class/power_supply/battery";
+        std::fs::create_dir_all(root.join(DIR)).unwrap();
+        let w = |name: &str, v: &str| {
+            std::fs::write(root.join(format!("{DIR}/{name}")), v.as_bytes()).unwrap();
+        };
+        w("charge_control_limit", "0");
+        w("charge_control_limit_max", "16");
+        w("constant_charge_current", "18400000");
+        w("constant_charge_current_max", "18400000");
+        w("charge_control_end_threshold", "100");
+        w("temp", "300");
+        w("status", "Charging");
+        w("capacity", "50");
+        w("current_now", "2000000");
+        w("voltage_now", "4000000");
+        root
+    }
+
+    /// 标准框架的节点必须被认作"可控制 / 可限制 SOC"
+    ///
+    /// # 这一条守的是 2026-10-19 的两个改动
+    ///
+    /// | # | 曾经的问题 | 表现 |
+    /// |---|---|---|
+    /// | 1 | 控制节点组只认 `wired_ctrl_limit` / `wired_chg_curr` | 标准框架机型整个"控速节点不可用"，档位/电流全测不到 |
+    /// | 2 | `soc_read` 无条件拼同目录的 `soc_limit` | 拿到一条**不存在的路径**；`ctl nodes` 显示已映射，实际每次读都失败 |
+    #[test]
+    fn 标准power_supply框架的节点也能被探测到() {
+        let root = make_standard_power_supply_tree("nodes");
+        with_fake_root(&root, || {
+            let nodes = Nodes::detect(None);
+
+            assert!(
+                nodes.can_control(),
+                "标准框架的 charge_control_limit / constant_charge_current 应被认作控制节点组"
+            );
+            assert!(
+                nodes
+                    .ctrl
+                    .as_ref()
+                    .is_some_and(|n| n.path_str().ends_with("charge_control_limit")),
+                "档位节点应命中 charge_control_limit"
+            );
+            assert!(
+                nodes
+                    .curr
+                    .as_ref()
+                    .is_some_and(|n| n.path_str().ends_with("constant_charge_current")),
+                "电流节点应命中 constant_charge_current"
+            );
+
+            // SOC 上限：标准接口下**控制节点自己就是生效值**
+            assert!(nodes.can_limit_soc(), "标准框架应判定为支持 SOC 上限");
+            let read = nodes
+                .soc_read
+                .as_ref()
+                .map(crate::sysfs::Node::path_str)
+                .unwrap_or_default();
+            assert!(
+                read.ends_with("charge_control_end_threshold"),
+                "标准框架的生效值节点应是控制节点自身（而不是不存在的 soc_limit），实得 {read}"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -9,11 +9,11 @@
 //! | 1 | 系统信息 | ❌ | 无 |
 //! | 2 | 电池信息 | ❌ | 无 |
 //! | 3 | 节点映射（**运行期探测**） | ❌ | 无（只读试开） |
-//! | 4 | 档位表（设备树直读） | ❌ | 无 |
+//! | 4 | 档位上限（档位表**或** `charge_control_limit_max`） | ❌ | 无 |
 //! | 5 | 档位数 / 最大功率档位 | ❌ | 无 |
 //! | 6 | 电流上限（读探） | ❌ | 无 |
 //! | 7 | 充电功率上限（三来源取最大） | ❌ | 无（只读） |
-//! | 8 | 硬件保护温度（设备树直读） | ❌ | 无 |
+//! | 8 | 硬件保护温度（设备树**或** `max_life_temp` 一类节点） | ❌ | 无 |
 //! | 9 | 场景定义 | ❌ | 无 |
 //! | 10 | SOC 上限支持性 | ❌ | 无 |
 //!
@@ -24,6 +24,13 @@
 //! 档位表、电流上限、功率上限、硬件保护温度**全部靠本机探测得出**，
 //! **不入出厂档案**（用户明确要求）。
 //! 各机型的档位数、档位电流、功率最大档位都可能不同，因此**不得假定 15 档**。
+//!
+//! ⚠️ 2026-10-19：档位上限有**两条来源**，缺少任何一条都不能报"失败"——
+//! | 机型 | 来源 |
+//! |---|---|
+//! | 小米 `charger_thermal` 封装层 | 设备树档位表的**行数** |
+//! | 标准 Linux `power_supply` | 节点 `charge_control_limit_max`（**没有档位表**） |
+//! 两者都没有时退回 `profile` 的暂定区间（`0~30`），并在界面上标明"暂定"。
 //!
 //! # 值域来源标记
 //!
@@ -96,6 +103,44 @@ impl Default for ProbeOptions {
     }
 }
 
+/// 档位上限是**怎么来的**
+///
+/// # 为什么需要它
+///
+/// 同一个数字（比如 `16`）有三种完全不同的出处，而用户在界面上
+/// 只能看到一句话，必须说清楚是哪一种：
+///
+/// | 来源 | 机型 | 可信度 |
+/// |---|---|---|
+/// | [`Table`](Self::Table) | 有档位表（小米 `watt_range` 一类） | 设备树直读 |
+/// | [`Node`](Self::Node) | 标准 `power_supply`（`charge_control_limit_max`） | 节点直读 |
+/// | [`Unknown`](Self::Unknown) | 两者都没有 | **暂定区间**，可能不准 |
+///
+/// ⚠️ 第三种必须让用户看出来是"猜的" —— 否则他会以为 `0~30` 是本机实测值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GearMaxOrigin {
+    /// 由档位表行数推导
+    Table,
+    /// 由节点 `charge_control_limit_max` 直读
+    Node,
+    /// 都没读到，用 `profile` 的暂定区间
+    Unknown,
+}
+
+impl GearMaxOrigin {
+    /// 生成面向用户的一句话（含档位数与出处）
+    ///
+    /// 形如 `16 档（节点直读）` / `15 档（档位表推导）` /
+    /// `30 档（暂定区间，未探测到）`。
+    fn describe(self, n: u8) -> String {
+        match self {
+            Self::Table => format!("{n} 档（档位表推导）"),
+            Self::Node => format!("{n} 档（节点直读）"),
+            Self::Unknown => format!("{n} 档（暂定区间，未探测到）"),
+        }
+    }
+}
+
 /// 执行检测，返回档案（**不落盘** —— 由调用方决定是否保存）
 pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
     let mut profile =
@@ -136,9 +181,32 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
 
     // SOC 上限支持性（探测而非假定）
     if nodes.can_limit_soc() {
+        // ⚠️ `min` / `max` 是**通用保守区间**，不是机型实测值
+        //
+        // # 为什么区间没有探测
+        //
+        // 标准 `power_supply` 的 `charge_control_end_threshold` **没有**
+        // 配套的 min/max 节点（2026-10-19 真机核对过 `battery` 与
+        // `qcom-battery` 两个目录，只有 end/start_threshold 与
+        // charge_control_limit(_max)）。小米 `smart_chg` 那套同样没有。
+        //
+        // ⇒ 驱动到底接受 20% 还是只接受 60%，**无法在只读阶段得知**。
+        //   真实边界由「写进去 + 回读校验」暴露（见 `SocLimit::tick`）。
+        //
+        // 因此这里给的是**保守的通用区间**：
+        //
+        // | 值 | 理由 |
+        // |---|---|
+        // | 60 | 电池健康保护类功能普遍以 60% 为最低有意义上限（再低等于充不满） |
+        // | 100 | 物理上限 |
+        //
+        // ⚠️ **这不是"写死某机型数据"**：它不来自任何一台机的实测，
+        //    而是功能语义上的保守默认。改它之前请同步确认
+        //    `soc_limit/config.rs` 的 `SOC_PHYSICAL_MIN/MAX`（20~100）
+        //    与界面滑块的范围，三处必须一致。
         profile.capabilities.soc_limit = Some(SocLimitCapability {
             supported: true,
-            min: 60,
+            min: 55,
             max: 100,
         });
         // ⚠️ 文案格式：`名称：短结论`
@@ -151,13 +219,19 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
         meta.notes.push("SOC 上限：节点可用".to_string());
     } else {
         meta.failed_items.push("soc_nodes".to_string());
+        // 文案不点名 `smart_chg`：标准框架的机型用的是
+        // `charge_control_end_threshold`，"找不到 smart_chg 节点"会让
+        // 用户以为自己的机器缺了个本该有的东西。
         meta.notes
-            .push("SOC 上限：不可用（未找到可写的 smart_chg 节点）".to_string());
+            .push("SOC 上限：不可用（未找到可写的充电上限节点）".to_string());
     }
 
     // ---------- ④ 档位表（设备树直读，**零副作用**）----------
     log::info!("[4/10] 读取充电档位表…");
     let mut gear_rows: Vec<GearRow> = Vec::new();
+    // 档位上限的**来源** —— 决定第 ⑧ 步那条面向用户的文案怎么说
+    // （有的机型靠档位表推导，有的只能读节点，见 §4 的兜底）
+    let mut gear_max_origin = GearMaxOrigin::Unknown;
     match sysfs::GearTable::detect() {
         // ⚠️ 第二个返回值是档位表路径，**这里不再需要**：
         //    它原先进 `notes` 文案（"…来源 {path}…"），而那正是
@@ -187,6 +261,7 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
             // 来源：设备树直读
             profile.capabilities.sources.gear_max = ValueSource::Devicetree;
             profile.capabilities.sources.gear_table = ValueSource::Devicetree;
+            gear_max_origin = GearMaxOrigin::Table;
 
             // 最大功率档位 = 电流上限最大的档
             profile.capabilities.power.max_power_gear = table.max_power_gear();
@@ -199,13 +274,33 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
             }
         }
         Err(e) => {
-            log::warn!("档位表直读失败：{e:#}");
-            meta.failed_items.push("gear_table".to_string());
-            meta.notes
-                .push(format!("档位表读取失败，沿用保守范围 0~15：{e:#}"));
-            // 来源保持 Default：0~15 是硬编码兜底，不是本机实测
-            profile.capabilities.sources.gear_max = ValueSource::Default;
+            // ⚠️ 这里必须区分**两种"读不到"**，否则界面会说谎
+            //
+            // | 情形 | 旧文案（一律当失败） | 实际情况 |
+            // |---|---|---|
+            // | 机型**没有**档位表节点 | 「档位表读取失败，沿用保守范围 0~15」 | **完全正常** —— 这类机型用标准 `power_supply` 接口 |
+            // | 节点在、但读/解析失败 | 同上 | 真失败，该让用户知道 |
+            //
+            // 旧代码把两者混为一谈，还写死了 `0~15`（K90PM 的数字）。
+            // 后果（2026-10-19 真机）：标准 `power_supply` 框架的机型
+            // 一跑检测就红着一行「档位表读取失败」—— 而它本来就没有
+            // 这个节点；同时界面报的「0~15」与它真实的 `0~16` 不符。
+            let has_node = sysfs::GEAR_TABLE_CANDIDATES
+                .iter()
+                .any(|p| sysfs::Node::new(*p).exists());
+            if has_node {
+                // 真失败：进 failed_items（界面「未探测到」区块会列出来）
+                log::warn!("档位表直读失败：{e:#}");
+                meta.failed_items.push("gear_table".to_string());
+            } else {
+                // 机型没有这个节点：**不是**失败，降级为 info
+                log::info!("[4/10] 本机型没有档位表节点 —— 改用标准接口读档位上限（不是失败）");
+            }
+            // 档位表确实没有（来源如实标 `unknown`）
             profile.capabilities.sources.gear_table = ValueSource::Unknown;
+            // ⚠️ 这里**不写 notes**：档位上限的文案统一由第 ⑧ 步输出。
+            //    否则界面上会出现两条同名的「档位上限」，而且这里还
+            //    说不出真实的档位数（要等下面的兜底读完才知道）。
         }
     }
     profile.capabilities.gear.table = gear_rows;
@@ -240,6 +335,51 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
     //
     // 只读候选节点（`constant_charge_current_max` / `usb/current_max` …）
     // 在本机**全部读 0**，无法作为替代来源，因此只能跳过。
+    // ⚠️ **没有档位表时的兜底**（2026-10-19 新增）
+    //
+    // 上面的 `gear.max = 表长度` 只在**读到了档位表**时执行（在那个
+    // `Ok(...)` 分支内部）。而部分机型完全没有档位表 —— 此时
+    // `gear.max` 会保留 `profile` 里的暂定值，可能与真实档位数不符
+    // （实测：暂定 15、真实 16）。
+    //
+    // ⇒ 退到标准接口的 `charge_control_limit_max` 读真值；
+    //   连它都没有，就用 profile 的暂定区间上界（用户 2026-10-19 定 0~30）。
+    // 判据用已经 move 进档案的那份表（`gear_rows` 在 L212 已 move）
+    if profile.capabilities.gear.table.is_empty() {
+        let mut picked = None;
+        for p in sysfs::GEAR_MAX_CANDIDATES {
+            let Ok(raw) = fs::read(p) else { continue };
+            let Ok(s) = std::str::from_utf8(&raw) else {
+                continue;
+            };
+            let Ok(v) = s.trim().parse::<u8>() else {
+                continue;
+            };
+            // 合理性：档位数不该是 0，也不该大到离谱
+            if v == 0 || v > 64 {
+                continue;
+            }
+            picked = Some((v, *p));
+            break;
+        }
+        match picked {
+            Some((v, p)) => {
+                log::info!("[4/10] 档位上限取自 {p}：{v} 档");
+                profile.capabilities.gear.max = v;
+                profile.capabilities.gear.safe = v;
+                profile.capabilities.sources.gear_max = ValueSource::Node;
+                gear_max_origin = GearMaxOrigin::Node;
+            }
+            None => {
+                profile.capabilities.gear.max = 30;
+                profile.capabilities.gear.safe = 30;
+                // 0~30 是**硬编码兜底**，不是本机实测 —— 来源如实标 `default`
+                profile.capabilities.sources.gear_max = ValueSource::Default;
+                log::warn!("[4/10] 档位上限无从探测，暂按 0~30 处理");
+                gear_max_origin = GearMaxOrigin::Unknown;
+            }
+        }
+    }
     log::info!("[5/10] 读取电流上限…");
 
     let charging_now = nodes
@@ -252,13 +392,29 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
     if charging_now {
         // 沿用档案值（不覆盖），并说明原因
         //
-        // ⚠️ **必须记入 `failed_items`**，不能只写 `notes`（2026-10-14 修）
+        // ⚠️ **不能只写 `notes`**（2026-10-14 修）
         //
-        // 这不是"正常跳过"，而是"**这一项没测到**"。
-        // 只写 notes 的后果（真机踩到过）：档案里 `failed_items` 是**空的**，
+        // 只写 notes 的后果（真机踩到过）：档案里什么都没记，
         // 界面和 `device show` 都不提示，用户以为检测全部成功 ——
         // 而实际上 `current.max_ua` 用的是兜底常量，不是本机实测值。
-        meta.failed_items.push("current_ceiling".to_string());
+        //
+        // ⚠️ 但**也不能进 `failed_items`**（2026-10-19 用户要求）
+        //
+        // 这不是"失败"，是"当前状态测不了"：充电中该节点反映的是
+        // **模块自己写入的值**，采信会形成自我循环、逐次压低上限。
+        // 拔掉充电器就能测 —— 因此归 [`pending_items`]（待补测）。
+        //
+        // # 为什么必须分开（用户原话：「总有一个测试显示感叹号」）
+        //
+        // | 项 | 状态要求 |
+        // |---|---|
+        // | 电流上限 | **必须未充电** |
+        // | 档位可写上限 | **必须充电中** |
+        //
+        // 两者相反 ⇒ 无论插不插电总有一项测不了。若都算"失败"，
+        // 用户每次都会看到感叹号，而机器完全正常 —— 久而久之
+        // 他会忽略所有告警。那是比不提示更大的问题。
+        meta.pending_items.push("current_ceiling".to_string());
         // ⚠️ 这里原先写的是 `**跳过**` —— markdown 的加粗语法。
         //
         // `notes` 最终原样渲染到「检测记录」卡片里（`MorePage.vue` 直接
@@ -310,12 +466,17 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
 
     // ---------- ⑥ 硬件保护温度 ----------
     //
-    // # 唯一可信来源：设备树
+    // # 可信来源：设备树属性 **或** sysfs 节点
     //
-    // | 级 | 来源 | 语义 | 本机值 |
+    // | 级 | 来源 | 语义 | 典型值 |
     // |---|---|---|---|
-    // | ① | 设备树 `ffc_temp_high` | 有线快充的电池温度上限 | 48.0℃ |
+    // | ① | 设备树 `ffc_temp_high` | 有线快充的电池温度上限 | 48.0℃（K90PM） |
+    // | ① | 节点 `qcom-battery/max_life_temp` | 电池允许的最高工作温度 | 44℃（标准框架机型） |
     // | ② | 兜底常量 | 通用保守值（**明确标记为 Default**） | 45.0℃ |
+    //
+    // ⚠️ 这两条是**同一条线**（"电池能承受多热"），只是导出方式不同。
+    //    老机型没有 `mca_*` 设备树，只能读节点 —— 2026-10-19 前
+    //    那条路根本没走通（只认 4 字节二进制），于是白退 45℃ 兜底。
     //
     // # ⚠️ 这里**曾经**有第 ② 级"官方热控表最高触发温度"，已移除
     //
@@ -332,10 +493,16 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
     //
     // 详见 `sysfs::HW_MAX_TEMP_CANDIDATES` 的文档。
     log::info!("[6/10] 读取硬件保护温度…");
-    if let Some(t) = read_hardware_max_temp() {
+    if let Some((t, src)) = read_hardware_max_temp() {
         profile.capabilities.thermal.hardware_max_c = t;
-        profile.capabilities.sources.hardware_max_temp = ValueSource::Devicetree;
-        meta.notes.push(format!("硬件保护温度：{t}℃（设备树直读）"));
+        profile.capabilities.sources.hardware_max_temp = src;
+        // 文案按**真实来源**说 —— 节点读到的不能写"设备树直读"
+        let how = match src {
+            ValueSource::Devicetree => "设备树直读",
+            ValueSource::Node => "节点直读",
+            _ => "直读",
+        };
+        meta.notes.push(format!("硬件保护温度：{t}℃ · {how}"));
     } else {
         meta.failed_items.push("hardware_max_temp".to_string());
         meta.notes.push(
@@ -490,17 +657,48 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
     //
     // 旧实现用 `write_and_verify("15")` 硬编码 K90PM 的档位数，
     // 会把档位更多的机型的上限**缩小**到 15。详见 `verify_gear_max` 的文档。
-    if opts.mode == ProbeMode::Full && opts.allow_write_probe {
-        let derived = profile.capabilities.gear.max;
-        log::info!("[8/10] 验证档位可写上限（推导值 {derived}）…");
+    // ⚠️ **未插充电器时不能做写探**（2026-10-19 真机确认）
+    //
+    // # 为什么
+    //
+    // 未插电时驱动不接受档位写入 —— 与小米那套
+    // "adapter is plugout, don't handle soc limit" 是同一个道理。
+    // 此时写探**必然失败**，而失败的处理是"保守降一档"：
+    //
+    // | 实测（K70 Pro，Discharging） | 结果 |
+    // |---|---|
+    // | `charge_control_limit_max` | **16** |
+    // | 写探 16（未插电） | 失败 |
+    // | 档案里记成 | **15** ← 白丢一档 |
+    //
+    // 也就是说：**拔着电跑一次完整检测，会把硬件上限永久记低一档**，
+    // 而用户的机器实际支持 16 档。这与"不写死机型数据"直接冲突 ——
+    // 数据不是写死的，是被检测**测错了**。
+    //
+    // ⇒ 未插电就**跳过**写探，保留推导值，并如实说明跳过原因。
+    //   用户想验证时插上电再勾一次即可。
+    let derived = profile.capabilities.gear.max;
+    let how = gear_max_origin.describe(derived);
+    let probe_gear = opts.mode == ProbeMode::Full && opts.allow_write_probe;
+    if probe_gear && !charging_now {
+        log::info!("[8/10] 未插充电器 —— 跳过档位写探（此状态下驱动不接受写入）");
+        // 归 `pending_items`（待补测）而非 `failed_items`：
+        // 这不是失败，插上充电器再勾一次就能测完。
+        // 详见 `ProbeMeta::pending_items` 的说明。
+        meta.pending_items.push("gear_write_probe".to_string());
+        meta.notes.push(format!(
+            "档位上限：{how} · 未插电，跳过写探 —— 插上充电器再勾一次即可验证"
+        ));
+    } else if probe_gear {
+        log::info!("[8/10] 验证档位可写上限（{how}）…");
 
         match verify_gear_max(&nodes, derived) {
             Ok(max) => {
                 if max == derived {
-                    meta.notes.push(format!("档位上限：{derived} 已验证可写"));
+                    meta.notes.push(format!("档位上限：{how}，已验证可写"));
                 } else {
                     meta.notes.push(format!(
-                        "档位上限：推导值 {derived} 写不进去，保守降为 {max}"
+                        "档位上限：{how}，但这个值写不进去，保守降为 {max} 档"
                     ));
                 }
                 profile.capabilities.gear.max = max;
@@ -514,9 +712,8 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
                 // `{e:#}` 是 anyhow 的**完整因果链**，动辄两三行，
                 // 直接违反"右列要短"这条要求（用户 2026-10-17 反馈）。
                 // 界面只说"失败了"，细节去 logcat 里看。
-                log::warn!("[8/10] 档位上限写探失败（沿用推导值 {derived}）：{e:#}");
-                meta.notes
-                    .push(format!("档位上限：验证失败，沿用推导值 {derived}"));
+                log::warn!("[8/10] 档位上限写探失败（沿用 {how}）：{e:#}");
+                meta.notes.push(format!("档位上限：验证失败，沿用 {how}"));
             }
         }
     } else {
@@ -535,8 +732,10 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
         //
         // ⚠️ 语气是 `skip` 而非 `warn`：不做写探是**设计行为**
         //    （快速检测的全部价值就是"零副作用"），不是失败。
-        meta.notes
-            .push("档位上限：未做写探（快速检测零副作用）".to_string());
+        //
+        // ⚠️ 这条也是「档位上限」**唯一**的快速模式文案 ——
+        //    第 ④ 步不再单独记一条（否则界面上会出现两行同名项）。
+        meta.notes.push(format!("档位上限：{how} · 未做写探"));
         log::info!("[8/10] 跳过档位上限验证（快速模式或未加 --confirm）");
     }
 
@@ -590,6 +789,28 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
         meta.notes.push(format!("未成功项：{}", names.join(" / ")));
     }
 
+    // ── 待补测项（**中性语气**，不是失败）──
+    //
+    // 用户 2026-10-19：「插电的时候无法测电流上限，不插电的时候无法测
+    // 档位上限，总有一个测试显示感叹号」。
+    //
+    // 这两项的状态要求相反，所以任何一次检测都必然有一项测不了。
+    // 关键是**别让它看起来像故障** —— 用"换个状态就能补测"的说法，
+    // 而不是"未成功"。
+    if !meta.pending_items.is_empty() {
+        let mut names: Vec<&str> = meta
+            .pending_items
+            .iter()
+            .map(|k| failed_item_label(k))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        meta.notes.push(format!(
+            "待补测：{} —— 这两项要求的插电状态相反，换状态再跑一次即可，不是故障",
+            names.join(" / ")
+        ));
+    }
+
     log::info!("[10/10] 完成");
     profile.probe_meta = meta;
     // 本机实测结果默认**未验证**（需维护者核对后才作为出厂档案分发）
@@ -634,16 +855,55 @@ fn read_battery_info() -> BatteryInfo {
 /// ⚠️ 不取"所有候选里的最小值"：这些节点的**场景并不相同**
 /// （无线反充的上限比有线快充低 8℃，会无谓压低用户可配置的范围）。
 /// 详见该常量文档。
-fn read_hardware_max_temp() -> Option<f32> {
+///
+/// # 返回值带上**来源**
+///
+/// 2026-10-19 前这里只返回温度，调用处一律标 `Devicetree`、文案一律写
+/// 「设备树直读」。但候选表里混着两类完全不同的东西：
+///
+/// | 路径 | 实际来源 |
+/// |---|---|
+/// | `/sys/firmware/devicetree/...` | 设备树属性 |
+/// | `/sys/class/qcom-battery/max_life_temp` | **sysfs 节点** |
+///
+/// 于是标准 `power_supply` 框架的机型会被标成"设备树直读" —— 既说错了
+/// 出处，又让 [`ValueSource::is_authoritative`] 把它降了一档
+/// （`Devicetree` 不是权威来源，`Node` 才是）。因此这里把来源一起带回。
+fn read_hardware_max_temp() -> Option<(f32, ValueSource)> {
     for path in sysfs::HW_MAX_TEMP_CANDIDATES {
         let Ok(raw) = fs::read(path) else { continue };
-        if raw.len() < 4 {
-            continue;
+
+        // 来源按**路径**判定，不按"读到了什么格式"判定
+        let src = if path.contains("/firmware/devicetree/") {
+            ValueSource::Devicetree
+        } else {
+            ValueSource::Node
+        };
+
+        // ── ① sysfs 节点：ASCII 文本（如 `"44\n"`）──
+        //
+        // 🔴 这是 2026-10-19 真机上发现的缺口：原实现只认设备树的
+        //    **4 字节大端二进制**，而 `qcom-battery` 下的温度上限是
+        //    纯文本 `"44\n"`（**3 字节**）⇒ 直接被 `raw.len() < 4`
+        //    跳过 ⇒ 检测报告"硬件保护温度未测到"，白退到 45℃ 兜底。
+        //
+        // ⚠️ 先试文本再试二进制：文本可能长达 4 字节（`"440\n"`），
+        //    若先按二进制解析会得到无意义的大数 —— 虽然
+        //    `parse_temp_celsius` 的范围检查能拦住，但顺序对了更直观。
+        if let Ok(s) = std::str::from_utf8(&raw) {
+            if let Ok(v) = s.trim().parse::<u32>() {
+                if let Some(c) = parse_temp_celsius(v) {
+                    return Some((c, src));
+                }
+            }
         }
-        // 设备树整数为 4 字节大端
-        let v = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        if let Some(c) = parse_temp_celsius(v) {
-            return Some(c);
+
+        // ── ② 设备树属性：4 字节大端整数 ──
+        if raw.len() >= 4 {
+            let v = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            if let Some(c) = parse_temp_celsius(v) {
+                return Some((c, src));
+            }
         }
     }
     None

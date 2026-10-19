@@ -1,6 +1,6 @@
 id=a_thermo_charge
 name=温控充 ThermoCharge
-version=0.4.0
-versionCode=400
+version=0.4.15
+versionCode=415
 author=乱世殇歌
 description=按电池温度闭环控制充电速度，并可设定充电上限。设备自适应，双写控制（档位+电流）。**四模式独立配置**（保守/官方/极速/自定义）、功率上限、**充电历史曲线**。**未跑检测前不做任何控制**。

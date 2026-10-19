@@ -255,6 +255,15 @@ export interface AddonStatus {
    *    里展开，前端只管显示，**不要在这里再写一份文案**
    *    （两处各写一份，迟早会不一致）。
    *
+   * ⚠️ 2026-10-19：这段文字**不再固定**。它按充电框架走：
+   *
+   * | 框架 | 前提文案 |
+   * |---|---|
+   * | 小米 `smart_chg` | 必须先打开「电池健康保护」 |
+   * | 标准 `charge_control_end_threshold` | 与那个开关无关，无需额外设置 |
+   *
+   * 所以**任何地方都不要**假定它一定提到「电池健康保护」。
+   *
    * `undefined` = 该功能没有特殊前提（或后端版本较老）。
    */
   requires?: string;
@@ -381,10 +390,15 @@ export function isTrustedSource(s: ValueSource | undefined): boolean {
  * |---|---|---|
  * | `node` | ✅ | 本机节点直读 |
  * | `battery_model` | ✅ | 本机电池型号解析 |
- * | `devicetree` | ✅ | 本机设备树直读（档位表/硬件温度的唯一来源） |
+ * | `devicetree` | ✅ | 本机设备树直读（档位表；部分机型的硬件温度也在这里） |
  * | `profile` | ❌ | **可能来自他人实测**（档案是分发的） |
  * | `default` | ❌ | 硬编码猜测 |
  * | `unknown` | ❌ | 没探到 |
+ *
+ * ⚠️ 2026-10-19：硬件保护温度**不再只有设备树一个来源**。
+ *    没有 `mca_*` 设备树的机型（标准 `power_supply` 那一类）会从
+ *    `qcom-battery/max_life_temp` 一类节点直读，来源标 `node`。
+ *    所以「设备树是唯一来源」的说法已经过时，别照着写文案。
  */
 export function isLocalSource(s: ValueSource | undefined): boolean {
   return s === "node" || s === "battery_model" || s === "devicetree";
@@ -466,6 +480,24 @@ export interface ProbeMeta {
    * 保留字段是为了兼容**旧版档案**，界面据此提示"建议重跑检测"。
    */
   needs_charge_for: string[];
+  /**
+   * **待补测项**：因插电状态不满足而主动跳过的检测项（后端英文 ID）
+   *
+   * # 与 `failed_items` 的区别（用户 2026-10-19 要求分开）
+   *
+   * | | `failed_items` | `pending_items` |
+   * |---|---|---|
+   * | 含义 | 真的失败了 | 只是当前状态不对 |
+   * | 用户该做什么 | 查原因 | **换插拔状态重跑** |
+   * | 界面语气 | 感叹号 | 中性提示 |
+   *
+   * 必须分开的原因：电流上限要求**未充电**、档位写探要求**充电中**，
+   * 两者相反 ⇒ 任何一次检测总有一项测不了。都算"失败"的话，
+   * 用户每次都会看到感叹号，而机器完全正常。
+   *
+   * 老档案没有这个字段 ⇒ 用 `?? []` 兜底。
+   */
+  pending_items?: string[];
   notes: string[];
   /** 检测时刻（Unix 秒） */
   probed_at?: number;
