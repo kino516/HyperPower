@@ -286,7 +286,7 @@ const currentKey = computed(() => TABS[navIndex.value]?.key ?? "status");
 /** 顶部栏标题 */
 const pageTitle = computed(() => {
   const label = TABS[navIndex.value]?.label ?? "";
-  return label ? `温控充 · ${label}` : "温控充";
+  return label ? `澎湃充控 · ${label}` : "澎湃充控";
 });
 
 // 切到新页签时标记为已访问（触发挂载）。

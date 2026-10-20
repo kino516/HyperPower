@@ -398,7 +398,7 @@ export async function exportDiagnosticLog(): Promise<string> {
     // （用户手上可能同时有好几次导出）
     `DBGFILE=$DL/thermo-debug-$TS.jsonl`,
     `{`,
-    `  echo "===== 温控充 诊断报告 ====="`,
+    `  echo "===== 澎湃充控 诊断报告 ====="`,
     `  echo "生成时间: $(date '+%Y-%m-%d %H:%M:%S %z')"`,
     `  echo`,
     `  echo "----- 版本 -----"`,

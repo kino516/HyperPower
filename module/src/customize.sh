@@ -11,7 +11,7 @@
 # 自行解包（需要按架构挑选文件，不能依赖默认解包）
 SKIPUNZIP=1
 
-MODNAME="温控充 ThermoCharge"
+MODNAME="澎湃充控 HyperPower"
 
 ui_print " "
 ui_print "  ╔══════════════════════════════════════╗"

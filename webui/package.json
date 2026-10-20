@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "温控充 ThermoCharge 的 WebUI（KernelSU / APatch 模块内运行）",
+  "description": "澎湃充控 HyperPower 的 WebUI（KernelSU / APatch 模块内运行）",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && node check-style-dup.mjs && node check-component-import.mjs && node check-html-comment.mjs && vite build",

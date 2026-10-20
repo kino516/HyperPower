@@ -79,7 +79,7 @@ LINE_SPACER = 7.0   # 留白段
 _ROOT = Path(__file__).resolve().parents[2]
 
 SRC = _ROOT / "dist" / "酷安发布稿.md"
-OUT = _ROOT / "dist" / "温控充 ThermoCharge · 酷安发布稿.docx"
+OUT = _ROOT / "dist" / "澎湃充控 HyperPower · 酷安发布稿.docx"
 
 # 表情符号：Word 里 微软雅黑 没有这些字形，会渲染成空白或豆腐块
 # （markdown 里保留，酷安那边能正常显示；只是转 Word 时去掉）
@@ -236,7 +236,7 @@ def add_page_number_footer(section):
     """页脚：左侧模块名，右侧"第 N 页"。"""
     p = section.footer.paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run("温控充 ThermoCharge · 亮屏也能快充     ")
+    r = p.add_run("澎湃充控 HyperPower · 亮屏也能快充     ")
     set_run_font(r, size=8.5, color=C_MUTED)
 
     r2 = p.add_run("第 ")
@@ -604,7 +604,7 @@ def main():
 
     doc = build(md)
 
-    doc.core_properties.title = "温控充 ThermoCharge —— 亮屏也能快充，温控交给你自己"
+    doc.core_properties.title = "澎湃充控 HyperPower —— 亮屏也能快充，温控交给你自己"
     doc.core_properties.author = "kino516"
     doc.core_properties.comments = "KernelSU / APatch 温控充电模块 · GPL-3.0 开源"
 

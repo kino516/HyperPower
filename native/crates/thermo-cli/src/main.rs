@@ -1,4 +1,4 @@
-//! 温控充 ThermoCharge · 单二进制
+//! 澎湃充控 HyperPower · 单二进制
 //!
 //! 子命令：
 //! - `supervisor` —— 进程监督与崩溃恢复（仅写固定安全值）

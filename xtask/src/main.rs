@@ -27,7 +27,7 @@ const TARGET: &str = "aarch64-linux-android";
 const BIN_NAME: &str = "thermo";
 
 const USAGE: &str = "\
-ThermoCharge 构建编排
+HyperPower 构建编排
 
 用法: cargo xtask <命令> [选项]
 

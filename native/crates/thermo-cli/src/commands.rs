@@ -248,7 +248,7 @@ fn info(ctx: &Ctx<'_>) -> Response {
         // 前缀 `a_` 是为了在 KernelSU 模块列表里**排序靠前**
         // （列表按 id 字母序升序）。数据目录仍是 `thermo_charge`，见 `paths.rs`。
         "module_id": "a_thermo_charge",
-        "module_name": "温控充 ThermoCharge",
+        "module_name": "澎湃充控 HyperPower",
         "version": env!("CARGO_PKG_VERSION"),
         "data_dir": crate::paths::DATA_DIR,
         "module_dir": crate::paths::MODULE_DIR,

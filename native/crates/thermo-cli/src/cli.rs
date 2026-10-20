@@ -12,12 +12,12 @@ use clap::{Parser, Subcommand};
 
 use crate::ipc;
 
-/// 温控充 —— root 常驻充电控制引擎
+/// 澎湃充控 —— root 常驻充电控制引擎
 #[derive(Debug, Parser)]
 #[command(
     name = "thermo",
     version,
-    about = "ThermoCharge 充电控制引擎",
+    about = "HyperPower 充电控制引擎",
     long_about = "按电池温度闭环控制充电速度；supervisor 与 worker 由 service.sh 拉起。"
 )]
 pub struct Cli {

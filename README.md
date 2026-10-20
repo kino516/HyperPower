@@ -1,10 +1,11 @@
-# 温控充 ThermoCharge
+# 澎湃充控 HyperPower
 
 按电池温度闭环控制充电速度，并可设定充电上限的 **KernelSU / APatch 模块**。
 
 | 项 | 值 |
 |---|---|
-| 模块 id | `a_thermo_charge`（`a_` 前缀为在 KernelSU 模块列表**排序靠前**） |
+| 显示名 | **澎湃充控 HyperPower**（2026-10-20 起；原「温控充 ThermoCharge」） |
+| 模块 id | `a_thermo_charge`（**有意保持不变**，保证已安装模块可原地升级；`a_` 前缀为在 KernelSU 模块列表**排序靠前**） |
 | 形态 | root 常驻原生守护进程 + WebUI（APP 由独立仓库维护） |
 | 引擎 | Rust（stable）单二进制 |
 | 支持基线 | **Android 12（API 31）及以上**，**仅 arm64-v8a** |
