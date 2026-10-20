@@ -216,20 +216,6 @@ fn format_line(kind: &str, fields: Value) -> String {
     line
 }
 
-/// 记录一条 `log` crate 的日志（供 tee logger 调用）
-///
-/// 与 [`write`] 分开是为了让日志那侧的字段名固定（`level`/`target`/`msg`），
-/// 分析时可以直接 grep。
-pub fn write_log(level: &str, target: &str, msg: &str) {
-    if !is_enabled() {
-        return;
-    }
-    write(
-        "log",
-        serde_json::json!({ "level": level, "target": target, "msg": msg }),
-    );
-}
-
 /// 秒级 Unix 时间戳（带毫秒小数）
 ///
 /// ⚠️ 用 `f64` 秒而不是整数毫秒：与项目里其它时间戳（`ts`）单位一致，
