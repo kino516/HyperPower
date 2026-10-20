@@ -513,7 +513,9 @@ pub fn default_config() -> Value {
             // `curve` 仍保留（`thermal.control_law` 可显式切回，供高级用户使用）。
             "control_law": "ramp",
             "virt_guard": true,
-            "virt_hard": 46.0,
+            // 48℃：与硬件保护温度（`hardware_max_c`）对齐，避免主板温度
+            // 一到 46℃ 就把快充压到 2W（真机验收 D12）。
+            "virt_hard": 48.0,
             // 0 = 跟随检测到的 hardware_max_c（见 §3 的 spec 说明）
             "abs_max": 0.0
         },

@@ -2250,6 +2250,33 @@ mod tests {
         );
     }
 
+    /// Cargo 包版本必须与 `module.prop` 的 `version` 一致
+    ///
+    /// `ctl info` 的 `version` 用 `CARGO_PKG_VERSION`，而 KernelSU 模块列表
+    /// 读 `module.prop` —— 两处不同步时用户会看到两个版本号，无法判断
+    /// 模块是否已更新（0.5.1 就漏了这处，故固化成测试）。
+    #[test]
+    fn 版本号与module_prop一致() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("应能定位到仓库根");
+        let prop = root.join("module/src/module.prop");
+        let text = std::fs::read_to_string(&prop)
+            .unwrap_or_else(|e| panic!("读取 {} 失败：{e}", prop.display()));
+        let version = text
+            .lines()
+            .find_map(|l| l.strip_prefix("version="))
+            .map(str::trim)
+            .expect("module.prop 应有 version= 行");
+
+        assert_eq!(
+            env!("CARGO_PKG_VERSION"),
+            version,
+            "Cargo 版本与 module.prop 的 version 不一致 —— 发版时需同步两处"
+        );
+    }
+
     /// WebUI 里硬编码的模块路径必须与 `module.prop` 的 id 一致
     ///
     /// # 为什么需要这条

@@ -291,7 +291,7 @@ impl Default for Config {
             //    `curve` 不读 `tighten_power_w`，会让界面上的「降到多少」失效
             control_law: ControlLaw::Ramp,
             virt_guard: true,
-            virt_hard: 46.0,
+            virt_hard: 48.0,
             actuator: Actuator::Dual,
             closed_loop: true,
             // ⚠️ 0 = **不限制功率**（默认）

@@ -22,7 +22,7 @@
     "ramp_span": 2.0,
     "control_law": "ramp",
     "virt_guard": true,
-    "virt_hard": 46.0,
+    "virt_hard": 48.0,
     "abs_max": 0.0
   },
   "control": {
