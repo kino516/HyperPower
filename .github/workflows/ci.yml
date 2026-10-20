@@ -50,12 +50,19 @@ jobs:
 
       - name: Cross-compile (aarch64)
         working-directory: native
-        env:
-          # 仓库内的 .cargo/config.toml 记录的是本机 NDK 路径；
-          # CI 用 Cargo 环境变量覆盖 linker / rustflags（env 优先级高于 config）
-          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android31-clang
-          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,relro,-z,now"
-        run: cargo build --release --target aarch64-linux-android -p thermo-cli
+        run: |
+          set -e
+          NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-<unset>} ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-<unset>}"
+          echo "resolved NDK=$NDK"
+          LLVM_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "--- clang wrappers ---"
+          ls "$LLVM_BIN" | grep -E '^aarch64-linux-android[0-9]+-clang$' || true
+          LINKER="$LLVM_BIN/aarch64-linux-android31-clang"
+          test -x "$LINKER" || { echo "::error::linker not found: $LINKER"; exit 1; }
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$LINKER"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,relro,-z,now"
+          cargo build --release --target aarch64-linux-android -p thermo-cli
 
       - name: Verify 16 KB alignment (release gate)
         run: |
