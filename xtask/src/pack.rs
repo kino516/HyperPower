@@ -94,6 +94,11 @@ fn repo_root() -> Result<PathBuf> {
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     for (rel, is_dir) in fs_walk::list_entries(src)? {
+        // `.gitkeep` 仅用于让空目录（如 profiles/）进入 git，
+        // 不应进入模块包 —— 设备侧只应看到真实数据文件
+        if rel.file_name().and_then(|n| n.to_str()) == Some(".gitkeep") {
+            continue;
+        }
         let target = dst.join(&rel);
         if is_dir {
             fs::create_dir_all(&target)?;

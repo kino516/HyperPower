@@ -216,6 +216,25 @@ fn format_line(kind: &str, fields: Value) -> String {
     line
 }
 
+/// 记录一条 `log` crate 的日志（供 tee logger 调用）
+///
+/// 与 [`write`] 分开是为了让日志那侧的字段名固定（`level`/`target`/`msg`），
+/// 分析时可以直接 grep。
+///
+/// 仅 Android target 的 tee logger 会调用它（见 `logging.rs` 的
+/// `install_android_tee`）；在 host 平台（CI 的 clippy）该分支不编译，
+/// 因此对非 android target 允许 dead_code —— 否则 `-D warnings` 会失败。
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn write_log(level: &str, target: &str, msg: &str) {
+    if !is_enabled() {
+        return;
+    }
+    write(
+        "log",
+        serde_json::json!({ "level": level, "target": target, "msg": msg }),
+    );
+}
+
 /// 秒级 Unix 时间戳（带毫秒小数）
 ///
 /// ⚠️ 用 `f64` 秒而不是整数毫秒：与项目里其它时间戳（`ts`）单位一致，
