@@ -6,7 +6,7 @@
 //!
 //! | 层 | 位置 | 优先级 |
 //! |---|---|---|
-//! | 本机档案 | `/data/adb/thermo_charge/device.json` | **最高** |
+//! | 本机档案 | `/data/adb/hyperpower/device.json` | **最高** |
 //! | 出厂档案 | `module/profiles/*.json` | 中 |
 //! | 通用默认 | 代码内置 | 最低 |
 //!

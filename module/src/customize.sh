@@ -100,7 +100,7 @@ fi
 
 # ---------- 5. 数据目录 ----------
 # 配置与模块目录分离：升级/重装模块不丢配置
-DATADIR=/data/adb/thermo_charge
+DATADIR=/data/adb/hyperpower
 ui_print "- 初始化数据目录"
 
 mkdir -p "$DATADIR/logs" "$DATADIR/ipc" 2>/dev/null

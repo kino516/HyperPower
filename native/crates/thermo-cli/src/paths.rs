@@ -7,7 +7,7 @@
 //! | 目录 | 名字 | 由谁决定 |
 //! |---|---|---|
 //! | 模块目录 | `a_hyperpower` | `module.prop` 的 `id` |
-//! | 数据目录 | `thermo_charge` | 本文件的常量（**与模块 id 无关**） |
+//! | 数据目录 | `hyperpower` | 本文件的常量（**与模块 id 无关**） |
 //!
 //! 两者刻意不同名，原因有两条：
 //!
@@ -29,7 +29,7 @@ use std::path::PathBuf;
 /// 数据目录
 ///
 /// ⚠️ **与模块 id 无关，改名时不得改动**（见模块文档）。
-pub const DATA_DIR: &str = "/data/adb/thermo_charge";
+pub const DATA_DIR: &str = "/data/adb/hyperpower";
 
 /// 模块目录
 ///

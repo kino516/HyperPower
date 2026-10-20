@@ -6,7 +6,7 @@
 //!
 //! | 层 | 内容 |
 //! |---|---|
-//! | 文件 | `/data/adb/thermo_charge/config.json`（**单一真源**，不生成任何派生文件） |
+//! | 文件 | `/data/adb/hyperpower/config.json`（**单一真源**，不生成任何派生文件） |
 //! | 内存 | 一份**通用 JSON 对象**（`serde_json::Value`） |
 //!
 //! 保持"通用 JSON"而非直接反序列化成结构体，是为了满足两条硬约束：

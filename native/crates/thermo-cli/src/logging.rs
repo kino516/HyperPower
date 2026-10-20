@@ -151,7 +151,7 @@ fn install_android_tee(level: log::LevelFilter) {
     let logger = LOGGER.get_or_init(|| TeeLogger {
         android: android_logger::AndroidLogger::new(
             android_logger::Config::default()
-                .with_tag("thermo_charge")
+                .with_tag("hyperpower")
                 .with_max_level(level),
         ),
         level,

@@ -9,7 +9,7 @@
 # ============================================================
 
 MODDIR=${0%/*}
-DATADIR=/data/adb/thermo_charge
+DATADIR=/data/adb/hyperpower
 LOGDIR="$DATADIR/logs"
 
 mkdir -p "$LOGDIR" 2>/dev/null

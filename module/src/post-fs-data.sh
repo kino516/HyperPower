@@ -9,7 +9,7 @@
 # ============================================================
 
 MODDIR=${0%/*}
-DATADIR=/data/adb/thermo_charge
+DATADIR=/data/adb/hyperpower
 
 # 仅确保数据目录存在且权限正确
 mkdir -p "$DATADIR/logs" "$DATADIR/ipc" 2>/dev/null

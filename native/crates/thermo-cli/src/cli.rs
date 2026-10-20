@@ -609,8 +609,8 @@ pub fn run_verify(json: bool) -> Result<()> {
     // 初版读 `worker.pid` 判断，结果在**刚装完模块**时误报：
     //
     // ```text
-    // ✗ worker 进程：读不到 /data/adb/thermo_charge/worker.pid —— worker 未运行？
-    // ✗ 控制通道：/data/adb/thermo_charge/ipc/control.sock 不存在
+    // ✗ worker 进程：读不到 /data/adb/hyperpower/worker.pid —— worker 未运行？
+    // ✗ 控制通道：/data/adb/hyperpower/ipc/control.sock 不存在
     // ```
     //
     // 而**进程其实活得好好的**：

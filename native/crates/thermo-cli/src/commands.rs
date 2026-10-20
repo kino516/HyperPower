@@ -246,7 +246,7 @@ fn info(ctx: &Ctx<'_>) -> Response {
         // 模块 id —— 必须与 module.prop 的 `id` 一致（KernelSU 用其作目录名）
         //
         // 前缀 `a_` 是为了在 KernelSU 模块列表里**排序靠前**
-        // （列表按 id 字母序升序）。数据目录仍是 `thermo_charge`，见 `paths.rs`。
+        // （列表按 id 字母序升序）。数据目录仍是 `hyperpower`，见 `paths.rs`。
         "module_id": "a_hyperpower",
         "module_name": "澎湃充控 HyperPower",
         "version": env!("CARGO_PKG_VERSION"),

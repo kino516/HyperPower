@@ -20,7 +20,7 @@ set -e
 # ⚠️ 模块目录名 = `module.prop` 的 `id`（KernelSU 用 id 作目录名）
 #    当前 id 为 `a_hyperpower`（`a_` 前缀是为了在模块列表里排序靠前）
 #
-# ⚠️ 数据目录（`/data/adb/thermo_charge`）**与模块 id 无关**，本脚本不碰它，
+# ⚠️ 数据目录（`/data/adb/hyperpower`）**与模块 id 无关**，本脚本不碰它，
 #    因此改 id 或重装模块都不会丢配置/档案/历史。
 MOD=/data/adb/modules/a_hyperpower
 ZIP=/data/local/tmp/thermo_charge.zip
@@ -74,9 +74,9 @@ echo "==> ①B 清理旧 id 的模块目录"
 for old in $LEGACY_MODS; do
   if [ -d "$old" ]; then
     # 顺带保住用户数据：确认数据目录存在，避免"删完才发现数据也没了"
-    if [ -d /data/adb/thermo_charge ]; then
+    if [ -d /data/adb/hyperpower ]; then
       echo "    ⚠️ 发现旧模块目录：$old"
-      echo "       数据目录 /data/adb/thermo_charge 保留（配置与档案不丢）"
+      echo "       数据目录 /data/adb/hyperpower 保留（配置与档案不丢）"
     else
       echo "    ⚠️ 发现旧模块目录：$old（数据目录不存在，无可保留）"
     fi

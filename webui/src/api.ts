@@ -51,7 +51,7 @@ import type {
  * 而漏改的后果是**整个 WebUI 失效**（调不到 `ctl`）。
  *
  * 前缀 `a_` 是为了在 KernelSU 模块列表里**排序靠前**（列表按 id 字母序升序）。
- * 注意**数据目录仍是 `thermo_charge`**，与模块 id 无关 ——
+ * 注意**数据目录仍是 `hyperpower`**，与模块 id 无关 ——
  * 因此改 id 不影响用户的配置 / 档案 / 历史。
  *
  * 防漏改：`native/crates/thermo-cli/src/commands.rs` 有一条测试
@@ -234,7 +234,7 @@ export async function dumpPerfLog(): Promise<void> {
   const safe = body.replace(/[^A-Za-z0-9_.:=\- ]/g, "");
 
   const ts = new Date().toISOString().slice(0, 19);
-  const dir = "/data/adb/thermo_charge/logs";
+  const dir = "/data/adb/hyperpower/logs";
 
   /**
    * 同时导出**界面异常**
@@ -311,20 +311,20 @@ export async function exportDiagnosticLog(): Promise<string> {
    * | 目录 | 内容 | 可否写 |
    * |---|---|---|
    * | `MOD` = `/data/adb/modules/a_hyperpower` | 二进制（`bin/`）、`module.prop`、`webroot/` | **模块目录（发布物）** |
-   * | `DATA` = `/data/adb/thermo_charge` | `config.json`、`logs/`、`events.jsonl` | ✅ 数据目录 |
+   * | `DATA` = `/data/adb/hyperpower` | `config.json`、`logs/`、`events.jsonl` | ✅ 数据目录 |
    *
    * 首次实现把两者混为一谈（都用 `DATA`），结果报告里：
    *
    * ```text
    * (读不到 module.prop)                        ← 它在 MOD 下
-   * /data/adb/thermo_charge/bin/ctl: inaccessible or not found   ← bin 也在 MOD 下
+   * /data/adb/hyperpower/bin/ctl: inaccessible or not found   ← bin 也在 MOD 下
    * ```
    *
    * 报告生成"成功"了，但最关键的版本与状态两段是空的 ——
    * 正是"看起来成功其实没用"的那类缺陷。**已实测修正**。
    */
   const MOD = "/data/adb/modules/a_hyperpower";
-  const DATA = "/data/adb/thermo_charge";
+  const DATA = "/data/adb/hyperpower";
 
   /**
    * ⚠️ 先把 **WebView 内存里**的诊断数据落盘，再生成报告
@@ -367,7 +367,7 @@ export async function exportDiagnosticLog(): Promise<string> {
    *
    * 用户原话：「导出位置不对，导出到下载目录」。
    *
-   * 首次实现只写 `/data/adb/thermo_charge/` —— 那是**只有 root 能看的地方**：
+   * 首次实现只写 `/data/adb/hyperpower/` —— 那是**只有 root 能看的地方**：
    * 用户打开文件管理器**根本找不到**，也就**没法把文件发给别人**，
    * 而"发给别人"正是这个功能的**唯一目的**。
    *
@@ -433,7 +433,7 @@ export async function exportDiagnosticLog(): Promise<string> {
      * | `logs/main.log` | **不存在** | `paths::main_log()` **只有定义与读取、没有写入者** —— 是预留路径 |
      * | `logs/service.log` | 存在 | 只有 `service.sh` 的启动/结束记录，无 worker 细节 |
      * | `logs/daemon.out` | 存在但 0 字节 | |
-     * | **logcat（tag `thermo_charge`）** | ✅ **真正有内容** | `logging.rs`：Android 上日志走 `android_logger` |
+     * | **logcat（tag `hyperpower`）** | ✅ **真正有内容** | `logging.rs`：Android 上日志走 `android_logger` |
      *
      * 首次实现 `tail main.log`，结果是 `(无 main.log)` ——
      * 而那段恰恰是排查问题**最需要**的信息（决策过程、钳位、节点探测）。
@@ -442,9 +442,9 @@ export async function exportDiagnosticLog(): Promise<string> {
      * ⚠️ logcat 是**环形缓冲**：日志会被冲掉。因此这一段只在
      *    **刚出问题不久**时有效。文案里要说明，否则用户第二天才导出会疑惑。
      */
-    `  echo "----- 运行日志（logcat，tag=thermo_charge，最近 300 行）-----"`,
+    `  echo "----- 运行日志（logcat，tag=hyperpower，最近 300 行）-----"`,
     `  echo "（提示：logcat 是环形缓冲，较早的日志可能已被系统冲掉）"`,
-    `  logcat -d -s thermo_charge 2>/dev/null | tail -n 300 || echo "(logcat 读取失败)"`,
+    `  logcat -d -s hyperpower 2>/dev/null | tail -n 300 || echo "(logcat 读取失败)"`,
     `  echo`,
     `  echo "----- main.log（若存在；Android 上通常为空，日志走 logcat）-----"`,
     `  tail -n 100 ${DATA}/logs/main.log 2>/dev/null || echo "(无 main.log)"`,
@@ -1318,7 +1318,7 @@ function mock(parts: string[]): unknown {
     }
     return {
       enabled: demo.debugOn,
-      path: "/data/adb/thermo_charge/debug/debug.jsonl",
+      path: "/data/adb/hyperpower/debug/debug.jsonl",
       bytes: demo.debugOn ? 2_411_724 : 0,
       max_bytes: 20 * 1024 * 1024,
       max_mb: 20,

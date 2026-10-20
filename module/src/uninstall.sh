@@ -45,13 +45,13 @@
 # ============================================================
 
 MODDIR=${0%/*}
-DATADIR=/data/adb/thermo_charge
+DATADIR=/data/adb/hyperpower
 
 # 卸载日志的落点：
 #   数据目录里的日志可能随之被清理，故同时在 /data/local/tmp 留一份，
 #   便于卸载后排查（该目录用户与 adb 都能访问、可自行删除）。
 SLOG="$DATADIR/logs/service.log"
-USLOG=/data/local/tmp/thermo_charge_uninstall.log
+USLOG=/data/local/tmp/hyperpower_uninstall.log
 
 # 同时输出到三处：stdout（管理器界面可见）、数据目录日志、临时日志
 slog() {
@@ -272,7 +272,7 @@ if [ "$_del_ok" = "1" ]; then
 
   # 路径白名单：只允许删除确定的这一个路径
   case "$DATADIR" in
-    /data/adb/thermo_charge)
+    /data/adb/hyperpower)
       if rm -rf "$DATADIR" 2>/dev/null && [ ! -e "$DATADIR" ]; then
         slog "已彻底删除数据目录 $DATADIR（无残留）"
       else
@@ -287,6 +287,6 @@ else
   slog "数据目录已保留（因节点状态异常，见上方告警）"
 fi
 
-slog "提示：如需彻底清除，可手动删除 /data/local/tmp/thermo_charge_uninstall.log"
+slog "提示：如需彻底清除，可手动删除 /data/local/tmp/hyperpower_uninstall.log"
 slog "===== 卸载完成 ====="
 exit 0

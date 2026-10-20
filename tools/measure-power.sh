@@ -28,7 +28,7 @@
 INTERVAL=${1:-30}
 COUNT=${2:-8}
 
-PIDFILE=/data/adb/thermo_charge/worker.pid
+PIDFILE=/data/adb/hyperpower/worker.pid
 PID=$(cat "$PIDFILE" 2>/dev/null)
 
 if [ -z "$PID" ] || [ ! -d "/proc/$PID" ]; then

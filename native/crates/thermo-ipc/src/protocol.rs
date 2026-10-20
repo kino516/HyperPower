@@ -1,6 +1,6 @@
 //! UDS 协议：JSON Lines
 //!
-//! - 端点：`/data/adb/thermo_charge/ipc/control.sock`（`0600 root:root`）
+//! - 端点：`/data/adb/hyperpower/ipc/control.sock`（`0600 root:root`）
 //! - 认证：`SO_PEERCRED` UID 必须为 0
 //! - 编码：一请求一行、一响应一行
 

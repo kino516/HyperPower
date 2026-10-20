@@ -5,7 +5,7 @@
 | 项 | 值 |
 |---|---|
 | 显示名 | **澎湃充控 HyperPower**（2026-10-20 起；原「温控充 ThermoCharge」） |
-| 模块 id | `a_hyperpower`（`a_` 前缀为在 KernelSU 模块列表**排序靠前**）；**从旧 id `a_thermo_charge` 升级必须先卸载旧模块** —— 数据目录 `/data/adb/thermo_charge` 不变，配置/档案/历史不丢 |
+| 模块 id | `a_hyperpower`（`a_` 前缀为在 KernelSU 模块列表**排序靠前**）；数据目录 **`/data/adb/hyperpower`**（全新项目，不继承旧 `thermo_charge` 配置）；从旧 id 升级请**先卸载旧模块** |
 | 形态 | root 常驻原生守护进程 + WebUI（APP 由独立仓库维护） |
 | 引擎 | Rust（stable）单二进制 |
 | 支持基线 | **Android 12（API 31）及以上**，**仅 arm64-v8a** |

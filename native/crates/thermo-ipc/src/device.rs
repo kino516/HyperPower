@@ -7,7 +7,7 @@
 //! | 层 | 位置 | 生命周期 |
 //! |---|---|---|
 //! | 出厂档案 | `module/profiles/*.json` | 随模块分发，只读 |
-//! | 本机档案 | `/data/adb/thermo_charge/device.json` | 检测后持久保存 |
+//! | 本机档案 | `/data/adb/hyperpower/device.json` | 检测后持久保存 |
 //! | 实时数据 | 内存 | 每拍刷新，**永不落盘** |
 
 use serde::{Deserialize, Serialize};
