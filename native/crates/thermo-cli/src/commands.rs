@@ -247,7 +247,7 @@ fn info(ctx: &Ctx<'_>) -> Response {
         //
         // 前缀 `a_` 是为了在 KernelSU 模块列表里**排序靠前**
         // （列表按 id 字母序升序）。数据目录仍是 `thermo_charge`，见 `paths.rs`。
-        "module_id": "a_thermo_charge",
+        "module_id": "a_hyperpower",
         "module_name": "澎湃充控 HyperPower",
         "version": env!("CARGO_PKG_VERSION"),
         "data_dir": crate::paths::DATA_DIR,
@@ -2188,7 +2188,7 @@ mod tests {
         assert!(text.ends_with('\n'));
         let v: Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(v["ok"], true);
-        assert_eq!(v["data"]["module_id"], "a_thermo_charge");
+        assert_eq!(v["data"]["module_id"], "a_hyperpower");
 
         // 🔴 防漏改：模块 id 与模块目录**必须同名**
         //
@@ -2240,7 +2240,7 @@ mod tests {
             .expect("module.prop 应有 id= 行");
 
         assert_eq!(
-            id, "a_thermo_charge",
+            id, "a_hyperpower",
             "module.prop 的 id 变了 —— 需同步 paths.rs 的 MODULE_DIR 与 commands.rs"
         );
         assert_eq!(

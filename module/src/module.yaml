@@ -1,5 +1,5 @@
 schemaVersion: 1
-id: a_thermo_charge
+id: a_hyperpower
 name: 澎湃充控 HyperPower
 summary: 按电池温度闭环控制充电速度
 description: README.md

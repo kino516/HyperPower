@@ -5,11 +5,11 @@
 | 项 | 值 |
 |---|---|
 | 显示名 | **澎湃充控 HyperPower**（2026-10-20 起；原「温控充 ThermoCharge」） |
-| 模块 id | `a_thermo_charge`（**有意保持不变**，保证已安装模块可原地升级；`a_` 前缀为在 KernelSU 模块列表**排序靠前**） |
+| 模块 id | `a_hyperpower`（`a_` 前缀为在 KernelSU 模块列表**排序靠前**）；**从旧 id `a_thermo_charge` 升级必须先卸载旧模块** —— 数据目录 `/data/adb/thermo_charge` 不变，配置/档案/历史不丢 |
 | 形态 | root 常驻原生守护进程 + WebUI（APP 由独立仓库维护） |
 | 引擎 | Rust（stable）单二进制 |
 | 支持基线 | **Android 12（API 31）及以上**，**仅 arm64-v8a** |
-| 当前版本 | **0.5.0**（新增 PPS 解锁；已实测：REDMI K90 Pro Max / Android 17 · Redmi K70 Pro / Android 16） |
+| 当前版本 | **0.5.1**（模块 id 改为 `a_hyperpower`；充电历史不再记录 ≤3 个采样点的插拔噪声。0.5.0 新增 PPS 解锁；已实测：REDMI K90 Pro Max / Android 17 · Redmi K70 Pro / Android 16） |
 | 实现状态 | 后端 / WebUI / 检测 / 多模式 / 充电历史 **全部完成**并真机验收 |
 
 > ## 🔴 安装 / 更新后必须**重启手机**
@@ -384,7 +384,7 @@ cargo xtask install --via ksud
 ### 设备端诊断命令（排查问题时按这个顺序）
 
 ```sh
-BIN=/data/adb/modules/a_thermo_charge/bin
+BIN=/data/adb/modules/a_hyperpower/bin
 
 # ① 出了任何问题先跑它 —— 端到端逐项自检，有失败项则非零退出
 $BIN/thermo verify

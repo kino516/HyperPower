@@ -33,7 +33,7 @@
 
 # ⚠️ 模块目录名 = module.prop 的 id（KernelSU 用 id 作目录名）
 #    改 id 时需同步此处的路径（见 tools/full-deploy.sh 的说明）
-BIN=/data/adb/modules/a_thermo_charge/bin
+BIN=/data/adb/modules/a_hyperpower/bin
 CTL="$BIN/ctl"
 THERMO="$BIN/thermo"
 fail=0

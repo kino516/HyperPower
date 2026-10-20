@@ -18,16 +18,16 @@
 set -e
 
 # ⚠️ 模块目录名 = `module.prop` 的 `id`（KernelSU 用 id 作目录名）
-#    当前 id 为 `a_thermo_charge`（`a_` 前缀是为了在模块列表里排序靠前）
+#    当前 id 为 `a_hyperpower`（`a_` 前缀是为了在模块列表里排序靠前）
 #
 # ⚠️ 数据目录（`/data/adb/thermo_charge`）**与模块 id 无关**，本脚本不碰它，
 #    因此改 id 或重装模块都不会丢配置/档案/历史。
-MOD=/data/adb/modules/a_thermo_charge
+MOD=/data/adb/modules/a_hyperpower
 ZIP=/data/local/tmp/thermo_charge.zip
 STAGE=/data/local/tmp/thermo_stage
 
 # 曾经用过的模块 id（改 id 后需清理旧目录，见 ①B）
-LEGACY_MODS="/data/adb/modules/thermo_charge"
+LEGACY_MODS="/data/adb/modules/a_thermo_charge /data/adb/modules/thermo_charge"
 
 # ============================================================
 #  ① 停进程
@@ -58,7 +58,7 @@ fi
 # | 目录 | 状态 |
 # |---|---|
 # | `/data/adb/modules/thermo_charge` | 旧的（含旧 id 的 module.prop） |
-# | `/data/adb/modules/a_thermo_charge` | 新的 |
+# | `/data/adb/modules/a_hyperpower` | 新的 |
 #
 # 后果**不是**"显示两个模块"这么简单 —— 两个目录各有一份
 # `service.sh`，开机时会**各拉一个 supervisor**，于是两个 worker

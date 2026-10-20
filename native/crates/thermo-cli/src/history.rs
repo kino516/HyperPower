@@ -105,6 +105,13 @@ pub const HISTORY_SCHEMA: u32 = 1;
 /// | 33 小时 | 120 秒 | 1000 |
 pub const MAX_POINTS: usize = 1000;
 
+/// 归档所需的最少采样点数
+///
+/// 只是插上电源又很快拔掉（例如试一下有没有在充电）时，会话只有
+/// 1–3 个点，没有复盘价值，还会把历史列表塞满。
+/// **采样点数 ≤ 该值的会话不写入历史**（草稿仍然清理）。
+pub const MIN_SESSION_POINTS: usize = 3;
+
 /// 最大可信的采样间隔（秒）
 ///
 /// 相邻两点间隔超过它时，**不计入能量积分** —— 因为那通常意味着
@@ -827,7 +834,13 @@ impl HistoryStore {
         // ⚠️ 先取值再 move（归档会消费 `s`）
         let energy = s.energy_wh;
 
-        if let Err(e) = self.archive(s) {
+        // 采样点过少 = 只插了一下电源又拔掉，不写入历史（草稿仍清掉）
+        if s.points.len() <= MIN_SESSION_POINTS {
+            log::debug!(
+                "充电会话采样点仅 {} 个（≤{MIN_SESSION_POINTS}），跳过归档",
+                s.points.len()
+            );
+        } else if let Err(e) = self.archive(s) {
             log::warn!("充电历史归档失败：{e:#}");
         }
         std::fs::remove_file(&self.draft_path).ok();
@@ -1178,6 +1191,14 @@ mod tests {
         HistoryStore::new(d.join("history.json"), d.join("history.current.json"), cfg)
     }
 
+    /// 造一次"采样点足够"的充电会话（4 点，避免被 MIN_SESSION_POINTS 过滤）
+    fn charge_once(h: &mut HistoryStore, base: i64, on: &Sample, off: &Sample) {
+        for t in 0..4 {
+            h.observe(base + t * 30, on, 0, 9_000_000, "normal");
+        }
+        h.observe(base + 500, off, 0, 0, "idle");
+    }
+
     // ── 会话边界 ──
 
     #[test]
@@ -1227,6 +1248,8 @@ mod tests {
 
         h.observe(1000, &on, 0, 9_000_000, "normal");
         h.observe(1030, &on, 0, 9_000_000, "normal");
+        h.observe(1060, &on, 0, 9_000_000, "normal");
+        h.observe(1090, &on, 0, 9_000_000, "normal");
         assert!(matches!(
             h.observe(3600, &off, 0, 0, "idle"),
             ObserveOutcome::Finished(_)
@@ -1238,6 +1261,27 @@ mod tests {
         assert_eq!(all[0].started_at, 1000);
         assert_eq!(all[0].ended_at, 3600);
         assert_eq!(all[0].soc_end, 60);
+    }
+
+    #[test]
+    fn 采样点过少不归档() {
+        let mut h = store("tiny", HistoryCfg::default());
+        let on = sample(35.0, 30.0, 50, ChargingStatus::Charging);
+        let off = sample(35.0, 0.0, 50, ChargingStatus::Discharging);
+
+        // 只插了一下电源：1、2、3 个点
+        h.observe(1000, &on, 0, 9_000_000, "normal");
+        h.observe(1030, &on, 0, 9_000_000, "normal");
+        h.observe(1060, &on, 0, 9_000_000, "normal");
+        assert!(matches!(
+            h.observe(1100, &off, 0, 0, "idle"),
+            ObserveOutcome::Finished(_)
+        ));
+        assert!(
+            h.load_sessions().is_empty(),
+            "采样点 ≤ {MIN_SESSION_POINTS} 的会话不应写入历史"
+        );
+        assert!(!h.draft_path.exists(), "草稿仍应被清理");
     }
 
     // ── 采样节流 ──
@@ -1424,9 +1468,7 @@ mod tests {
 
         // 造 5 次会话
         for i in 0..5i64 {
-            let base = 10_000 + i * 1000;
-            h.observe(base, &on, 0, 9_000_000, "normal");
-            h.observe(base + 500, &off, 0, 0, "idle");
+            charge_once(&mut h, 10_000 + i * 1000, &on, &off);
         }
 
         let all = h.load_sessions();
@@ -1442,9 +1484,7 @@ mod tests {
         let on = sample(35.0, 30.0, 50, ChargingStatus::Charging);
         let off = sample(35.0, 0.0, 60, ChargingStatus::Discharging);
         for i in 0..3i64 {
-            let base = 10_000 + i * 1000;
-            h.observe(base, &on, 0, 9_000_000, "normal");
-            h.observe(base + 500, &off, 0, 0, "idle");
+            charge_once(&mut h, 10_000 + i * 1000, &on, &off);
         }
         let all = h.load_sessions();
         assert!(all[0].started_at > all[1].started_at);
@@ -1480,6 +1520,8 @@ mod tests {
         let s = sample(35.0, 30.0, 50, ChargingStatus::Charging);
         h.observe(1000, &s, 0, 9_000_000, "normal");
         h.observe(1030, &s, 0, 9_000_000, "normal");
+        h.observe(1060, &s, 0, 9_000_000, "normal");
+        h.observe(1090, &s, 0, 9_000_000, "normal");
         assert!(h.is_recording());
 
         h.configure(HistoryCfg {
@@ -1554,9 +1596,7 @@ mod tests {
         let on = sample(35.0, 30.0, 50, ChargingStatus::Charging);
         let off = sample(35.0, 0.0, 60, ChargingStatus::Discharging);
         for i in 0..3i64 {
-            let base = 10_000 + i * 1000;
-            h.observe(base, &on, 0, 9_000_000, "normal");
-            h.observe(base + 500, &off, 0, 0, "idle");
+            charge_once(&mut h, 10_000 + i * 1000, &on, &off);
         }
         assert_eq!(h.clear().unwrap(), 3);
         assert!(h.load_sessions().is_empty());
@@ -1576,8 +1616,7 @@ mod tests {
         let mut h = store("byid", HistoryCfg::default());
         let on = sample(35.0, 30.0, 50, ChargingStatus::Charging);
         let off = sample(35.0, 0.0, 60, ChargingStatus::Discharging);
-        h.observe(10_000, &on, 0, 9_000_000, "normal");
-        h.observe(10_500, &off, 0, 0, "idle");
+        charge_once(&mut h, 10_000, &on, &off);
 
         let s = h.load_session("10000").expect("应按 id 找到");
         assert_eq!(s.soc_start, 50);

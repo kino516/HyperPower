@@ -6,7 +6,7 @@
 //!
 //! | 目录 | 名字 | 由谁决定 |
 //! |---|---|---|
-//! | 模块目录 | `a_thermo_charge` | `module.prop` 的 `id` |
+//! | 模块目录 | `a_hyperpower` | `module.prop` 的 `id` |
 //! | 数据目录 | `thermo_charge` | 本文件的常量（**与模块 id 无关**） |
 //!
 //! 两者刻意不同名，原因有两条：
@@ -35,7 +35,7 @@ pub const DATA_DIR: &str = "/data/adb/thermo_charge";
 ///
 /// ⚠️ 必须与 `module/src/module.prop` 的 `id` 一致 ——
 /// KernelSU 用 `id` 作为模块目录名。
-pub const MODULE_DIR: &str = "/data/adb/modules/a_thermo_charge";
+pub const MODULE_DIR: &str = "/data/adb/modules/a_hyperpower";
 
 /// 导出目录（用户可访问）
 pub const EXPORT_DIR: &str = "/sdcard/Download";

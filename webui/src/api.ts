@@ -57,7 +57,7 @@ import type {
  * 防漏改：`native/crates/thermo-cli/src/commands.rs` 有一条测试
  * （`webui路径与module_prop一致`）会读本文件并核对，改漏了会测试失败。
  */
-const MODULE_DIR = "/data/adb/modules/a_thermo_charge";
+const MODULE_DIR = "/data/adb/modules/a_hyperpower";
 
 /** 稳定入口（shim → `thermo ctl`） */
 const CTL = `${MODULE_DIR}/bin/ctl`;
@@ -310,7 +310,7 @@ export async function exportDiagnosticLog(): Promise<string> {
    *
    * | 目录 | 内容 | 可否写 |
    * |---|---|---|
-   * | `MOD` = `/data/adb/modules/a_thermo_charge` | 二进制（`bin/`）、`module.prop`、`webroot/` | **模块目录（发布物）** |
+   * | `MOD` = `/data/adb/modules/a_hyperpower` | 二进制（`bin/`）、`module.prop`、`webroot/` | **模块目录（发布物）** |
    * | `DATA` = `/data/adb/thermo_charge` | `config.json`、`logs/`、`events.jsonl` | ✅ 数据目录 |
    *
    * 首次实现把两者混为一谈（都用 `DATA`），结果报告里：
@@ -323,7 +323,7 @@ export async function exportDiagnosticLog(): Promise<string> {
    * 报告生成"成功"了，但最关键的版本与状态两段是空的 ——
    * 正是"看起来成功其实没用"的那类缺陷。**已实测修正**。
    */
-  const MOD = "/data/adb/modules/a_thermo_charge";
+  const MOD = "/data/adb/modules/a_hyperpower";
   const DATA = "/data/adb/thermo_charge";
 
   /**
