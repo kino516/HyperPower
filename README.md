@@ -9,7 +9,7 @@
 | 形态 | root 常驻原生守护进程 + WebUI（APP 由独立仓库维护） |
 | 引擎 | Rust（stable）单二进制 |
 | 支持基线 | **Android 12（API 31）及以上**，**仅 arm64-v8a** |
-| 当前版本 | **0.5.2**（虚拟硬保护默认 46℃ → 48℃，与硬件保护对齐；0.5.1 模块 id 改为 `a_hyperpower`、充电历史过滤 ≤3 采样点噪声；0.5.0 新增 PPS 解锁。已实测：REDMI K90 Pro Max / Android 17 · Redmi K70 Pro / Android 16） |
+| 当前版本 | **1.0.0**（首个正式版：模块更名「澎湃充控 HyperPower」、id 改为 `a_hyperpower`、虚拟硬保护默认 48℃、充电历史过滤 ≤3 采样点噪声；含 0.5.0 的 PPS 解锁。已实测：REDMI K90 Pro Max / Android 17 · Redmi K70 Pro / Android 16） |
 | 实现状态 | 后端 / WebUI / 检测 / 多模式 / 充电历史 **全部完成**并真机验收 |
 
 > ## 🔴 安装 / 更新后必须**重启手机**
