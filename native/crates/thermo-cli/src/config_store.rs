@@ -50,6 +50,8 @@ pub const CONFIG_SCHEMA: u32 = 1;
 /// 而配置里明明有这一段 —— 属于"列表与数据不同源"的典型缺陷。
 pub const SECTIONS: &[&str] = &[
     "device", "thermal", "control", "ui", "daemon", "limit", "log", "curve",
+    // PPS 解锁（附加功能；与 `limit` 平级、完全独立）
+    "pps",
     // 充电历史（观测归档；`get --section history` 可查其开关与保留策略）
     "history",
     // 调试模式（排障用；界面在「反馈问题」里查它的开关与上限）
@@ -138,6 +140,14 @@ const ACTUATORS: &[&str] = &["dual", "readonly"];
 
 const PROFILES: &[&str] = &["auto", "generic"];
 const LOG_LEVELS: &[&str] = &["error", "warn", "info", "debug"];
+
+/// PPS 解锁模式可选值
+///
+/// | 值 | 含义 |
+/// |---|---|
+/// | `lock` | 始终锁定（不管插什么头都解锁） |
+/// | `auto` | 只在已是 PPS 协议时解锁（不动原装头的私有路径） |
+const PPS_MODES: &[&str] = &["lock", "auto"];
 
 /// **按模式独立保存**的配置分区（多模式机制的边界）
 ///
@@ -377,6 +387,23 @@ pub const KEYS: &[KeySpec] = &[
     spec("limit.verify_s", KeyKind::Int { min: 5, max: 300 }),
     spec("limit.keep_on_restore", KeyKind::Bool),
     spec("limit.warn_on_conflict", KeyKind::Bool),
+    // ── §8.5 PPS 解锁分区（6，**附加功能**）──
+    //
+    // ⚠️ 与 `limit.*` **完全独立**：写坏一个不影响另一个。
+    //    出厂默认关闭 —— 本功能会改变充电协议协商（见 `pps::config::WARN_MIPPS`）。
+    spec("pps.enabled", KeyKind::Bool),
+    spec("pps.mode", KeyKind::Enum(PPS_MODES)),
+    spec("pps.forge_broadcast", KeyKind::Bool),
+    spec("pps.power_display_w", KeyKind::Int { min: 30, max: 120 }),
+    // 门控电压：0 ~ 20 V（默认 12 V）
+    spec(
+        "pps.min_vbus_uv",
+        KeyKind::Int {
+            min: 0,
+            max: 20_000_000,
+        },
+    ),
+    spec("pps.verify_s", KeyKind::Int { min: 5, max: 300 }),
     // ── §9 日志分区（3）──
     spec("log.level", KeyKind::Enum(LOG_LEVELS)),
     spec("log.csv", KeyKind::Bool),
@@ -509,6 +536,14 @@ pub fn default_config() -> Value {
             "verify_s": 15,
             "keep_on_restore": true,
             "warn_on_conflict": true
+        },
+        "pps": {
+            "enabled": false,
+            "mode": "lock",
+            "forge_broadcast": true,
+            "power_display_w": 100,
+            "min_vbus_uv": 12000000,
+            "verify_s": 30
         },
         "curve": [
             {"t_max": 38.0, "curr": 18400000},
@@ -1512,7 +1547,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 键总数为四十三() {
+    fn 键总数为五十一() {
         // 43 = 40（原 41，移除重复的 `device.power_limit_w`）+ 3（充电历史分区）
         //
         // 移除理由见 KEYS 里的注释：它与 `control.target_power_w`
@@ -1521,10 +1556,14 @@ mod tests {
         // 新增的 3 个见 §10：`history.enabled` / `history.keep` / `history.sample_s`。
         //
         // +2（2026-10-17）见 §11：`debug.enabled` / `debug.max_mb` —— 调试模式。
+        //
+        // +6（2026-10-20）见 §8.5：`pps.*` —— PPS 解锁（独立分区，
+        //    与 `limit.*` 完全隔离，写坏一个不影响另一个）。
         assert_eq!(
             key_count(),
-            45,
-            "移除 device.power_limit_w、加入充电历史（+3）与调试模式（+2）后合计 45 个键"
+            51,
+            "移除 device.power_limit_w、加入充电历史（+3）、调试模式（+2）\
+             与 PPS 解锁（+6）后合计 51 个键"
         );
     }
 

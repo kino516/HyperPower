@@ -232,11 +232,61 @@ export interface SocLimitDetail {
   note_ui_not_synced?: string;
 }
 
+/**
+ * PPS 解锁功能的细节（`addon show pps` 的 `detail`）
+ *
+ * # 字段为什么这么多是 `null`
+ *
+ * 全部来自**只读节点**，机型/平台不同则可能读不到：
+ * 读不到就是 `null`，**不代表功能坏了**（见 `broadcast_reason` 的说明）。
+ */
+export interface PpsDetail {
+  /** 平台：`qcom` / `mtk`；未探测到为 `null` */
+  platform: string | null;
+  /** 命中的 PD 认证位路径 */
+  node: string | null;
+  /** 认证位当前值（`"0"` / `"1"`）；读不到为 `null` */
+  node_value: string | null;
+  /** 解锁模式的中文名：`锁定` / `自动` */
+  mode: string;
+  /** 会话的中文描述（如「充电中（已解锁）」） */
+  session: string;
+  /** 是否已解锁 */
+  engaged: boolean;
+  /** 当前协议（如 `PD_PPS` / `USB` / `Unknown`） */
+  real_type: string | null;
+  /** 适配器 SVID（`0000` = 公版 PPS 头） */
+  adapter_svid: string | null;
+  /** USB 侧电压（μV）；拔电时可能为负 */
+  voltage_uv: number | null;
+  /** 充电器最高功率（W） */
+  apdo_max: number | null;
+  /** **本机此刻是否满足广播条件** */
+  broadcast_ready: boolean;
+  /** 为什么能/不能广播（人话） */
+  broadcast_reason: string;
+  /** 最近一次广播的时刻（Unix 秒） */
+  last_burst_at: number | null;
+  /** 累计写入次数 */
+  write_count: number;
+}
+
 /** 附加功能状态 */
 export interface AddonStatus {
   addon_api_version: number;
   consecutive_failures: number;
-  detail: SocLimitDetail;
+  /**
+   * **各自的细节**（按功能不同而不同）
+   *
+   * | 功能 | 类型 |
+   * |---|---|
+   * | `soc_limit` | [`SocLimitDetail`] |
+   * | `pps` | [`PpsDetail`] |
+   *
+   * ⚠️ 用联合类型而不是 `any`：拿错字段时 `vue-tsc` 能拦住。
+   *    使用前先按 `id` 收窄（`isPpsStatus()` / `isSocLimitStatus()`）。
+   */
+  detail: SocLimitDetail | PpsDetail;
   enabled: boolean;
   errors: number;
   id: string;
@@ -273,6 +323,29 @@ export interface AddonStatus {
   /** 是否已熔断（连续失败被自动停用） */
   tripped: boolean;
   writes: number;
+}
+
+/**
+ * 是否为**充电上限**的状态（按 `id` 收窄类型）
+ *
+ * 用法：
+ * ```ts
+ * if (isSocLimitStatus(st)) { st.detail.soc_target }   // 类型安全
+ * ```
+ */
+export function isSocLimitStatus(
+  st: AddonStatus | null | undefined,
+): st is AddonStatus & { detail: SocLimitDetail } {
+  return st?.id === "soc_limit";
+}
+
+/**
+ * 是否为 **PPS 解锁**的状态（按 `id` 收窄类型）
+ */
+export function isPpsStatus(
+  st: AddonStatus | null | undefined,
+): st is AddonStatus & { detail: PpsDetail } {
+  return st?.id === "pps";
 }
 
 // ============================================================

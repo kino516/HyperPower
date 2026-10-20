@@ -85,6 +85,7 @@ fn main() -> Result<()> {
             json,
         } => cli::run_measure(duration_ms, interval_ms, json),
         Command::Device { action } => cli::run_device(action),
+        Command::Pps { action } => cli::run_pps(action),
         Command::Version => {
             println!("{}", cli::version_json());
             Ok(())

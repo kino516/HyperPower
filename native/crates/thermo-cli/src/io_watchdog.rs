@@ -235,6 +235,45 @@ impl AddonIo for WatchedIo {
             reply,
         })?
     }
+
+    /// 是否插着充电器
+    ///
+    /// # 🔴 这个覆写是必须的（2026-10-20 真机 bug）
+    ///
+    /// 漏掉它就会落到 trait 的**默认实现（永远 `true`）**，而 worker
+    /// 主循环用的正是 `WatchedIo` —— 于是真机上：
+    ///
+    /// | 功能 | 症状 |
+    /// |---|---|
+    /// | PPS 解锁 | 拔电时永不还原 `pd_verifed`；`auto` 模式的还原分支永不执行 |
+    /// | 充电上限 | "未充电跳过巡检"的省电逻辑从未生效 |
+    ///
+    /// # 为什么不走 watchdog 队列
+    ///
+    /// 它只读一个几字节的 `status` 文件，且与温控主循环自己的采样同级
+    /// （那边也是直接读 sysfs）。走队列反而要新增 `Req` 变体、多一次
+    /// 线程往返 —— 得不偿失。
+    fn is_plugged(&mut self) -> bool {
+        crate::addon_host::read_is_plugged()
+    }
+
+    /// 启动子进程**不走 watchdog 线程**
+    ///
+    /// # 为什么可以直接在主线程做
+    ///
+    /// watchdog 存在的意义是"sysfs 写可能把线程卡进内核 D 状态"。
+    /// 而 `spawn` 只是 `fork` + `exec`，**不碰 sysfs** —— 它不会因为
+    /// 节点卡住而挂起，因此没有理由让它经过那个队列。
+    ///
+    /// 反过来说，如果把它塞进 watchdog 队列，会引入一个新问题：
+    /// 子进程启动需要几十毫秒，而 watchdog 的调用是**同步等回复**的，
+    /// 期间主线程照样阻塞 —— 达不到"不阻塞温控"的目的。
+    ///
+    /// ⇒ 直接委托给 [`crate::addon_host::spawn_child`]：
+    ///   它只做 `Command::spawn` + 立刻返回，不等子进程结束。
+    fn spawn_detached(&mut self, args: &[&str]) -> Result<(), String> {
+        crate::addon_host::spawn_child(args)
+    }
 }
 
 #[cfg(test)]

@@ -56,3 +56,28 @@ allow ksu vendor_sysfs_battery:file { open read write getattr };
 # 这一套在出厂时通常已经对 root 放行，但显式声明一次更稳：
 # 万一某台机型的策略收紧了，模块不至于"突然写不进去"。
 allow ksu sysfs_charger:file { open read write getattr };
+
+# ────────────────────────────────────────────────────────────
+#  PPS 解锁（`pps` 附加功能）需要的类型
+# ────────────────────────────────────────────────────────────
+#
+# 实测机型差异（2026-10-20）：
+#
+# | 节点 | K70 Pro（manet） | K90 Pro Max（myron） |
+# |---|---|---|
+# | `pd_verifed` | `qcom_battery` | `qcom_battery` |
+# | `adapter_svid` | `qcom_battery` | **`xm_power`** |
+# | `apdo_max` | `qcom_battery` | **`xm_power`** |
+# | `usb/voltage_now` | `usb_supply` | `usb_supply` |
+#
+# ⇒ `qcom_battery` 上面已经放行；这里补另外两个**只读**类型。
+
+# 小米封装层（`xm_power/typec/*`）：PPS 门控读 SVID 与 apdo_max
+#
+# ⚠️ 本模块对它**只读不写**，但 `read` 也需要 `open` + `getattr`。
+allow ksu vendor_sysfs_xm_power:file { open read getattr };
+
+# USB 侧供电节点（`power_supply/usb/*`）：PPS 门控读电压
+#
+# ⚠️ 同样只读。这个类型也覆盖 `usb/current_now` 这类观测节点。
+allow ksu vendor_sysfs_usb_supply:file { open read getattr };

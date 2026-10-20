@@ -68,7 +68,14 @@ import * as api from "../api";
 import { f0, f1, thermalPairValid } from "../format";
 import { perfMark } from "../perf";
 import { refresh, sysState } from "../stores/sys";
-import type { AddonStatus, ModeInfo, ThermalSection } from "../types";
+import type {
+  AddonStatus,
+  ModeInfo,
+  PpsDetail,
+  SocLimitDetail,
+  ThermalSection,
+} from "../types";
+import { isPpsStatus, isSocLimitStatus } from "../types";
 
 // ============================================================
 //  常量
@@ -196,6 +203,17 @@ const pendingSoc = ref<number | null>(null);
 /** 刚拨动、还没被后端确认的开关状态：让开关**立刻**跟手 */
 const pendingLimitOn = ref<boolean | null>(null);
 
+// ── 卡片 5：PPS 解锁 ──
+const ppsInfo = ref<AddonStatus | null>(null);
+/** 刚拨动、还没被后端确认的开关状态 */
+const pendingPpsOn = ref<boolean | null>(null);
+
+/** 解锁模式的可选项（与后端 `PPS_MODES` 一致） */
+const PPS_MODES: { value: "lock" | "auto"; label: string }[] = [
+  { value: "lock", label: "锁定" },
+  { value: "auto", label: "自动" },
+];
+
 // ============================================================
 //  工具
 // ============================================================
@@ -246,14 +264,17 @@ async function loadLimit(): Promise<void> {
 async function load(): Promise<void> {
   loading.value = true;
   const deviceP = api.fetchDeviceCached().catch(() => null);
+  // PPS 是**非关键路径**：它读不到不该让整页报错（老版本后端没有这个功能）
+  const ppsP = api.fetchPps().catch(() => null);
   try {
-    const [modeList, thermalData, hw, addon, range, dev] = await Promise.all([
+    const [modeList, thermalData, hw, addon, range, dev, pps] = await Promise.all([
       api.fetchModes(),
       api.fetchThermal(),
       api.fetchHardwareMaxTemp(),
       api.fetchLimit(),
       api.fetchSocRange(),
       deviceP,
+      ppsP,
     ]);
 
     modes.value = modeList.modes;
@@ -262,6 +283,12 @@ async function load(): Promise<void> {
     hwMax.value = hw;
     limitInfo.value = addon;
     socRange.value = range;
+    ppsInfo.value = pps;
+
+    // 顺带同步 `forge_broadcast` 的真实值（不阻塞首屏）
+    if (pps !== null) {
+      void loadPpsForgeOnly();
+    }
 
     if (dev !== null) {
       const pw = dev.capabilities.power_max_w;
@@ -680,8 +707,20 @@ async function applyPower(): Promise<void> {
 
 const limitSupported = computed(() => limitInfo.value?.supported ?? false);
 const limitEnabled = computed(() => limitInfo.value?.enabled ?? false);
-const socTarget = computed(() => limitInfo.value?.detail.soc_target ?? 80);
-const socActive = computed(() => limitInfo.value?.detail.soc_active ?? null);
+
+/**
+ * 只取**充电上限**的 detail（类型收窄）
+ *
+ * `AddonStatus.detail` 现在是 `SocLimitDetail | PpsDetail` 联合类型 ——
+ * 直接 `.soc_target` 会被 `vue-tsc` 拦住（PpsDetail 没这个字段）。
+ * 用 `isSocLimitStatus` 收窄，拿错字段时编译期就报错。
+ */
+const limitDetail = computed<SocLimitDetail | null>(() =>
+  isSocLimitStatus(limitInfo.value) ? limitInfo.value.detail : null,
+);
+
+const socTarget = computed(() => limitDetail.value?.soc_target ?? 80);
+const socActive = computed(() => limitDetail.value?.soc_active ?? null);
 
 /**
  * **使用前提**（后端 `spec.requires`）—— 卡片顶部那块提示
@@ -702,7 +741,7 @@ const limitRequires = computed(() => limitInfo.value?.requires ?? null);
  * 必须主动说明，否则这是"看起来失败其实成功了"的典型陷阱。
  */
 const limitUiNote = computed(
-  () => limitInfo.value?.detail.note_ui_not_synced ?? null,
+  () => limitDetail.value?.note_ui_not_synced ?? null,
 );
 
 /** 本机支持的电量区间（不写死 60~100，机型不同范围不同） */
@@ -755,6 +794,100 @@ async function onToggleLimit(v: boolean): Promise<void> {
     pendingLimitOn.value = null;
     busy.value = false;
   }
+}
+
+/**
+ * 只取 **PPS** 的 detail（类型收窄）
+ */
+const ppsDetail = computed<PpsDetail | null>(() =>
+  isPpsStatus(ppsInfo.value) ? ppsInfo.value.detail : null,
+);
+
+const ppsEnabled = computed(() => ppsInfo.value?.enabled ?? false);
+/** 开关展示值：优先用"刚拨动"的意图，让开关**立刻**跟手 */
+const ppsEnabledShown = computed(
+  () => pendingPpsOn.value ?? ppsEnabled.value,
+);
+const ppsMode = computed<"lock" | "auto">(() =>
+  ppsDetail.value?.mode === "自动" ? "auto" : "lock",
+);
+/** 后端没有直接给 `forge_broadcast`，从配置读（`false` 才是关） */
+const ppsForge = ref(true);
+
+/** 开启 / 关闭 PPS 解锁 */
+async function onTogglePps(v: boolean): Promise<void> {
+  if (busy.value) {
+    return;
+  }
+  busy.value = true;
+  pendingPpsOn.value = v;
+  try {
+    await api.setPpsEnabled(v);
+    void showSnackbar({
+      message: v ? "已启用 PPS 解锁（请插拔一次充电器）" : "已关闭 PPS 解锁",
+      duration: "long",
+    });
+    await wait(SETTLE_MS);
+    await loadPps();
+  } catch (e) {
+    fail(e);
+  } finally {
+    pendingPpsOn.value = null;
+    busy.value = false;
+  }
+}
+
+/** 切换解锁模式 */
+async function onPpsMode(m: "lock" | "auto"): Promise<void> {
+  if (busy.value || m === ppsMode.value) {
+    return;
+  }
+  busy.value = true;
+  try {
+    await api.setPpsMode(m);
+    await wait(SETTLE_MS);
+    await loadPps();
+  } catch (e) {
+    fail(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+/** 切换是否伪造金标动画 */
+async function onPpsForge(v: boolean): Promise<void> {
+  if (busy.value) {
+    return;
+  }
+  busy.value = true;
+  // 立刻跟手，失败时再退回
+  ppsForge.value = v;
+  try {
+    await api.setPpsForge(v);
+  } catch (e) {
+    ppsForge.value = !v;
+    fail(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+/** 只同步 `forge_broadcast`（首屏非阻塞用） */
+async function loadPpsForgeOnly(): Promise<void> {
+  try {
+    const cfg = await api.fetchPpsSection();
+    if (typeof cfg.forge_broadcast === "boolean") {
+      ppsForge.value = cfg.forge_broadcast;
+    }
+  } catch {
+    // 保持上一次的值
+  }
+}
+
+/** 读 PPS 状态（顺带同步 `forge_broadcast` 的真实值） */
+async function loadPps(): Promise<void> {
+  ppsInfo.value = await api.fetchPps();
+  await loadPpsForgeOnly();
 }
 
 /** 提交目标电量 */
@@ -1382,6 +1515,146 @@ async function applySoc(): Promise<void> {
             type="primary"
             @click="onToggleLimit(true)"
           >
+            重试
+          </MiuixButton>
+        </div>
+      </div>
+    </MiuixCard>
+
+    <!--
+      ── 卡片 5：PPS 解锁（附加功能 ②，2026-10-20 移植） ──
+
+      移植自 FreePPS（GPL-3.0）。设计见 `ThermoCharge-PPS移植方案.md` §10。
+
+      🔴 两件事必须在界面上说清楚，否则用户会误判：
+
+      1. **MIPPS 冲突**：锁定 PPS 可能让小米原装头失去私有快充协议，
+         功率反而下降。这是 FreePPS 的真机结论，不是理论担忧。
+      2. **需重新插拔**：协议握手在插电时进行，改完设置不插拔不生效。
+    -->
+    <MiuixSmallTitle text="PPS 解锁" />
+    <MiuixCard v-if="!loading && ppsInfo === null">
+      <!--
+        ⚠️ 不能什么都不渲染：那会只剩一个光秃秃的标题，
+           用户以为页面坏了。老版本后端没有 pps 功能时也会走到这里。
+      -->
+      <MiuixText
+        type="footnote1"
+        color="var(--m-color-on-surface-secondary)"
+        class="hint"
+      >
+        读不到本功能的运行状态（后端版本较老，或演示模式下无数据）。
+        可用命令行确认：<code>ctl addon show pps</code>
+      </MiuixText>
+    </MiuixCard>
+    <MiuixCard v-else-if="ppsInfo && !ppsInfo.supported">
+      <MiuixText type="title4">本机不支持</MiuixText>
+      <MiuixText
+        type="footnote1"
+        color="var(--m-color-on-surface-secondary)"
+        class="hint"
+      >
+        {{ ppsInfo.probe || "未找到可写的 PD 认证位" }}
+      </MiuixText>
+    </MiuixCard>
+
+    <MiuixCard v-else-if="ppsInfo">
+      <MiuixText
+        type="footnote1"
+        color="var(--m-color-on-surface-secondary)"
+        class="lead"
+      >
+        有些第三方 PD 充电头支持 PPS（可编程电压），但会被手机的 PD 认证挡在快充之外。
+        打开本功能可以让它们也触发快充。
+      </MiuixText>
+
+      <!-- 总开关 -->
+      <div class="row">
+        <div class="row__text">
+          <MiuixText type="body1">启用</MiuixText>
+          <MiuixText type="footnote1" color="var(--m-color-on-surface-secondary)">
+            改动后需插拔一次充电器才生效
+          </MiuixText>
+        </div>
+        <MiuixSwitch
+          :model-value="ppsEnabledShown"
+          :disabled="loading || busy"
+          @update:model-value="onTogglePps"
+        />
+      </div>
+
+      <MiuixDivider class="gap" />
+
+      <!-- 模式 -->
+      <div class="field">
+        <div class="field__head">
+          <div class="field__text">
+            <MiuixText type="body1">解锁模式</MiuixText>
+            <MiuixText type="footnote1" color="var(--m-color-on-surface-secondary)">
+              「自动」只在充电头本来就是 PPS 时才动手，更保守
+            </MiuixText>
+          </div>
+        </div>
+        <div class="chips">
+          <button
+            v-for="m in PPS_MODES"
+            :key="m.value"
+            type="button"
+            class="chip chip--pick"
+            :class="{ 'chip--on': ppsMode === m.value }"
+            :disabled="loading || busy"
+            @click="onPpsMode(m.value)"
+          >
+            {{ m.label }}
+          </button>
+        </div>
+      </div>
+
+      <!-- 金标动画 -->
+      <div class="row">
+        <div class="row__text">
+          <MiuixText type="body2">伪造金标动画</MiuixText>
+          <MiuixText type="footnote2" color="var(--m-color-on-surface-secondary)">
+            插电时让状态栏显示 100W 快充图标（仅公版 PPS 头）
+          </MiuixText>
+        </div>
+        <MiuixSwitch
+          :model-value="ppsForge"
+          :disabled="loading || busy"
+          @update:model-value="onPpsForge"
+        />
+      </div>
+
+      <MiuixDivider class="gap" />
+
+      <!-- 当前状态（只读诊断） -->
+      <InfoRow title="平台" :summary="ppsDetail?.platform ?? '未探测到'" />
+      <InfoRow title="当前协议" :summary="ppsDetail?.real_type ?? '读不到'" />
+      <InfoRow
+        title="认证位"
+        :summary="ppsDetail?.node_value === '1' ? '已解锁' : '未解锁'"
+      />
+      <InfoRow title="会话" :summary="ppsDetail?.session ?? '—'" />
+      <InfoRow
+        title="金标动画"
+        :summary="ppsDetail?.broadcast_reason ?? '—'"
+      />
+
+      <!-- MIPPS 警示（红色，本卡片最关键的一条） -->
+      <div class="notice notice--error">
+        <MiuixText type="footnote1" color="var(--m-color-on-error-container)">
+          <b>可能会变慢：</b>锁定 PPS 可能让小米原装头失去私有快充协议
+          （MIPPS），功率反而下降。用原装头且发现变慢时，请关闭本功能或改用「自动」。
+        </MiuixText>
+      </div>
+
+      <!-- 熔断告警 -->
+      <div v-if="ppsInfo.tripped" class="notice notice--error">
+        <MiuixText type="body2" color="var(--m-color-on-error-container)">
+          连续失败已自动停用：{{ ppsInfo.last_error ?? "未知原因" }}
+        </MiuixText>
+        <div class="actions">
+          <MiuixButton class="actions__btn" type="primary" @click="onTogglePps(true)">
             重试
           </MiuixButton>
         </div>

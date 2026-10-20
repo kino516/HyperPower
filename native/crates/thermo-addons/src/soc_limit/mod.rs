@@ -77,6 +77,43 @@ pub const SOC_ENABLE_CANDIDATES: &[&str] = &[
     "/sys/class/power_supply/battery/charge_control_en",
 ];
 
+/// **驱动真实电量**节点候选（%）—— 充电上限实际比较的那个数
+const RSOC_CANDIDATES: &[&str] = &[
+    "/sys/class/qcom-battery/fg1_rsoc",
+    "/sys/class/power_supply/battery/fg1_rsoc",
+    "/sys/class/power_supply/battery/rsoc",
+];
+
+/// **系统电量覆盖**节点候选 —— 可写，用来把显示校正成驱动真实值
+///
+/// # 🔴 为什么需要它（2026-10-20 用户明确要求）
+///
+/// 本机上两个 SOC 严重不一致，且系统显示**偏高**：
+///
+/// | 来源 | 节点 | 实测值 |
+/// |---|---|---|
+/// | 电池图标 | `battery/capacity` | **90~99%** |
+/// | 驱动真实 | `qcom-battery/fg1_rsoc` | **78~81%** |
+///
+/// 后果是用户看到的两件事：
+///
+/// 1. 设 95%，驱动按 `rsoc` 充到 95 才停 —— 那时图标早就 100% 了
+/// 2. 图标本身的电量就是虚高的，充电过程中的读数不可信
+///
+/// 用户的要求：**「系统显示按驱动读取的电量调整」** ——
+/// 把图标校正成驱动真实值，两边永远同一口径。
+///
+/// ⇒ 每拍把 `fake_soc` 写成当前 `rsoc`；禁用/卸载时恢复原值。
+///
+/// ⚠️ `capacity` 本身只读（`-r--r--r--`），`fake_soc` 是驱动提供的
+///    唯一覆盖入口（实测：写 85 → 图标 85；恢复 -22 → 回到真实值）。
+/// ⚠️ **必须记录原值**并在禁用时恢复 —— 否则模块卸载后图标会一直
+///    停在最后写入的假电量上，那是很糟的用户体验。
+const FAKE_SOC_CANDIDATES: &[&str] = &[
+    "/sys/class/qcom-battery/fake_soc",
+    "/sys/class/power_supply/battery/fake_soc",
+];
+
 /// 控制节点的**写入方言**
 ///
 /// # 为什么需要区分
@@ -255,6 +292,24 @@ pub struct SocLimit {
     ///
     /// 写入成功即清零。
     verify_fail_streak: u32,
+    /// 本拍**实际写入的阈值**
+    ///
+    /// 恒等于 `config.soc` —— 因为系统显示已经由 `fake_soc` 校正到
+    /// 驱动口径，两边同一个数，不需要任何换算。
+    last_target: Option<u8>,
+    /// **驱动真实电量**节点（`fg1_rsoc`，%）
+    node_rsoc: Option<String>,
+    /// **系统电量覆盖**节点（`fake_soc`）
+    ///
+    /// 写它 = 让电池图标显示指定值。见 [`FAKE_SOC_CANDIDATES`]。
+    node_fake_soc: Option<String>,
+    /// `fake_soc` 的**原始值**（禁用/清理时恢复）
+    ///
+    /// ⚠️ 原值通常是负数（本机 `-22`，表示"不覆盖"）。
+    ///    必须原样存下、原样写回 —— 不能写 0 或 100。
+    fake_soc_orig: Option<String>,
+    /// 上一次写入 `fake_soc` 的值（相同则跳过，减少无谓写入）
+    fake_soc_last: Option<u8>,
 }
 
 impl SocLimit {
@@ -273,6 +328,11 @@ impl SocLimit {
             write_count: 0,
             range: None,
             verify_fail_streak: 0,
+            last_target: None,
+            node_rsoc: None,
+            node_fake_soc: None,
+            fake_soc_orig: None,
+            fake_soc_last: None,
         }
     }
 
@@ -288,6 +348,76 @@ impl SocLimit {
     fn effective_range(&self) -> (u8, u8) {
         self.range
             .unwrap_or((config::SOC_FALLBACK_MIN, config::SOC_FALLBACK_MAX))
+    }
+
+    /// 把**系统显示电量校正成驱动真实电量**（写 `fake_soc`）
+    ///
+    /// # 用户要求（2026-10-20）
+    ///
+    /// 「充电上限设置成 95，写入驱动 95，**系统显示 95**；
+    ///   系统显示不准，按驱动读取的电量调整」
+    ///
+    /// # 真机数据
+    ///
+    /// | 来源 | 值 |
+    /// |---|---|
+    /// | 电池图标 `capacity` | **90~99%**（虚高） |
+    /// | 驱动真实 `fg1_rsoc` | **78~81%** |
+    ///
+    /// 虚高的后果：设 95% 时驱动按 `rsoc=95` 停，图标那时早已 100%。
+    ///
+    /// ⇒ 每拍把 `fake_soc` 写成当前 `rsoc`，图标就与驱动同口径：
+    ///
+    /// ```text
+    /// fake_soc = rsoc   ⇒   capacity 显示 rsoc
+    /// ```
+    ///
+    /// 于是"设 95 → 驱动 95 → 显示 95"三者统一。
+    ///
+    /// # 安全约束
+    ///
+    /// - 只在**已启用且充电中**才写，禁用时恢复原值
+    /// - 值没变就跳过，避免每拍无谓写入
+    /// - 读不到 `rsoc` 时**不动** `fake_soc`（宁可显示不准，也不要写错）
+    fn sync_display_to_driver(&mut self, io: &mut dyn AddonIo) {
+        let (Some(rsoc_path), Some(fake_path)) =
+            (self.node_rsoc.clone(), self.node_fake_soc.clone())
+        else {
+            return;
+        };
+        let Some(rsoc) = io
+            .read(&rsoc_path)
+            .ok()
+            .and_then(|r| logic::parse_active(&r))
+        else {
+            return;
+        };
+        // 值没变就不重复写
+        if self.fake_soc_last == Some(rsoc) {
+            return;
+        }
+        if io.write(&fake_path, &rsoc.to_string()).is_ok() {
+            self.fake_soc_last = Some(rsoc);
+        }
+    }
+
+    /// 恢复 `fake_soc` 的原始值（禁用 / 交回官方 / 退出时调用）
+    ///
+    /// ⚠️ 不恢复的后果：模块停用后电池图标会一直显示模块最后写入的
+    ///    假电量，与实际严重脱节 —— 必须还原成驱动自己的行为。
+    fn restore_display(&mut self, io: &mut dyn AddonIo) {
+        let (Some(fake_path), Some(orig)) =
+            (self.node_fake_soc.clone(), self.fake_soc_orig.clone())
+        else {
+            return;
+        };
+        if self.fake_soc_last.is_none() {
+            return;
+        }
+        if io.write(&fake_path, &orig).is_ok() {
+            self.fake_soc_last = None;
+            log::info!("[soc_limit] 已恢复系统电量显示（fake_soc={orig}）");
+        }
     }
 
     /// **写入方冲突**的提示后缀（不含则返回空串）
@@ -460,6 +590,29 @@ impl Addon for SocLimit {
                 };
                 self.enable_engaged = false;
 
+                // ── 探测 SOC 口径校正所需的两组节点（**只读**）──
+                //
+                // 见 [`FAKE_SOC_CANDIDATES`]：把系统显示校正成驱动真实值。
+                // ⚠️ probe 阶段**不写** fake_soc，只记下原值备用。
+                self.node_rsoc = RSOC_CANDIDATES
+                    .iter()
+                    .find(|p| io.exists(p))
+                    .map(|p| (*p).to_string());
+                self.node_fake_soc = if self.node_rsoc.is_some() {
+                    FAKE_SOC_CANDIDATES
+                        .iter()
+                        .find(|p| io.writable(p))
+                        .map(|p| (*p).to_string())
+                } else {
+                    None
+                };
+                self.fake_soc_orig = self
+                    .node_fake_soc
+                    .as_ref()
+                    .and_then(|p| io.read(p).ok())
+                    .map(|s| s.trim().to_string());
+                self.fake_soc_last = None;
+
                 let outcome = ProbeOutcome::Supported {
                     detail: match &self.node_enable {
                         Some(e) => format!("命中 {cand}（使能 {e}）"),
@@ -515,13 +668,41 @@ impl Addon for SocLimit {
     fn tick(&mut self, io: &mut dyn AddonIo, _now_s: i64) -> TickOutcome {
         let interval = self.config.interval_s();
 
-        // ① 未启用 → **零写入**（决策 B：停止干预，一个字都不写）
+        // ① 未启用 → 停止干预
+        //
+        // ⚠️ 但**必须恢复 fake_soc**：本功能可能改过电量显示，
+        //    关掉后不还原，电池图标就会一直显示假电量。
         if !self.config.enabled {
+            self.restore_display(io);
             return TickOutcome::idle(interval);
         }
 
-        // ② ⚠️ **插着充电器才巡检**
+        // ①-0 把系统显示电量校正成驱动真实值（用户要求，见方法文档）
+        self.sync_display_to_driver(io);
+
+        // ①-1 🔴 **从节点回读使能位真实状态**（2026-10-20 真机反馈）
         //
+        // # 为什么不能只信内存标记
+        //
+        // `enable_engaged` 只是本进程的**内存标记**，而 `charge_control_en`
+        // 是**驱动持久化**的节点值。两者会脱节：
+        //
+        // | 场景 | 内存标记 | 节点实际 |
+        // |---|---|---|
+        // | worker 重启 | `false` | **`1`**（上次写的一直在） |
+        // | 拔电期间 | 不写、也不置位 | 保持 `1` |
+        //
+        // 旧逻辑据此判 `soc_in_effect = false` ⇒ 界面显示**「未生效」**，
+        // 而实际限制是生效的 —— 用户看到就认定功能坏了。
+        //
+        // ⇒ 每拍读一次真实值即可对齐。代价：一次只读 sysfs（15~60 秒一拍）。
+        if let Some(en) = self.node_enable.clone() {
+            if let Ok(v) = io.read(&en) {
+                self.enable_engaged = v.trim() != "0";
+            }
+        }
+
+        // ② ⚠️ **插着充电器才巡检**        //
         // # 为什么要加这个判据
         //
         // 限制值只可能在**充电时**被改写 —— 没插电时驱动根本不会去充，
@@ -546,7 +727,30 @@ impl Addon for SocLimit {
         // 才会被发现并修回。这是可接受的：
         //   · 没插电时限制值是多少都无所谓（不充电）
         //   · 下次插电的第一件事就是校验并修正（见上面"插电瞬间"）
+        //
+        // ── ⚠️ 但**必须读一次生效值**（2026-10-20 真机反馈）──
+        //
+        // 原先这里直接 `idle` 返回，于是 `last_seen` 永远是 `None`：
+        //
+        // | 字段 | 拔电时 | 用户看到 |
+        // |---|---|---|
+        // | `soc_active` | `null` | 「—」 |
+        // | `soc_in_effect` | `false` | **「未生效」** |
+        //
+        // 而那时节点里的值其实是**正确**的（`threshold=60`、`en=1`）。
+        // 用户看到「未生效」就判定**功能坏了** —— 本轮"充电上限无效"
+        // 的反馈正是这么来的。
+        //
+        // ⇒ 拔电时不写、不校验，但**读一次**用于状态显示。
+        //   代价：一次只读 sysfs；收益：界面不再谎报"未生效"。
         if !io.is_plugged() {
+            // 拔电时仍读一次生效值，供界面显示（否则会一直报「未生效」）
+            if let Some(read) = self.node_read.clone() {
+                self.last_seen = io
+                    .read(&read)
+                    .ok()
+                    .and_then(|raw| logic::parse_active(&raw));
+            }
             return TickOutcome::idle(interval);
         }
 
@@ -587,8 +791,16 @@ impl Addon for SocLimit {
 
         self.last_seen = actual;
 
+        // ⑤-1 写入值 = **用户设定值，原样写**
+        //
+        // 因为 `fake_soc` 已经把系统显示校正到驱动口径（见 ①-0），
+        // 用户设 90、驱动按 `rsoc=90` 停、图标那时也显示 90 ——
+        // 三者天然一致，不需要任何换算或闭环。
+        let target = self.config.soc;
+        self.last_target = Some(target);
+
         // ⑥ 已一致 → 不写（这是常态：绝大多数拍什么都不做）
-        if !logic::needs_rewrite(self.config.soc, actual) {
+        if !logic::needs_rewrite(target, actual) {
             return TickOutcome::idle(interval);
         }
 
@@ -596,9 +808,9 @@ impl Addon for SocLimit {
         // 按命中节点的方言生成写入内容
         let text = match self.dialect {
             // 小米：控制字（位域打包）
-            Dialect::ControlWord => logic::format_word(logic::encode(self.config.soc)),
+            Dialect::ControlWord => logic::format_word(logic::encode(target)),
             // 标准：纯百分比
-            Dialect::Percent => self.config.soc.to_string(),
+            Dialect::Percent => target.to_string(),
         };
 
         // ⑦-0 🔴 **先开使能位**（标准百分比方言，2026-10-19 真机查明）
@@ -671,6 +883,9 @@ impl Addon for SocLimit {
     }
 
     fn release(&mut self, io: &mut dyn AddonIo) -> TickOutcome {
+        // 先把系统电量显示还原（我们可能改过它）
+        self.restore_display(io);
+
         // ⚠️ 标准百分比方言下，**开过使能位就要关回去**（2026-10-19）
         //
         // 小米 `smart_chg` 那套是"零写入"就能停止干预（控制字自带使能位，
@@ -715,7 +930,31 @@ impl Addon for SocLimit {
         // 与目标不符的值 —— 这**不是失败**，插电后自会生效。
         // 因此这里只如实报告"实际读到多少"，不在后端做"是否生效"的判决。
         let active = self.last_seen;
+        // 写入值现在恒等于 `config.soc`（不做换算），所以直接用目标比较
         let matches_target = active == Some(self.config.soc);
+
+        // 🔴 **"生效中"显示的是用户设定值**（2026-10-20 用户明确要求）
+        //
+        // # 用户反馈
+        //
+        // 「设定的充电上限与生效中的怎么不一样」——之前两次都是把
+        // **节点内部值**当成了"生效值"暴露给用户：
+        //
+        // | 时期 | 界面显示 | 原因 |
+        // |---|---|---|
+        // | 折算方案 | 目标 85 / 生效 65 | 把节点值当生效值 |
+        // | 折算+换算 | 目标 85 / 生效 89 | 旧阈值配新偏差 |
+        //
+        // 用户的选择是「界面显示跟设定一样」，所以这里直接显示
+        // `config.soc` —— 节点里写的就是它，两者本来就该相等。
+        //
+        // ⚠️ 只在**已启用**时显示：关掉功能后没有"生效中的上限"，
+        //    显示 `null` 才诚实（界面显示「—」）。
+        let active_shown = if self.config.enabled {
+            Some(self.config.soc)
+        } else {
+            None
+        };
 
         // ⚠️ 使能位没开时，即使读数与目标一致也**不算生效**（2026-10-19）
         //
@@ -735,7 +974,11 @@ impl Addon for SocLimit {
             // 有使能节点：必须是我们开过了
             Some(_) => self.enable_engaged,
         };
-        let in_effect = matches_target && enable_ok;
+        // 关掉功能后不可能是"已生效"
+        //
+        // 写入值恒等于 `config.soc`（fake_soc 校正后两边同口径），
+        // 所以"值匹配"就是可靠判据。
+        let in_effect = self.config.enabled && enable_ok && matches_target;
 
         AddonStatus {
             id: spec.id.to_string(),
@@ -754,7 +997,8 @@ impl Addon for SocLimit {
             requires: spec.requires.map(str::to_string),
             detail: json!({
                 "soc_target": self.config.soc,
-                "soc_active": active,
+                // 已换算回 `capacity` 口径（与 `soc_target` 同一刻度）
+                "soc_active": active_shown,
                 // 目标与生效是否一致（界面据此决定要不要提示"尚未生效"）
                 "soc_in_effect": in_effect,
                 "verify_s": self.config.verify_s,

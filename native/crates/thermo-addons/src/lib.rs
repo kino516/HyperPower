@@ -26,6 +26,7 @@
 //! registry.rs   插槽注册表 —— 新增功能只改这里一行
 //! runner.rs     调度 + 熔断
 //! soc_limit/    附加功能 ①：充电上限（机制由真机实测确证）
+//! pps/          附加功能 ②：PPS 解锁（移植自 FreePPS，GPL-3.0）
 //! ```
 
 #![forbid(unsafe_code)]
@@ -33,12 +34,14 @@
 
 pub mod addon;
 pub mod io;
+pub mod pps;
 pub mod registry;
 pub mod runner;
 pub mod soc_limit;
 
 pub use addon::{Addon, AddonError, AddonSpec, AddonStatus, ProbeOutcome, TickOutcome};
 pub use io::AddonIo;
+pub use pps::{Pps, PpsConfig};
 pub use registry::build_all;
 pub use runner::{AddonRunner, AddonSlot, TRIP_AFTER_FAILURES};
 pub use soc_limit::{SocLimit, SocLimitConfig};

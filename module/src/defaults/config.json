@@ -50,6 +50,14 @@
     "keep_on_restore": true,
     "warn_on_conflict": true
   },
+  "pps": {
+    "enabled": false,
+    "mode": "lock",
+    "forge_broadcast": true,
+    "power_display_w": 100,
+    "min_vbus_uv": 12000000,
+    "verify_s": 30
+  },
   "curve": [
     {"t_max": 38.0, "curr": 18400000},
     {"t_max": 40.0, "curr": 12000000},

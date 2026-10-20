@@ -794,6 +794,51 @@ export function fetchLimit(): Promise<AddonStatus> {
   return run(["limit", "show"]) as Promise<AddonStatus>;
 }
 
+// ── PPS 解锁（没有 `limit` 那样的便捷别名，走通用 `addon` 命令）──
+
+/**
+ * 读取 PPS 解锁状态
+ *
+ * 用通用的 `addon show pps`，而不是新加一个 `pps show` 别名 ——
+ * 功能侧的通用命令已经够用，多一个别名就多一处要维护的接口面。
+ */
+export function fetchPps(): Promise<AddonStatus> {
+  return run(["addon", "show", "pps"]) as Promise<AddonStatus>;
+}
+
+/** 开启 / 关闭 PPS 解锁 */
+export async function setPpsEnabled(on: boolean): Promise<void> {
+  await run(["addon", on ? "on" : "off", "pps"], TIMEOUT_WRITE_MS);
+}
+
+/**
+ * 设定 PPS 解锁模式
+ *
+ * | 值 | 含义 |
+ * |---|---|
+ * | `lock` | 始终锁定（不管插什么头都解锁） |
+ * | `auto` | 只在已是 PPS 协议时解锁 |
+ */
+export async function setPpsMode(mode: "lock" | "auto"): Promise<void> {
+  await run(["set", "pps.mode", mode], TIMEOUT_WRITE_MS);
+}
+
+/** 设定是否伪造金标动画 */
+export async function setPpsForge(on: boolean): Promise<void> {
+  await run(["set", "pps.forge_broadcast", String(on)], TIMEOUT_WRITE_MS);
+}
+
+/**
+ * 读取 `pps` 配置分区（原始对象）
+ *
+ * ⚠️ 不做严格类型：分区里有 6 个键，而界面目前只用到
+ * `forge_broadcast`。为它再定义一个完整 interface 属于过度设计 ——
+ * 需要时按字段名取，缺就回退。
+ */
+export function fetchPpsSection(): Promise<Record<string, unknown>> {
+  return run(["get", "--section", "pps"]) as Promise<Record<string, unknown>>;
+}
+
 /**
  * 设定充电上限（**同时开启**该功能，符合直觉）
  *
@@ -1109,6 +1154,10 @@ const demo = {
   mode: "custom",
   /** 调试模式开关（演示用） */
   debugOn: false,
+  /** PPS 解锁开关（演示用） */
+  ppsEnabled: false,
+  /** PPS 解锁模式（演示用） */
+  ppsMode: "lock",
 };
 
 /** 演示：四种模式 */
@@ -1365,6 +1414,38 @@ function mock(parts: string[]): unknown {
     return mockLimit();
   }
 
+  // ── PPS 解锁（演示）──
+  if (head === "addon") {
+    // `addon show pps` / `addon on pps` / `addon off pps`
+    if (parts[2] === "pps" || sub === "pps") {
+      if (sub === "on") demo.ppsEnabled = true;
+      if (sub === "off") demo.ppsEnabled = false;
+    }
+    if (sub === "show") return mockPps();
+    return { count: 2, addons: [] };
+  }
+
+  // `set pps.mode auto` / `set pps.forge_broadcast false`
+  if (head === "set" && sub === "pps.mode") {
+    demo.ppsMode = parts[2] ?? "lock";
+    return { key: "pps.mode", value: demo.ppsMode };
+  }
+  if (head === "set" && sub === "pps.forge_broadcast") {
+    return { key: "pps.forge_broadcast", value: parts[2] };
+  }
+
+  // `get --section pps`
+  if (head === "get" && sub === "--section" && parts[2] === "pps") {
+    return {
+      enabled: demo.ppsEnabled,
+      mode: demo.ppsMode,
+      forge_broadcast: true,
+      power_display_w: 100,
+      min_vbus_uv: 12_000_000,
+      verify_s: 30,
+    };
+  }
+
   if (head === "get") {
     const section = parts[2];
     if (section === "curve") {
@@ -1464,10 +1545,58 @@ function mockLimit(): AddonStatus {
   };
 }
 
+/**
+ * 演示：PPS 解锁状态
+ *
+ * ⚠️ 刻意演示**门控通过**的场景（公版 PPS 头、20V、100W），
+ *    这样浏览器里能看到"可广播"的样子；
+ *    真机上拔电时会显示"当前协议不是 PPS"，两种都值得看。
+ */
+function mockPps(): AddonStatus {
+  return {
+    addon_api_version: 1,
+    consecutive_failures: 0,
+    detail: {
+      platform: "qcom",
+      node: "/sys/class/qcom-battery/pd_verifed",
+      node_value: demo.ppsEnabled ? "1" : "0",
+      mode: demo.ppsMode === "auto" ? "自动" : "锁定",
+      session: demo.ppsEnabled ? "充电中（已解锁）" : "充电中（未解锁）",
+      engaged: demo.ppsEnabled,
+      real_type: "PD_PPS",
+      adapter_svid: "0000",
+      voltage_uv: 20_000_000,
+      apdo_max: 100,
+      broadcast_ready: demo.ppsEnabled,
+      broadcast_reason: demo.ppsEnabled
+        ? "可广播（100W）"
+        : "PD 认证位是 0（未解锁），先启用本功能",
+      last_burst_at: demo.ppsEnabled ? Math.floor(Date.now() / 1000) - 30 : null,
+      write_count: demo.ppsEnabled ? 2 : 0,
+    },
+    enabled: demo.ppsEnabled,
+    errors: 0,
+    id: "pps",
+    interval_s: 30,
+    label: "PPS 解锁",
+    last_error: null,
+    origin:
+      "节点机制由真机实测确证：写 qcom-battery/pd_verifed，读 real_type 与 adapter_svid 判断协议",
+    probe: "命中 /sys/class/qcom-battery/pd_verifed（平台 qcom）",
+    // 与后端 `WARN_MIPPS` 同款文案
+    requires:
+      "锁定 PPS 可能让小米原装头失去私有快充协议（MIPPS），导致功率反而下降。用原装头时若发现变慢，请关闭本功能或改用「自动」模式",
+    summary: "绕过 PD 认证，让第三方充电头也能触发快充；可选伪造金标动画",
+    supported: true,
+    ticks: 5,
+    tripped: false,
+    writes: demo.ppsEnabled ? 2 : 0,
+  };
+}
+
 function mockDevice(): DeviceProfileView {
   return {
-    battery: {
-      cycle_count: 205,
+    battery: {      cycle_count: 205,
       health_percent: 96.6,
       model_name: "P11U_7560mah_100w",
       technology: "Li-poly",

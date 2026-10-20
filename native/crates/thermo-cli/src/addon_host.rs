@@ -15,11 +15,104 @@
 //! thermo-addons **不依赖** thermo-core ⇒ 附加功能不认识温控概念（编译期隔离）
 //! ```
 
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+
 use thermo_addons::io::AddonIo;
 use thermo_addons::registry;
 use thermo_addons::runner::AddonRunner;
 
 use crate::config_store::ConfigStore;
+
+// ============================================================
+//  后台子进程（PPS 广播用）
+// ============================================================
+
+/// 已启动但尚未回收的子进程
+///
+/// # 为什么需要回收
+///
+/// `Command::spawn` 返回的 `Child` 若从不 `wait()`，进程退出后会留下
+/// **僵尸（zombie）**。PPS 每次插电启动一个 `thermo pps burst`，
+/// 一天插拔十几次就是十几个僵尸 —— 长期运行会占用 PID 表。
+///
+/// ⇒ 每次启动前先顺手回收已退出的（非阻塞 `try_wait`），
+///   这样既不需要额外线程，也不会积压。
+///
+/// ⚠️ 用 `Mutex<Vec<Child>>` 而非线程：附加功能的 I/O 在单线程里跑，
+///    回收动作也只会从那里发生，加锁只是为了满足 `'static` 存储。
+static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+
+/// 启动一个**与本进程同二进制**的短命子进程，立即返回
+///
+/// # 参数
+///
+/// `args` 是子命令部分（如 `["pps", "burst", "--power", "100"]`），
+/// 可执行文件由 `std::env::current_exe()` 定位。
+///
+/// # 为什么不同步执行
+///
+/// PPS 的爆发序列是 5 条 `am broadcast`，合计 0.5~1 秒。
+/// worker 在充电中是 3 秒一拍 —— 同步执行会把温控采样推迟近一秒，
+/// 属于"附加功能拖累核心功能"，违反隔离契约。
+///
+/// # 隔离
+///
+/// - `Stdio::null()`：子进程输出不进主进程管道（否则管道写满会互相阻塞）
+/// - 不 `wait()`：父进程立刻返回
+/// - 失败**不是致命错误**：调用方只记日志，节点写入不受影响
+pub fn spawn_child(args: &[&str]) -> Result<(), String> {
+    // ① 先回收已退出的子进程（防僵尸）
+    reap_finished();
+
+    let exe = std::env::current_exe().map_err(|e| format!("取自身路径失败：{e}"))?;
+
+    // ② 启动（不等待）
+    let child = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("启动子进程失败：{e}"))?;
+
+    // ③ 挂到表里，等下次回收
+    if let Ok(mut list) = CHILDREN.lock() {
+        list.push(child);
+        // 上限保护：万一 try_wait 一直拿不到（子进程很多且都还活着），
+        // 也不要无限增长。超过 32 个就丢掉最早的那批句柄 ——
+        // 丢了句柄最坏只是可能留僵尸，比内存无限增长好。
+        //
+        // ⚠️ 先算长度再 drain：`list.drain(0..list.len() - 32)` 会在
+        //    同一个表达式里同时可变借用（drain）与不可变借用（len）——
+        //    Rust 不允许，必须把 len 提到外面。
+        let len = list.len();
+        if len > 32 {
+            list.drain(0..len - 32);
+        }
+    }
+
+    Ok(())
+}
+
+/// 回收已退出的子进程（非阻塞）
+///
+/// ⚠️ `try_wait` 不会阻塞：子进程还在跑时立即返回 `Ok(None)`。
+pub fn reap_finished() {
+    let Ok(mut list) = CHILDREN.lock() else {
+        return;
+    };
+    // ⚠️ 先算出保留哪些，再一次性替换 —— 不能在 `retain_mut` 里
+    //    同时可变借用 `list` 和读取 `list.len()`（借用冲突）。
+    let mut alive: Vec<Child> = Vec::with_capacity(list.len());
+    for mut c in list.drain(..) {
+        // `try_wait` 非阻塞：还在跑时返回 Ok(None)
+        if !matches!(c.try_wait(), Ok(Some(_))) {
+            alive.push(c);
+        }
+    }
+    *list = alive;
+}
 
 /// 基于真实文件系统的 [`AddonIo`] 实现
 ///
@@ -75,21 +168,7 @@ impl AddonIo for SysfsIo {
     /// 返回 `true`（保守）：宁可多巡检，也不要因为节点读不到而
     /// 让功能静默失效。
     fn is_plugged(&mut self) -> bool {
-        // ⚠️ 走 `BATTERY_DIRS` 候选，而不是写死 `power_supply/battery`
-        //
-        // 虽然 `battery` 是绝大多数机型的位置，但 `bms` / `main` 也存在
-        // （见 `sysfs::BATTERY_DIRS`）。少一个候选就少一分"读不到 ⇒
-        // 一直保守返回 true ⇒ 巡检永不停止"的可能。
-        for dir in crate::sysfs::BATTERY_DIRS {
-            let p = format!("{dir}/status");
-            let Ok(s) = std::fs::read_to_string(crate::sysfs::rooted(&p)) else {
-                continue;
-            };
-            let s = s.trim();
-            return matches!(s, "Charging" | "Full" | "Not charging");
-        }
-        // 全都读不到：保守返回 true（宁可多巡检）
-        true
+        read_is_plugged()
     }
 
     fn write(&mut self, path: &str, value: &str) -> Result<(), String> {
@@ -107,6 +186,60 @@ impl AddonIo for SysfsIo {
         f.flush().ok();
         Ok(())
     }
+
+    /// 启动后台子进程（PPS 广播用）
+    ///
+    /// 见 [`spawn_child`] —— 只 `spawn`、不等待，立刻返回。
+    fn spawn_detached(&mut self, args: &[&str]) -> Result<(), String> {
+        spawn_child(args)
+    }
+}
+
+/// 判定"是否插着充电器"
+///
+/// # 为什么抽成自由函数（2026-10-20 真机 bug）
+///
+/// 有两个 `AddonIo` 实现：
+///
+/// | 实现 | 用在哪 |
+/// |---|---|
+/// | [`SysfsIo`] | 命令路径 / 测试 |
+/// | [`crate::io_watchdog::WatchedIo`] | **worker 主循环用的就是这个** |
+///
+/// 当时只有 `SysfsIo` 实现了 `is_plugged`，`WatchedIo` 用了 trait 的
+/// **默认实现（永远返回 `true`）**。于是真机上：
+///
+/// | 现象 | 后果 |
+/// |---|---|
+/// | PPS 认为"永远在充电" | 拔电时**永不还原** `pd_verifed`；`auto` 模式的还原分支永不执行 |
+/// | 充电上限认为"永远在充电" | "未充电跳过巡检"的省电逻辑从未生效 |
+///
+/// ⇒ 逻辑只写一份，两个实现都调它。
+///
+/// # 判据
+///
+/// | 值 | 是否算"插着" |
+/// |---|---|
+/// | `Charging` / `Full` | ✅ |
+/// | `Not charging` | ✅ **算插着**（充电上限生效后的正常状态） |
+/// | `Discharging` | ❌ |
+/// | 读不到 | `true`（保守） |
+pub fn read_is_plugged() -> bool {
+    // ⚠️ 走 `BATTERY_DIRS` 候选，而不是写死 `power_supply/battery`
+    //
+    // 虽然 `battery` 是绝大多数机型的位置，但 `bms` / `main` 也存在
+    // （见 `sysfs::BATTERY_DIRS`）。少一个候选就少一分"读不到 ⇒
+    // 一直保守返回 true ⇒ 巡检永不停止"的可能。
+    for dir in crate::sysfs::BATTERY_DIRS {
+        let p = format!("{dir}/status");
+        let Ok(s) = std::fs::read_to_string(crate::sysfs::rooted(&p)) else {
+            continue;
+        };
+        let s = s.trim();
+        return matches!(s, "Charging" | "Full" | "Not charging");
+    }
+    // 全都读不到：保守返回 true（宁可多巡检）
+    true
 }
 
 /// 结果：运行器 + 加载期发现的问题
@@ -144,7 +277,7 @@ pub fn setup(cfg: &ConfigStore) -> AddonSetup {
 /// ⚠️ 本函数**不会立即写节点** —— 下一拍才生效。这样一次命令只触发一次写入，
 /// 也避免在命令处理路径上做 I/O。
 pub fn reload_config(runner: &mut AddonRunner, cfg: &ConfigStore) {
-    // 当前只有充电上限一个功能；新增功能时在此追加分支。
+    // ── ① 充电上限 ──
     if let Some(slot) = runner.slot_mut("soc_limit") {
         if let Some(soc) = slot
             .addon_mut()
@@ -174,6 +307,26 @@ pub fn reload_config(runner: &mut AddonRunner, cfg: &ConfigStore) {
             }
         }
     }
+
+    // ── ② PPS 解锁 ──
+    //
+    // 与充电上限**完全同构**：独立分区、独立校验、独立重新调度。
+    // 任一功能配置写坏都不影响另一个。
+    if let Some(slot) = runner.slot_mut("pps") {
+        if let Some(pps) = slot
+            .addon_mut()
+            .as_any_mut()
+            .downcast_mut::<thermo_addons::pps::Pps>()
+        {
+            let section = cfg.section(thermo_addons::pps::config::SECTION);
+            if let Ok(new_cfg) = thermo_addons::pps::PpsConfig::from_section_opt(section) {
+                if new_cfg.validate().is_ok() {
+                    pps.set_config(new_cfg);
+                    slot.reschedule_now();
+                }
+            }
+        }
+    }
 }
 
 /// 从**生效档案**读本机支持的电量上限区间（%）
@@ -196,12 +349,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 出厂默认下充电上限为关闭() {
+    fn 出厂默认下各功能均为关闭() {
         let cfg = ConfigStore::with_defaults("x.json");
         let setup = setup(&cfg);
         assert!(setup.problems.is_empty(), "出厂默认不应有问题");
-        let slot = setup.runner.slot("soc_limit").unwrap();
-        assert!(!slot.addon().enabled(), "出厂默认必须关闭");
+        for id in ["soc_limit", "pps"] {
+            let slot = setup.runner.slot(id).unwrap_or_else(|| panic!("缺 {id}"));
+            assert!(!slot.addon().enabled(), "{id} 出厂默认必须关闭");
+        }
     }
 
     #[test]
@@ -210,7 +365,7 @@ mod tests {
         // 无需经过配置文件即可验证容错路径。
         let bad = serde_json::json!({"limit": {"soc": "不是数字"}});
         let (slots, problems) = registry::build_all(&bad);
-        assert_eq!(slots.len(), 1, "插槽仍在（只是停用）");
+        assert_eq!(slots.len(), 2, "插槽仍在（只是停用）");
         assert!(!problems.is_empty(), "必须记录问题");
     }
 

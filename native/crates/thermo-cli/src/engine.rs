@@ -19,6 +19,7 @@
 use serde_json::{json, Value};
 use thermo_ipc::device::EffectiveProfile;
 
+use thermo_core::config::CURR_MAX_UA;
 use thermo_core::{Decision, Reason, Sample, State};
 
 use crate::config_store::ConfigStore;
@@ -113,6 +114,54 @@ pub struct Engine {
     pub write_failures: u32,
     /// 是否已交回官方（因连续失败）
     pub released: bool,
+    /// **学到的电流能力上限**（μA）——由"写探"得来
+    ///
+    /// # 为什么需要它（2026-10-20 真机实测）
+    ///
+    /// 标准 `power_supply` 机型（K70 Pro）上，档案里的
+    /// `current.max_ua` 只有 **6 A** —— 那是 `constant_charge_current`
+    /// 的**默认值**，不是能力上限。而驱动实际接受 **15.95 A**：
+    ///
+    /// | 写入 | 驱动实际 | USB 电压 | 电池功率 |
+    /// |---|---|---|---|
+    /// | 6 A | 6 A | 8.4 V | **23.6 W** |
+    /// | 12 A | 12 A | 16.8 V | 31.3 W |
+    /// | 20 A | **15.95 A**（钳位） | 17.4 V | **50.3 W** |
+    ///
+    /// 注意第三行：**电流限制还连带压低了电压协商** —— 电流给小了，
+    /// 充电头就只肯给 8 V。所以这个值太小不只是"限流"，而是
+    /// 直接把快充能力废掉了。
+    ///
+    /// # 怎么学
+    ///
+    /// 温度正常时先写 [`CURR_MAX_UA`]（30 A 物理上限），再读回：
+    /// 驱动会把值**钳到真实能力**（实测 15.95 A），把读回值记下来，
+    /// 之后就用它当目标 —— 于是每台机器自动得到自己的真实上限，
+    /// 不需要任何机型数据。
+    ///
+    /// ⚠️ 依赖"驱动会钳位"这一前提。这是驱动的硬件保护职责，
+    ///    K70 Pro 实测成立（20 A → 15.95 A）。
+    pub learned_curr_max: Option<i32>,
+    /// **电流通道是否已经放开**（不再限制）
+    ///
+    /// # 为什么光靠"值不同就写"不够（2026-10-20 真机踩坑）
+    ///
+    /// 电量接近上限时，驱动会**自己**小幅调整
+    /// `constant_charge_current`（实测在 6.0 / 7.5 / 12.3 A 之间变）。
+    /// 而 `apply_dual` 的 `write_if_different` 一看"节点值 ≠ 我们的目标"
+    /// 就写回去 —— 于是模块和驱动互相追着写，**每 3 秒触发一次
+    /// 充电协商重置**。
+    ///
+    /// 真机现象：
+    ///
+    /// - `curr_limit` 在 6.00 / 7.50 / 12.30 A 之间跳
+    /// - USB 电压在 5 V / 9 V / 15 V / 17 V 之间跳
+    /// - 电池电流在 ±0.1 A 抖动（甚至倒流）
+    ///
+    /// ⇒ 一旦确认"不需要限制"，就写一次放开值并把本标记置位，
+    ///   之后**不再碰电流节点** —— 驱动想怎么调由它去。
+    ///   需要重新限制时（收紧 / 用户设了更低的功率上限）清掉标记。
+    pub curr_opened: bool,
     /// **上一次采样时的充电状态**（缓存）
     ///
     /// # 为什么需要缓存
@@ -210,6 +259,9 @@ impl Engine {
             read_failures: 0,
             write_failures: 0,
             released: false,
+            // `None` = 还没探测过 ⇒ 第一次温度正常时会写探一次
+            learned_curr_max: None,
+            curr_opened: false,
             // 初值为 `false`（未充电）⇒ 启动后第一轮会走"轻拍"，随后
             // 立刻由拍到的一次采样纠正。**刻意不用"启动即跑一拍"**：
             // worker 的启动路径已经显式跑过首拍了。
@@ -218,8 +270,29 @@ impl Engine {
     }
 
     /// 内核所需的能力边界（由生效档案转换而来）
+    ///
+    /// # 🔴 用"学到的电流上限"覆盖档案值（2026-10-20）
+    ///
+    /// 档案里的 `current.max_ua` 在标准 `power_supply` 机型上只是
+    /// `constant_charge_current` 的**默认值**（6 A），不是能力上限。
+    /// 而决策层的 `Bounds.curr_max` 就是它 —— 于是：
+    ///
+    /// | 用户设置 | 结果 |
+    /// |---|---|
+    /// | 不设功率上限（`Normal`） | 电流取 `curr_max` = 6 A ⇒ 24 W |
+    /// | 设了 120 W（`PowerLimit`） | `pcap = min(120W÷4.14V=29A, 6A)` = 6 A ⇒ 还是 24 W |
+    ///
+    /// 两条路都被这 6 A 卡住 —— 这也解释了为什么用户反馈
+    /// 「设不设上限都只有 24W」。
+    ///
+    /// ⇒ 一旦通过写探学到真实上限（实测 15.95 A），就用它替换档案值，
+    ///   让 `power_cap_curr` 的钳位上界变成真实能力。
     pub fn caps(&self) -> thermo_core::Capabilities {
-        crate::profile_io::to_core_caps(&self.profile.profile.capabilities)
+        let mut c = crate::profile_io::to_core_caps(&self.profile.profile.capabilities);
+        if let Some(learned) = self.learned_curr_max {
+            c.current.max_ua = learned;
+        }
+        c
     }
 
     /// 交回官方时用的电流上限（本机实测值；拿不到则用保守值）
@@ -290,6 +363,64 @@ impl Engine {
                 return rep;
             }
         };
+
+        // ── ① 首次充电时做一次**写探**，学习真实电流上限 ──
+        //
+        // 🔴 **必须在 `caps()` 之前**（2026-10-20 真机踩坑，两版才修对）
+        //
+        // 第一版把写探放在 `apply()` 里，问题是 `decision` 在那之前
+        // **已经用旧的 `caps` 算好了**：
+        //
+        // ```text
+        // decision.curr_ua = 6A   （旧 cap）
+        // 随后 apply 里写探 → learned = 30A → cap 变 30A
+        // ⇒ need_limit = (6 < 30) = true ⇒ 又写回 6A   ← 前功尽弃
+        // ```
+        //
+        // 所以必须先把 learned 探出来，`caps()` 才会返回真实上限，
+        // 决策层算出的 `curr_ua` 才是对的。
+        //
+        // # 为什么学习不能挂在某个 reason 上
+        //
+        // 第一版放在 `Reason::Normal` 分支里，而用户的配置是
+        // **功率上限 120W** ⇒ 走 `PowerLimit`，学习分支永远进不去，
+        // 而 `PowerLimit` 算出的电流又被 `curr_max=6A` 钳住 ——
+        // 于是"设了上限"和"没设上限"都是 24W。
+        //
+        // ⚠️ 依赖"驱动会钳位"（K70 Pro 实测：写 30A → 15.95A / 21.8A）。
+        // ⚠️ **只在真正的 `Charging` 时探**（2026-10-20 真机踩坑）：
+        //
+        // 第一版用的是 `is_active()`，而它把 `Full` 也算"活跃"。
+        // 于是满电时也写探了一次，驱动当然只肯给 6 A ⇒ 学到 6 A
+        // 并**固定下来**，下次低电量充电时又是 24W。
+        //
+        // 真机日志就是这么写的：`学到电流能力上限：6 A`。
+        //
+        // ⇒ 只有 `Charging`（真正在充）才有参考价值：
+        //   `Full` / `NotCharging` 时驱动本来就压着电流，探不出能力。
+        if self.learned_curr_max.is_none()
+            && sample.status == thermo_core::ChargingStatus::Charging
+            && self.profile.profile.capabilities.detected
+            && !cfg.observe_only
+        {
+            if let Some(c) = &self.nodes.curr {
+                if c.write_i64(i64::from(CURR_MAX_UA)).is_ok() {
+                    if let Ok(v) = c.read_i64() {
+                        if let Ok(v32) = i32::try_from(v) {
+                            if v32 > 0 {
+                                log::info!(
+                                    "[engine] 学到电流能力上限：{} A（写探 {} A，驱动钳位后）",
+                                    f64::from(v32) / 1e6,
+                                    f64::from(CURR_MAX_UA) / 1e6
+                                );
+                                self.learned_curr_max = Some(v32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let caps = self.caps();
 
         let prev_phase = self.state.phase;
@@ -709,14 +840,104 @@ impl Engine {
         let _ = sample;
 
         let result = if decision.release {
-            // 交回官方：档位归零 + 电流放到本机上限 + 移除标记归零
+            self.curr_opened = false;
+            // 交回官方 ⇒ 丢掉学到的电流上限，下次充电重新探
+            //
+            // # 为什么要清（2026-10-20）
+            //
+            // 学到的值只对**当时的电量/温度/协议**成立。如果一直留着：
+            //
+            // · 满电时学到 6 A（驱动本来就在压电流）⇒ 下次低电量还是 24 W
+            // · 拔掉换了另一个充电器 ⇒ 能力可能完全不同
+            //
+            // 而重探的代价只有"插电后写一次电流节点"，可以忽略。
+            self.learned_curr_max = None;
             self.nodes.release_control(self.release_curr_ua())
         } else if decision.reason == Reason::HardProtect || decision.reason == Reason::VirtGuard {
+            // 硬保护是**故意**收紧，标记必须清掉，否则后续放松时会被"已放开"挡住
+            self.curr_opened = false;
             self.nodes
                 .apply_hard_protect(decision.gear, decision.curr_ua)
+        } else if decision.reason == Reason::Normal || decision.reason == Reason::PowerLimit {
+            // ── 判断"到底需不需要限制电流" ──
+            //
+            // `decision.curr_ua` 已经是决策层算好的目标（`Normal` 时是
+            // `curr_max`，`PowerLimit` 时是功率换算后的 pcap）。
+            //
+            // 如果它 **不小于** 学到的能力上限，说明这个目标等于"不限制"
+            // —— 那就只需要写一次放开值，之后不再碰节点。
+            //
+            // 为什么必须这样（真机实测）：
+            //
+            // | 做法 | 结果 |
+            // |---|---|
+            // | 每拍写目标值 | 驱动会自己微调 6.0/7.5/12.3 A，我们追着写 ⇒ **每 3 秒重置协商** |
+            // | 写一次放开值后撒手 | 驱动自己稳在某个值，协商稳定 |
+            //
+            // 而"真需要限制"（用户设了 50W 这种低于能力的上限）时，
+            // 每条拍都必须把值压回去 —— 否则驱动会自己冲上去。
+            // ⚠️ 基准必须用 `caps().current.max_ua`（决策层实际用的那个值），
+            //    不能用 `CURR_MAX_UA`。否则首次运行时两者不一致：
+            //    `curr_ua = 6A`（档案值）< `CURR_MAX_UA = 30A` ⇒ 判成
+            //    "需要限制" ⇒ 永远写 6A ⇒ **永远学不到真实上限**（死锁）。
+            let cap = self.caps().current.max_ua;
+            let need_limit = decision.curr_ua < cap;
+
+            if need_limit {
+                // 要限制：每次都强制写精确目标
+                self.curr_opened = false;
+                self.nodes.apply_dual(decision.gear, decision.curr_ua, prev)
+            } else if self.curr_opened {
+                // 已放开：**完全不碰电流节点**，让驱动自己管
+                Ok(())
+            } else {
+                // 首次放开：写一次物理上限，读回值由 ② 学下来
+                let r = self.nodes.release_control(CURR_MAX_UA);
+                if r.is_ok() {
+                    self.curr_opened = true;
+                }
+                r
+            }
         } else {
             self.nodes.apply_dual(decision.gear, decision.curr_ua, prev)
         };
+
+        // ② 🔴 读回值**只用来学一次**，绝不跟着波动走（2026-10-20 真机踩坑）
+        //
+        // # 为什么"跟随读回值"是错的
+        //
+        // 上一版让 `learned_curr_max` 每拍跟随读回值，结果变成这样：
+        //
+        // | 拍 | 我们写 | 驱动给 | 学到 |
+        // |---|---|---|---|
+        // | 1 | 30 A | 6 A | 6 A |
+        // | 2 | 6 A | 7.5 A | 7.5 A |
+        // | 3 | 7.5 A | 6 A | 6 A |
+        // | … | **来回追，每拍都写** | | |
+        //
+        // 电量接近上限时，驱动本来就会自己小幅调整
+        // `constant_charge_current` —— 模块跟着它跑，等于每 3 秒
+        // 触发一次协商重置。真机现象：`curr_limit` 在
+        // 6.00 / 7.50 / 12.30 A 之间跳，USB 电压 5/9/15/17 V 乱跳，
+        // 电池电流在 ±0.1 A 抖动。
+        //
+        // ⇒ 只在**还没学到**时记一次（写探的结果），之后固定不动。
+        if result.is_ok() && self.learned_curr_max.is_none() {
+            if let Some(c) = &self.nodes.curr {
+                if let Ok(v) = c.read_i64() {
+                    if let Ok(v32) = i32::try_from(v) {
+                        if v32 > 0 {
+                            log::info!(
+                                "[engine] 学到电流能力上限：{} A（写探 {} A，驱动钳位后）",
+                                f64::from(v32) / 1e6,
+                                f64::from(CURR_MAX_UA) / 1e6
+                            );
+                            self.learned_curr_max = Some(v32);
+                        }
+                    }
+                }
+            }
+        }
 
         if let Err(e) = result {
             self.write_failures = self.write_failures.saturating_add(1);
@@ -1440,6 +1661,20 @@ mod tests {
     ///
     /// ⚠️ 调用方必须已持有 [`E2E_LOCK`]（内部通过 [`with_fake_root`] 保证）。
     fn engine_on(fake: &FakeSysfs) -> Engine {
+        engine_on_with_curr(fake, None)
+    }
+
+    /// 构造引擎，可指定档案里的**电流能力上限**（μA）
+    ///
+    /// `None` = 用通用档案的默认值（`CURR_MAX_UA`）。
+    ///
+    /// # 为什么需要可调（2026-10-20）
+    ///
+    /// 真机（标准 `power_supply` 机型）上档案的 `current.max_ua` 只有
+    /// **6A**（`constant_charge_current` 的默认值），而驱动实际允许 12A+。
+    /// "只放宽不收紧"这条行为**只有在 `driven > 档案值` 时才看得出来** ——
+    /// 用默认的 30A 档案测不出来。
+    fn engine_on_with_curr(fake: &FakeSysfs, curr_max: Option<i32>) -> Engine {
         let nodes = Nodes::detect(None);
         let (table, _path) = GearTable::detect().expect("假档位表应当可解析");
 
@@ -1457,6 +1692,9 @@ mod tests {
         // 专门验证门禁本身的测试见 `端到端_未检测时零写入`。
         let mut p = crate::profile_io::generic_profile(Default::default());
         p.capabilities.detected = true;
+        if let Some(c) = curr_max {
+            p.capabilities.current.max_ua = c;
+        }
         let profile = thermo_ipc::device::EffectiveProfile {
             profile: p,
             source: thermo_ipc::device::ProfileSource::Generic,
@@ -1658,6 +1896,108 @@ mod tests {
                 curr, "15375000",
                 "44.0℃ 应取线性过渡的中点值（上限与目标的中间）"
             );
+        });
+    }
+
+    /// 🔴 **回归守卫**：温度正常时写**物理上限**，让驱动自己钳位
+    ///
+    /// # 真机证据（2026-10-20，K70 Pro + 第三方 PPS 头）
+    ///
+    /// | 写入电流 | 驱动实际接受 | USB 电压 | 电池功率 |
+    /// |---|---|---|---|
+    /// | 6 A（档案值） | 6 A | 8.4 V | **23.6 W** |
+    /// | 12 A | 12 A | 16.8 V | 31.3 W |
+    /// | 20 A | **15.95 A**（钳位） | 17.4 V | **50.3 W** |
+    ///
+    /// 档案里的 `curr_max`（6 A）是 `constant_charge_current` 的
+    /// **默认值**，不是能力上限。照着写会把功率钉死在 24W —— 而且
+    /// **电流给小了，充电头连电压都不肯上**（8.4 V vs 17.4 V）。
+    ///
+    /// ⇒ 温度正常时写 `CURR_MAX_UA`（30 A 物理上限），驱动会钳到
+    ///   真实能力，模块再读回记住（见 `Engine::learned_curr_max`）。
+    #[test]
+    fn 端到端_温度正常时写物理上限让驱动钳位() {
+        let fake = FakeSysfs::new("relax_only");
+
+        with_fake_root(&fake.root, || {
+            // 复现真机：档案里只有 6A（那只是个默认值）
+            let mut engine = engine_on_with_curr(&fake, Some(6_000_000));
+
+            let rep = engine.step(1000);
+            assert!(rep.sampled, "应采样成功");
+
+            let curr = fake.read("sys/class/xm_power/charger/charger_thermal/wired_chg_curr");
+            assert_eq!(
+                curr, "30000000",
+                "温度正常时应写物理上限让驱动钳位，而不是照抄档案里的 6A —— \
+                 否则功率会被钉死在 24W（真机实测 50W → 24W）"
+            );
+        });
+    }
+
+    /// 学到的上限会被记住，后续不再反复写物理上限
+    ///
+    /// 假节点树没有真实驱动，写入即生效，所以"驱动钳位后"读回就是 30A
+    /// —— 这正好用来验证"学到之后走学到的值"这条路径不再变。
+    #[test]
+    fn 端到端_学到上限后保持一致() {
+        let fake = FakeSysfs::new("learned");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on_with_curr(&fake, Some(6_000_000));
+
+            engine.step(1000);
+            let first = fake.read("sys/class/xm_power/charger/charger_thermal/wired_chg_curr");
+            assert_eq!(first, "30000000");
+
+            // 再跑几拍：不应被改回档案值
+            for i in 1..4 {
+                engine.step(1000 + i);
+            }
+            let later = fake.read("sys/class/xm_power/charger/charger_thermal/wired_chg_curr");
+            assert_eq!(later, "30000000", "学到的上限必须保持，不能退回 6A");
+        });
+    }
+
+    /// 🔴 **回归守卫**：已放开之后，值一致就**绝不重复写**
+    ///
+    /// # 真机踩坑（2026-10-20，K70 Pro）
+    ///
+    /// 上一版每拍都按"值不同就写"处理，而电量接近上限时驱动会**自己**
+    /// 小幅调整 `constant_charge_current`（实测 6.0 / 7.5 / 12.3 A 之间变）
+    /// —— 模块跟着追，就变成每 3 秒写一次，每次都触发充电协商重置。
+    ///
+    /// 真机现象：
+    ///
+    /// - `curr_limit` 在 6.00 / 7.50 / 12.30 A 之间跳
+    /// - USB 电压在 5 V / 9 V / 15 V / 17 V 之间跳
+    /// - 电池电流在 ±0.1 A 抖动（甚至倒流）
+    ///
+    /// ⇒ 放开一次之后就不再碰电流节点，让驱动自己管。
+    #[test]
+    fn 端到端_已放开后不再重复写() {
+        let fake = FakeSysfs::new("opened");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on_with_curr(&fake, Some(6_000_000));
+
+            // 模拟"已放开 + 已学到真机实测的 12.3A"
+            engine.learned_curr_max = Some(12_300_000);
+            engine.curr_opened = true;
+            fake.write(
+                "sys/class/xm_power/charger/charger_thermal/wired_chg_curr",
+                "12300000",
+            );
+
+            // 多跑几拍：任何一次重写都会触发协商重置
+            for i in 0..5 {
+                engine.step(1000 + i);
+                assert_eq!(
+                    fake.read("sys/class/xm_power/charger/charger_thermal/wired_chg_curr"),
+                    "12300000",
+                    "第 {i} 拍：已放开后不该再写电流节点"
+                );
+            }
         });
     }
 
@@ -2197,7 +2537,15 @@ mod tests {
     #[test]
     fn 端到端_附加功能与温控互不干扰() {
         let fake = FakeSysfs::new("addon");
-        fake.write("sys/class/power_supply/battery/status", "Discharging");
+        // ⚠️ 必须是**充电中**（2026-10-20 修正）
+        //
+        // 充电上限有一条设计纪律：**未充电时不巡检**（省电，见
+        // `AddonIo::is_plugged` 的文档）。原先这里写 `Discharging`
+        // 却期望 SOC 控制字被写入 —— 那个断言之所以一直能过，是因为
+        // `WatchedIo` 漏实现了 `is_plugged()`，落到 trait 默认值
+        // （永远 `true`）。补上实现后本测试立刻失败，正好暴露了
+        // "测试依赖 bug" 这件事。
+        fake.write("sys/class/power_supply/battery/status", "Charging");
         // 附加功能侧：初始生效值 80
         fake.write("sys/class/xm_power/charger/smart_charge/soc_limit", "80");
 

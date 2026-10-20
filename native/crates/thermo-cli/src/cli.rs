@@ -132,8 +132,44 @@ pub enum Command {
         action: Option<DeviceAction>,
     },
 
+    /// 【内部】PPS 金标广播（**由 worker 以子进程方式调用**，不要手工跑）
+    ///
+    /// # 为什么是独立子命令而不是 worker 里直接发
+    ///
+    /// 爆发序列是 5 条 `am broadcast`，合计 0.5~1 秒。而 worker 在充电中
+    /// 是 3 秒一拍 —— 同步执行会把温控采样推迟近一秒。
+    ///
+    /// ⇒ worker 用 `spawn_detached` 启动一个 `thermo pps burst` 子进程，
+    ///   自己立刻返回。子进程串行执行完整序列后退出。
+    ///
+    /// ⚠️ 手工调用**会真的发广播**（SystemUI 会播动画），
+    ///    调试时自己知道在做什么即可。
+    Pps {
+        /// 子动作
+        #[command(subcommand)]
+        action: PpsAction,
+    },
+
     /// 输出版本信息（JSON）
     Version,
+}
+
+/// PPS 相关的子命令
+#[derive(Debug, Subcommand)]
+pub enum PpsAction {
+    /// 执行一次金标广播爆发（子进程用）
+    ///
+    /// 依次发 5 条广播，节奏照抄真机结论（见 `thermo_addons::pps::forge`）。
+    /// 任何一条失败**都不会中断**后续 —— 动画是尽力而为的锦上添花。
+    Burst {
+        /// 要显示的功率（W）
+        #[arg(long, default_value_t = 100)]
+        power: u16,
+
+        /// 只打印将要执行的命令，不真的发（排障用）
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// 设备档案相关的子命令
@@ -1596,6 +1632,97 @@ pub fn run_device(action: Option<DeviceAction>) -> Result<()> {
         DeviceAction::Import { file, confirm } => device_import(&file, confirm),
         DeviceAction::Reset { confirm } => device_reset(confirm),
     }
+}
+
+// ============================================================
+//  PPS 金标广播（子进程入口）
+// ============================================================
+
+/// 执行 PPS 子命令
+pub fn run_pps(action: PpsAction) -> Result<()> {
+    match action {
+        PpsAction::Burst { power, dry_run } => pps_burst(power, dry_run),
+    }
+}
+
+/// 依次发出爆发序列里的每一条广播
+///
+/// # 设计要点
+///
+/// | 要点 | 原因 |
+/// |---|---|
+/// | 单条失败**不中断** | 动画是锦上添花，第 3 条失败不该导致后 2 条不发 |
+/// | 步间 `sleep` | 节奏来自真机结论，改了动画就出不来（见 `forge` 的文档） |
+/// | 退出码始终为 0 | 这是 worker 的子进程，非零退出会污染日志；失败只记 stderr |
+///
+/// # 为什么用 `am` 而不是直接 binder
+///
+/// `am broadcast` 是 shell 层就有的稳定接口，跨 Android 版本可用；
+/// 直接调 binder 需要绑定系统服务，风险与维护成本都高得多。
+fn pps_burst(power: u16, dry_run: bool) -> Result<()> {
+    let seq = thermo_addons::pps::forge::burst_sequence(power);
+
+    if dry_run {
+        println!("=== PPS 爆发序列（dry-run，不会真的发）===");
+        println!("功率显示: {power}W");
+        println!("共 {} 条：", seq.len());
+        for (i, (delay, cmd)) in seq.iter().enumerate() {
+            let args = cmd.args();
+            println!();
+            println!("  [{}/{}] 前置等待 {delay}ms", i + 1, seq.len());
+            println!("    am {}", args.join(" "));
+        }
+        return Ok(());
+    }
+
+    let mut failed = 0usize;
+    for (i, (delay, cmd)) in seq.iter().enumerate() {
+        if *delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(*delay));
+        }
+
+        let args = cmd.args();
+        match std::process::Command::new("am")
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                log::debug!("[pps] 广播 {}/{} 已发送", i + 1, seq.len());
+            }
+            Ok(out) => {
+                // ⚠️ 不中断：后续条数照发
+                failed += 1;
+                let err = String::from_utf8_lossy(&out.stderr);
+                log::warn!(
+                    "[pps] 广播 {}/{} 失败（{}）：{}",
+                    i + 1,
+                    seq.len(),
+                    out.status,
+                    err.trim()
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                log::warn!("[pps] 无法执行 am（{}/{}）：{e}", i + 1, seq.len());
+            }
+        }
+    }
+
+    if failed > 0 {
+        eprintln!(
+            "PPS 广播：{}/{} 条失败（动画可能不完整）",
+            failed,
+            seq.len()
+        );
+    } else {
+        log::info!("[pps] 广播全部发出（{} 条，{power}W）", seq.len());
+    }
+
+    // 始终成功退出：这是 worker 的子进程，失败细节已进日志
+    Ok(())
 }
 
 /// 显示生效档案

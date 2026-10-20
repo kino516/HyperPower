@@ -38,6 +38,15 @@ const STD_CTRL: &str = "/sys/class/power_supply/battery/charge_control_end_thres
 ///    它不为 `1` 时，写 [`STD_CTRL`] **表面成功、实际被吞**。
 const STD_EN: &str = "/sys/class/qcom-battery/charge_control_en";
 
+/// 系统显示电量（`capacity`）—— 用户看到的那个数
+const CAPACITY: &str = "/sys/class/power_supply/battery/capacity";
+
+/// 驱动内部真实电量（`rsoc`）—— `charge_control_end_threshold` 按它比较
+const RSOC: &str = "/sys/class/qcom-battery/fg1_rsoc";
+
+/// 系统电量覆盖节点（可写，用来把电池图标校正成驱动真实值）
+const FAKE_SOC: &str = "/sys/class/qcom-battery/fake_soc";
+
 #[derive(Debug, Default)]
 struct FakeIo {
     files: HashMap<String, String>,
@@ -112,6 +121,25 @@ impl FakeIo {
         self
     }
 
+    /// K70 Pro + **暴露 rsoc**（用于验证 SOC 口径校正）
+    ///
+    /// ⚠️ 刻意做成独立的工厂而不改 [`Self::k70pro`]：一改就会让所有
+    ///    既有测试的写入值跟着变，噪音太大。
+    fn k70pro_with_rsoc(capacity: u8, rsoc: u8) -> Self {
+        let mut io = Self::k70pro();
+        io.files.insert(CAPACITY.to_string(), capacity.to_string());
+        io.files.insert(RSOC.to_string(), rsoc.to_string());
+        io
+    }
+
+    /// K70 Pro + rsoc + **可写的 fake_soc**（验证电量显示校正）
+    fn k70pro_with_display(capacity: u8, rsoc: u8, fake_soc: &str) -> Self {
+        let mut io = Self::k70pro_with_rsoc(capacity, rsoc);
+        io.files.insert(FAKE_SOC.to_string(), fake_soc.to_string());
+        io.writable.push(FAKE_SOC.to_string());
+        io
+    }
+
     fn writes(&self) -> usize {
         self.write_log.len()
     }
@@ -153,6 +181,19 @@ impl AddonIo for FakeIo {
         //    ⇒ 返回 None ⇒ 静默 Ok 且不更新文件）—— 于是"写使能"看起来
         //    成功、实际没变，测试会测出假的"回读不符"。
         if path.ends_with("charge_control_en") {
+            self.files
+                .insert(path.to_string(), value.trim().to_string());
+            return Ok(());
+        }
+
+        // ── 系统电量覆盖节点：纯数字，直接保存 ──
+        //
+        // ⚠️ 不单独处理的话会掉进下面的 `parse_word`（它要求 `0x` 前缀）
+        //    ⇒ 返回 None ⇒ 静默 Ok 且**不更新文件** —— 于是"写成功"但
+        //    读回还是旧值，测试测出假的失败。
+        //
+        // 注意原值是负数（`-22` = 不覆盖），所以这里**不能用 u8 解析**。
+        if path.ends_with("fake_soc") {
             self.files
                 .insert(path.to_string(), value.trim().to_string());
             return Ok(());
@@ -344,6 +385,194 @@ fn release是空操作() {
 //  ②.5 省电：未充电时跳过巡检
 // ============================================================
 
+/// 🔴 **回归守卫**：未达设定电量时，写入值就是**用户设定的值**
+///
+/// # 背景（2026-10-20，K70 Pro）
+///
+/// 本机的 `charge_control_end_threshold` 按驱动内部的 `rsoc` 比较，
+/// 而系统电量显示的是 `capacity`，两者差 **6~20% 且不是常数**。
+///
+/// ⇒ 改成闭环：模块盯 `capacity`，到点才压低阈值（见下一个测试）。
+///   没到点时**原样写设定值**，不做任何折算。
+#[test]
+fn 未达设定时写入用户设定值() {
+    // 系统显示 60%，设定 83% ⇒ 还没到
+    let mut io = FakeIo::k70pro_with_rsoc(60, 58);
+
+    let mut addon = probed(enabled_config(83), &mut io);
+    addon.tick(&mut io, 0);
+
+    let wrote_vals: Vec<&str> = io
+        .write_log
+        .iter()
+        .filter(|(p, _)| p == STD_CTRL)
+        .map(|(_, v)| v.as_str())
+        .collect();
+
+    assert_eq!(
+        wrote_vals,
+        vec!["83"],
+        "没到设定值时写入用户设定值，不能按 capacity/rsoc 偏差折算"
+    );
+}
+
+/// 没有 `rsoc` / `fake_soc` 节点时，行为完全一样（本来就只用设定值）
+#[test]
+fn 没有容量节点时行为相同() {
+    let mut io = FakeIo::k70pro();
+
+    let mut addon = probed(enabled_config(83), &mut io);
+    addon.tick(&mut io, 0);
+
+    let wrote_vals: Vec<&str> = io
+        .write_log
+        .iter()
+        .filter(|(p, _)| p == STD_CTRL)
+        .map(|(_, v)| v.as_str())
+        .collect();
+
+    assert_eq!(wrote_vals, vec!["83"], "没有容量节点时也写设定值");
+}
+
+/// 🔴 **回归守卫**：`soc_active` 显示的是**用户设定值**
+///
+/// # 真机反馈（2026-10-20）
+///
+/// 「设定的充电上限与生效中的怎么不一样」
+///
+/// 之前两次不一致都是把**节点内部值**暴露成了"生效值"。
+/// 现在写入值恒等于设定值（`fake_soc` 已把两边校正到同一口径），
+/// 所以显示值与目标天然相等。
+#[test]
+fn 生效值显示用户设定的值() {
+    let mut io = FakeIo::k70pro_with_rsoc(99, 79);
+
+    let mut addon = probed(enabled_config(85), &mut io);
+    addon.tick(&mut io, 0);
+
+    // 直写：节点里就是 85
+    let node_val = io
+        .write_log
+        .iter()
+        .find(|(p, _)| p == STD_CTRL)
+        .map(|(_, v)| v.clone());
+    assert_eq!(
+        node_val.as_deref(),
+        Some("85"),
+        "节点里写的必须就是用户设定的 85"
+    );
+
+    let s = addon.status();
+    assert_eq!(
+        s.detail["soc_active"], 85,
+        "界面显示的生效值必须是用户设定的 85"
+    );
+    assert_eq!(s.detail["soc_target"], 85);
+    assert_eq!(s.detail["soc_in_effect"], true);
+}
+
+/// 关闭功能时不显示"生效中的上限"（诚实显示「—」）
+#[test]
+fn 关闭功能时不显示生效值() {
+    let mut io = FakeIo::k70pro_with_rsoc(80, 78);
+    let mut cfg = enabled_config(80);
+    cfg.enabled = false;
+
+    let mut addon = probed(cfg, &mut io);
+    addon.tick(&mut io, 0);
+
+    let s = addon.status();
+    assert_eq!(
+        s.detail["soc_active"],
+        serde_json::Value::Null,
+        "功能关着时没有生效值可言"
+    );
+    assert_eq!(s.detail["soc_in_effect"], false);
+}
+
+/// 🔴 **回归守卫**：把系统电量显示校正成驱动真实电量
+///
+/// # 用户要求（2026-10-20）
+///
+/// 「充电上限设置成 95，写入驱动 95，**系统显示 95**；
+///   系统显示不准，按驱动读取的电量调整」
+///
+/// 真机上 `capacity`（图标）虚高 6~20%，而 `fg1_rsoc` 才是驱动用的数。
+/// 所以每拍把 `fake_soc` 写成当前 `rsoc`，图标就与驱动同口径。
+#[test]
+fn 把系统显示校正成驱动真实电量() {
+    // 图标显示 95（虚高），驱动真实 82
+    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+
+    let mut addon = probed(enabled_config(90), &mut io);
+    addon.tick(&mut io, 0);
+
+    assert_eq!(
+        io.files.get(FAKE_SOC).map(String::as_str),
+        Some("82"),
+        "fake_soc 应写成驱动真实电量 82，让图标与驱动同口径"
+    );
+}
+
+/// 禁用功能时**必须恢复** `fake_soc` 原值
+///
+/// 不恢复的后果：电池图标会一直显示模块最后写入的假电量，
+/// 与实际严重脱节。
+#[test]
+fn 禁用时恢复系统电量显示() {
+    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+
+    // 先启用跑一拍（写入 fake_soc = 82）
+    let mut addon = probed(enabled_config(90), &mut io);
+    addon.tick(&mut io, 0);
+    assert_eq!(io.files.get(FAKE_SOC).map(String::as_str), Some("82"));
+
+    // 再禁用（配置改掉后重载）
+    let mut off = enabled_config(90);
+    off.enabled = false;
+    addon.set_config(off);
+    addon.tick(&mut io, 1);
+
+    assert_eq!(
+        io.files.get(FAKE_SOC).map(String::as_str),
+        Some("-22"),
+        "禁用后必须恢复原值 -22，否则图标会一直显示假电量"
+    );
+}
+
+/// `rsoc` 没变时不重复写 `fake_soc`（省掉无谓的 sysfs 写）
+#[test]
+fn rsoc未变时不重复写fake_soc() {
+    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+
+    let mut addon = probed(enabled_config(90), &mut io);
+    addon.tick(&mut io, 0);
+    let first = io.write_log.iter().filter(|(p, _)| p == FAKE_SOC).count();
+    assert_eq!(first, 1, "第一拍应写一次");
+
+    // 再跑三拍，rsoc 不变
+    for i in 1..4 {
+        addon.tick(&mut io, 100 + i);
+    }
+    let total = io.write_log.iter().filter(|(p, _)| p == FAKE_SOC).count();
+    assert_eq!(total, 1, "rsoc 没变就不该重复写，实得 {total} 次");
+}
+
+/// 没有 `fake_soc` 节点时不写任何东西（不影响既有行为）
+#[test]
+fn 没有fake_soc节点时不写() {
+    let mut io = FakeIo::k70pro_with_rsoc(95, 82);
+
+    let mut addon = probed(enabled_config(90), &mut io);
+    addon.tick(&mut io, 0);
+
+    assert_eq!(
+        io.write_log.iter().filter(|(p, _)| p == FAKE_SOC).count(),
+        0,
+        "没有该节点时不该尝试写"
+    );
+}
+
 #[test]
 fn 未充电时不巡检也不写() {
     // 制造"与目标不一致"的情形 —— 若它巡检就一定会写
@@ -363,6 +592,62 @@ fn 未充电时不巡检也不写() {
         io.files.get(READ).map(String::as_str),
         Some("90"),
         "现有值不得被改动"
+    );
+}
+
+/// 🔴 **回归守卫**：拔电时虽然不写，但**必须读出生效值**
+///
+/// # 这个 bug 真机踩过（2026-10-20，K70 Pro）
+///
+/// 原先拔电分支直接 `idle` 返回，`last_seen` 永远是 `None`：
+///
+/// | 字段 | 值 | 界面显示 |
+/// |---|---|---|
+/// | `soc_active` | `null` | 「—」 |
+/// | `soc_in_effect` | `false` | **「未生效」** |
+///
+/// 而节点里的值其实是对的（`threshold=60`、`en=1`）。用户看到
+/// 「未生效」就判定功能坏了 —— 那轮反馈的"充电上限无效"正是如此。
+#[test]
+fn 拔电时也要读出生效值供界面显示() {
+    let mut io = FakeIo::hyperos().unplugged();
+    // 节点里已经是用户设定的 80（与目标一致）
+    io.files.insert(READ.to_string(), "80".to_string());
+
+    let mut addon = probed(enabled_config(80), &mut io);
+    let outcome = addon.tick(&mut io, 0);
+
+    assert!(!outcome.wrote, "拔电时仍然不写");
+    assert_eq!(
+        addon.last_seen(),
+        Some(80),
+        "必须读出生效值，否则界面会一直显示「未生效」"
+    );
+
+    let s = addon.status();
+    assert_eq!(s.detail["soc_active"], 80, "soc_active 应反映真实值");
+    assert_eq!(
+        s.detail["soc_in_effect"], true,
+        "值正确时界面必须显示「已生效」"
+    );
+}
+
+/// 拔电且节点值与目标不一致 ⇒ 仍然不写（只是如实显示未生效）
+#[test]
+fn 拔电时值不一致也不写() {
+    let mut io = FakeIo::hyperos().unplugged();
+    io.files.insert(READ.to_string(), "90".to_string());
+
+    let mut addon = probed(enabled_config(80), &mut io);
+    let outcome = addon.tick(&mut io, 0);
+
+    assert!(!outcome.wrote, "拔电时不该写");
+    assert_eq!(io.writes(), 0);
+    assert_eq!(addon.last_seen(), Some(90), "读到 90 要如实报告");
+    assert_eq!(
+        addon.status().detail["soc_in_effect"],
+        false,
+        "不一致时显示未生效是对的"
     );
 }
 

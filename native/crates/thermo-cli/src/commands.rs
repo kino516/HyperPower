@@ -1426,6 +1426,7 @@ fn addon(ctx: &Ctx<'_>, args: &Value) -> Response {
 fn addon_enable_key(id: &str) -> Option<&'static str> {
     match id {
         "soc_limit" => Some("limit.enabled"),
+        "pps" => Some("pps.enabled"),
         _ => None,
     }
 }
@@ -2115,14 +2116,22 @@ mod tests {
     }
 
     #[test]
-    fn addon_list列出充电上限() {
+    fn addon_list列出全部附加功能() {
         let (ctx, _c, _p, _n, _a) = ctx_with(ConfigStore::with_defaults("x.json"));
         let (resp, _) = dispatch(&ctx, "addon", &json!(["list"]), false);
         match resp {
             Response::Ok { data: Some(d), .. } => {
-                assert_eq!(d["count"], 1);
-                assert_eq!(d["addons"][0]["id"], "soc_limit");
-                assert_eq!(d["addons"][0]["enabled"], false, "出厂默认关闭");
+                // ⚠️ 不按数组下标断言（顺序会随新增功能变化），按 id 查
+                let list = d["addons"].as_array().expect("应是数组");
+                assert_eq!(d["count"], list.len(), "count 必须与实际条数一致");
+
+                for id in ["soc_limit", "pps"] {
+                    let item = list
+                        .iter()
+                        .find(|a| a["id"] == id)
+                        .unwrap_or_else(|| panic!("列表里应有 {id}"));
+                    assert_eq!(item["enabled"], false, "{id} 出厂默认关闭");
+                }
             }
             _ => panic!("应返回列表"),
         }
