@@ -51,20 +51,11 @@ jobs:
       - name: Cross-compile (aarch64)
         working-directory: native
         env:
-          # CI 上的路径与本地不同，用环境变量让 config.toml 可被覆盖
-          THERMO_NDK: ${{ env.ANDROID_NDK_HOME }}
-        run: |
-          # 在 CI 上直接指定 linker（避免本机绝对路径）
-          mkdir -p .cargo
-          cat > .cargo/config-ci.toml <<'EOF'
-          [target.aarch64-linux-android]
-          linker = "aarch64-linux-android31-clang"
-          rustflags = [
-              "-C", "link-arg=-Wl,-z,max-page-size=16384",
-              "-C", "link-arg=-Wl,-z,relro,-z,now",
-          ]
-          EOF
-          cargo build --release --target aarch64-linux-android -p thermo-cli
+          # 仓库内的 .cargo/config.toml 记录的是本机 NDK 路径；
+          # CI 用 Cargo 环境变量覆盖 linker / rustflags（env 优先级高于 config）
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android31-clang
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,relro,-z,now"
+        run: cargo build --release --target aarch64-linux-android -p thermo-cli
 
       - name: Verify 16 KB alignment (release gate)
         run: |
