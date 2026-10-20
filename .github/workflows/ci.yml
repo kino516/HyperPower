@@ -66,11 +66,16 @@ jobs:
 
       - name: Verify 16 KB alignment (release gate)
         run: |
+          set -e
           BIN=native/target/aarch64-linux-android/release/thermo
+          file "$BIN"
           echo "=== LOAD segments ==="
-          readelf -l "$BIN" | grep LOAD
-          if readelf -l "$BIN" | grep LOAD | grep -qv '0x4000$'; then
+          # -W 强制宽格式，避免 llvm-readelf 把 Program Header 拆成多行
+          readelf -lW "$BIN" | grep LOAD || { echo "::error::no LOAD segments"; exit 1; }
+          BAD=$(readelf -lW "$BIN" | awk '/LOAD/{ if ($NF != "0x4000") print }')
+          if [ -n "$BAD" ]; then
             echo "::error::存在未按 16 KB 对齐的 LOAD 段，禁止发布"
+            echo "$BAD"
             exit 1
           fi
           echo "✓ 全部 LOAD 段对齐 0x4000"
