@@ -144,7 +144,7 @@ fn assert_no_apk(stage: &Path) -> Result<()> {
 /// 检查 ELF 的 LOAD 段是否按 16 KB 对齐
 fn check_alignment(bin: &Path) -> Result<()> {
     let out = std::process::Command::new("llvm-readelf")
-        .args(["-l", &bin.to_string_lossy()])
+        .args(["-lW", &bin.to_string_lossy()])
         .output();
 
     let out = match out {

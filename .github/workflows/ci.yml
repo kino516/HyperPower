@@ -128,7 +128,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: thermo-aarch64
-          path: module/src/bin
+          # 打包脚本（xtask pack）从这里读取二进制再复制进模块
+          path: native/target/aarch64-linux-android/release
 
       - name: Download webroot
         uses: actions/download-artifact@v4
