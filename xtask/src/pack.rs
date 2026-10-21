@@ -69,7 +69,7 @@ pub fn pack(release: bool) -> Result<()> {
 
     // ---------- 打 zip ----------
     println!("==> 打包 zip");
-    let zip_path = dist.join("thermo_charge.zip");
+    let zip_path = dist.join("HyperPower.zip");
     if zip_path.exists() {
         fs::remove_file(&zip_path)?;
     }

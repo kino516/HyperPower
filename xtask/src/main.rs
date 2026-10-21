@@ -688,7 +688,7 @@ fn test_args() -> Vec<&'static str> {
 /// adb push
 fn push(dest: &str) -> Result<()> {
     let root = repo_root()?;
-    let zip = root.join("dist").join("thermo_charge.zip");
+    let zip = root.join("dist").join("HyperPower.zip");
     if !zip.exists() {
         anyhow::bail!(
             "未找到模块 zip（请先运行 cargo xtask pack）: {}",
@@ -711,7 +711,7 @@ fn push(dest: &str) -> Result<()> {
 
 /// 经管理器安装
 fn install(via: Installer) -> Result<()> {
-    let modpath = "/data/local/tmp/thermo_charge.zip";
+    let modpath = "/data/local/tmp/HyperPower.zip";
     let cmd = match via {
         Installer::Ksud => format!("ksud module install {modpath}"),
         Installer::Apatch => format!("apd module install {modpath}"),
