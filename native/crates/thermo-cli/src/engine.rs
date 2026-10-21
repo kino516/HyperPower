@@ -29,6 +29,28 @@ use crate::sysfs::{GearTable, Nodes};
 /// 连续失败多少次后交回官方（fail-closed）
 pub const FAIL_LIMIT: u32 = 5;
 
+/// 档位回读是否算"写入生效"
+///
+/// # 判据是「**不松于目标**」，不是「等于目标」
+///
+/// 档位数字的含义：**越大越严**（`0` = 最松/最大电流，表尾 = 最紧）。
+///
+/// 官方 `MONITOR-BAT` 会在充电中**竞争写**同一节点（真机实测：
+/// 模块写 `0` 后读回 `3`/`7`/`11`/`14`，见 `docs/03` §2C.4）。
+/// 这种"比目标更严"的覆盖：
+///
+/// | 回读 | 语义 | 是否算我们的失败 |
+/// |---|---|---|
+/// | `≥` 目标 | 不比目标松（被官方压得更紧，或就是我们的值） | ❌ 不算 —— 更严对安全无害 |
+/// | `<` 目标 | 比目标松（该收紧的没紧上去） | ✅ 算 —— 这才是真没生效 |
+///
+/// 旧实现用 `==`，于是官方每次覆盖都记一次写失败；连续 5 拍就
+/// `release_now` 把**整场充电**交回官方（2026-10-21 真机事件
+/// `1792554354~1792554369`：充电开始 34 秒后温控自废）。
+fn gear_verified(read_back: i64, target: u8) -> bool {
+    read_back >= i64::from(target)
+}
+
 /// 采样结果
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampleOutcome {
@@ -852,7 +874,8 @@ impl Engine {
             //
             // 而重探的代价只有"插电后写一次电流节点"，可以忽略。
             self.learned_curr_max = None;
-            self.nodes.release_control(self.release_curr_ua())
+            self.nodes
+                .release_control(self.caps().gear.open, self.release_curr_ua())
         } else if decision.reason == Reason::HardProtect || decision.reason == Reason::VirtGuard {
             // 硬保护是**故意**收紧，标记必须清掉，否则后续放松时会被"已放开"挡住
             self.curr_opened = false;
@@ -892,7 +915,12 @@ impl Engine {
                 Ok(())
             } else {
                 // 首次放开：写一次物理上限，读回值由 ② 学下来
-                let r = self.nodes.release_control(CURR_MAX_UA);
+                //
+                // ⚠️ 档位也要一并放到本机最松档（`gear_open`），否则
+                //    官方压在 3 档时，电流放到 30A 也会被档位卡在 8A。
+                let r = self
+                    .nodes
+                    .release_control(self.caps().gear.open, CURR_MAX_UA);
                 if r.is_ok() {
                     self.curr_opened = true;
                 }
@@ -955,13 +983,13 @@ impl Engine {
         }
 
         // 回读校验（只校验档位：电流在未充电时读的是能力上限，不可作为判据）
-        let verified = self
-            .nodes
-            .ctrl
-            .as_ref()
-            .and_then(|n| n.read_i64().ok())
-            .map(|v| v == i64::from(decision.gear))
-            .unwrap_or(true);
+        //
+        // ⚠️ 判据见 [`gear_verified`]：**不松于目标**即通过。
+        //    官方 `MONITOR-BAT` 会把档位竞争写成更严的值（3/7/11/14），
+        //    用 `==` 会把这种常态覆盖误判成写入失败 ⇒ 连续 5 拍
+        //    `release_now` ⇒ 整场充电交回官方（真机事故）。
+        let read_back = self.nodes.ctrl.as_ref().and_then(|n| n.read_i64().ok());
+        let verified = read_back.is_none_or(|v| gear_verified(v, decision.gear));
 
         if verified {
             self.write_failures = 0;
@@ -970,14 +998,23 @@ impl Engine {
             //    事件流会被同一件事刷爆（实测空闲两分钟写上百条重复记录）。
         } else {
             self.write_failures = self.write_failures.saturating_add(1);
-            let msg = format!("写入后回读不符（期望档位 {}）", decision.gear);
+            // `verified == false` ⇒ `read_back` 必为 `Some`（`None` 走通过）
+            let actual = read_back.unwrap_or(-1);
+            let msg = format!(
+                "写入后档位比目标更松（期望 ≥{}，实得 {}）",
+                decision.gear, actual
+            );
             self.events.emit(
                 kind::WRITE_FAIL,
                 &msg,
-                json!({ "failures": self.write_failures, "gear": decision.gear }),
+                json!({
+                    "failures": self.write_failures,
+                    "gear": decision.gear,
+                    "read_back": actual,
+                }),
             );
             if self.write_failures >= FAIL_LIMIT && !self.released {
-                self.release_now("回读连续不符达阈值");
+                self.release_now("档位回读连续更松达阈值");
             }
         }
 
@@ -989,7 +1026,10 @@ impl Engine {
         if self.released {
             return;
         }
-        match self.nodes.release_control(self.release_curr_ua()) {
+        match self
+            .nodes
+            .release_control(self.caps().gear.open, self.release_curr_ua())
+        {
             Ok(()) => {
                 self.released = true;
                 self.state.reset();
@@ -2168,6 +2208,65 @@ mod tests {
                 "未收紧时档位应保持最松（0）"
             );
         });
+    }
+
+    /// 官方 `MONITOR-BAT` 会把档位**竞争写**成更严的值（真机实测：写 0 后读回 3/7/11/14）
+    ///
+    /// 这类"比目标更严"的覆盖**不是**模块的写入失败：
+    ///
+    /// | 回读值 | 语义 | 处理 |
+    /// |---|---|---|
+    /// | `≥` 目标 | 不比目标松（可能被官方压得更紧） | 接受（更严对安全无害） |
+    /// | `<` 目标 | 比目标松（该紧的没紧上去） | 才算失败 |
+    ///
+    /// 旧实现只要"不等于目标"就计一次写失败，于是官方把 0 覆盖成 3 后
+    /// 连续 5 拍误判 ⇒ `release_now` ⇒ **整个充电会话交回官方**（真机事故）。
+    #[test]
+    fn 官方把档位覆盖得更严时不算写入失败() {
+        let fake = FakeSysfs::new("gear_official_override");
+        let ctrl = "sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit";
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on(&fake);
+
+            // 第 1 拍：正常放行，模块写档位 0（最松）
+            let rep = engine.step(1000);
+            assert!(rep.wrote, "正常放行应当写节点");
+            assert_eq!(fake.read(ctrl), "0", "档位应被写成最松档 0");
+
+            // 模拟官方 `MONITOR-BAT` 在模块写完之后覆盖成更严的 3 档
+            fake.write(ctrl, "3");
+
+            // 之后连续 6 拍（超过 FAIL_LIMIT=5）：官方覆盖不该累计写失败
+            for i in 0..6 {
+                engine.step(1004 + i * 4);
+            }
+
+            assert_eq!(
+                engine.write_failures, 0,
+                "官方把档位压得更严不是写入失败，不该累计（实得 {}）",
+                engine.write_failures
+            );
+            assert!(
+                !engine.released,
+                "不得因官方竞争写档位而交回官方（那会让整个充电会话失去温控）"
+            );
+        });
+    }
+
+    /// 档位回读判据：**更严通过、更松失败**
+    ///
+    /// 单独锁死纯函数的两个方向，避免以后又改回 `==`。
+    #[test]
+    fn 档位回读判据_更严通过_更松失败() {
+        assert!(gear_verified(0, 0), "等于目标应通过");
+        assert!(gear_verified(3, 0), "官方把最松档 0 覆盖成 3（更严）应通过");
+        assert!(gear_verified(15, 3), "比目标更严应通过");
+        assert!(!gear_verified(2, 3), "比目标更松必须判失败");
+        assert!(
+            !gear_verified(0, 15),
+            "硬保护档位被放松（15 → 0）必须判失败"
+        );
     }
 
     // ────────────────────────────────────────────────────────────

@@ -926,7 +926,7 @@ fn restore(ctx: &Ctx<'_>, args: &Value) -> Response {
         } else {
             700_000
         };
-        match ctx.nodes.release_control(curr_max) {
+        match ctx.nodes.release_control(caps.gear.open, curr_max) {
             Ok(()) => ctx.data(json!({
                 "mode": "release",
                 "curr_ua": curr_max,

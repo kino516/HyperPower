@@ -935,5 +935,5 @@ pub fn write_safe_values(profile_source: ProfileSource) -> Result<()> {
         700_000
     };
     let _ = profile_source;
-    nodes.release_control(curr_max)
+    nodes.release_control(caps.gear.open, curr_max)
 }

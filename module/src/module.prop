@@ -1,6 +1,6 @@
 id=a_hyperpower
 name=澎湃充控 HyperPower
-version=1.0.0
-versionCode=1000
+version=1.0.1
+versionCode=1001
 author=乱世殇歌
 description=按电池温度闭环控制充电速度，并可设定充电上限。设备自适应，双写控制（档位+电流）。**四模式独立配置**（保守/官方/极速/自定义）、功率上限、**充电历史曲线**。**未跑检测前不做任何控制**。
