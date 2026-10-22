@@ -608,6 +608,45 @@ fn power_loop_relaxes_when_below_target() {
     assert!(cap <= caps.current.max_ua, "放松不得超出档案上界");
 }
 
+/// 停充后（实测功率≈0）功率闭环必须**保持上一拍值**，不得振荡
+///
+/// 真机事故（2026-10-22，K90 Pro Max）：到达充电上限 85% 后系统停充，
+/// 电池侧功率在 `0.02~0.9W` 之间抖动。旧实现把它当"无反馈"返回前馈，
+/// 下一拍读到 0.2~0.4W 又按比例放大 —— 电流上限在 **23.2A ↔ 29A**
+/// 之间形成极限环，每拍都写节点（debug 日志 20 分钟 950KB）。
+#[test]
+fn 停充低功率时功率闭环保持上一拍值() {
+    let caps = caps_100w();
+    let mut cfg = Config::default();
+    cfg.target_power_w = 100;
+
+    let mut st = State::default();
+    st.power_cap_ua = Some(12_000_000); // 上一拍停在 12A
+
+    let mut s = sample(30.0);
+    s.voltage_uv = 4_310_000;
+    s.soc = 85;
+
+    // 0.086W：旧实现会回到前馈（100/4.31≈23.2A，再被档案钳到 18.4A）
+    s.current_ua = 20_000;
+    let d = decide_with(&s, &cfg, &st, &caps).unwrap();
+    assert_eq!(
+        d.power_cap_ua,
+        Some(12_000_000),
+        "功率≈0 时应保持上一拍值，不得重置为前馈"
+    );
+
+    // 下一拍噪声 0.43W：同样不得按 ratio 放大
+    st.power_cap_ua = Some(12_000_000);
+    s.current_ua = 100_000;
+    let d = decide_with(&s, &cfg, &st, &caps).unwrap();
+    assert_eq!(
+        d.power_cap_ua,
+        Some(12_000_000),
+        "0.43W 噪声不得触发闭环放大"
+    );
+}
+
 /// 死区：误差在 ±5% 内不动
 #[test]
 fn power_loop_has_deadband() {

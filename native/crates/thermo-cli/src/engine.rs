@@ -208,6 +208,11 @@ pub struct Engine {
     ///
     /// 休眠被唤醒（uevent / 客户端）后会跑一次全拍，届时就刷新了。
     pub last_charging: bool,
+    /// 本拍是否因**充电上限已达标**而挂起了主控制环
+    ///
+    /// 只用于调试日志（`trace` 的 `soc_hold` 列）。判据见
+    /// [`Engine::soc_limit_holds`]。
+    pub soc_hold_active: bool,
 }
 
 impl std::fmt::Debug for Engine {
@@ -295,6 +300,7 @@ impl Engine {
             // 立刻由拍到的一次采样纠正。**刻意不用"启动即跑一拍"**：
             // worker 的启动路径已经显式跑过首拍了。
             last_charging: false,
+            soc_hold_active: false,
         }
     }
 
@@ -332,6 +338,68 @@ impl Engine {
         } else {
             700_000
         }
+    }
+
+    /// 充电上限是否已经把充电**停住**了（⇒ 主控制环应当挂起）
+    ///
+    /// # 为什么需要它（2026-10-22 真机事故）
+    ///
+    /// 到达设定 SOC（例：85%）后，系统已经把充电停掉
+    /// （`dumpsys battery` 的 `Max charging current = 0`，
+    /// 电池侧功率 `0.02~0.4W`）。此时若仍照常跑主控制环：
+    ///
+    /// | 现象 | 后果 |
+    /// |---|---|
+    /// | 功率闭环把 0.3W 噪声当成"远低于目标 100W" | 电流上限被按 1.25 倍逐拍放大 |
+    /// | 与"无反馈回退前馈"交替 | **23.2A ↔ 29A 极限环**（详见 `power_cap_curr`） |
+    /// | 每 3 秒一次无效写 | debug 日志 20 分钟涨到 950KB；可能扰动 `smart_chg` 状态机 |
+    ///
+    /// ⇒ 达到上限且确实停充时应**不写**，直到 SOC 回落到目标以下。
+    ///
+    /// # 判据（必须全部满足）
+    ///
+    /// | 条件 | 理由 |
+    /// |---|---|
+    /// | 插槽存在、已启用、本机支持、未熔断 | 未启用 / 熔断时不能信任它的状态 |
+    /// | `soc_in_effect == true` | 目标已写入且被**回读**确认（不是自说自话） |
+    /// | `sample.soc >= soc_target` | 实际电量已达设定上限 |
+    /// | `power_w < ` [`SOC_HOLD_POWER_W`] | **安全阀**：证明确实已经不在充电 |
+    ///
+    /// # 为什么最后一条必须有
+    ///
+    /// `soc_in_effect` 依赖 `soc_limit` 节点的回读。万一把节点漂移误判成
+    /// "已生效"，而系统其实还在大功率充电 —— 没有这条就会把主控制环
+    /// 整个挂起，温度保护也随之失效。用"实测功率极低"兜底：
+    /// **只要还在充，就不挂起**。
+    ///
+    /// ⚠️ 只在"已停充"时挂起，因此不存在"用户想充却充不进"的副作用：
+    ///    功率恢复（例如拔插后重新开始充电）时判据自动失效，主环立刻恢复。
+    fn soc_limit_holds(&self, sample: &Sample) -> bool {
+        /// 低于此功率（W）才认为"真的没在充电"
+        ///
+        /// 真机停充后是 `0.02~0.9W`，而充电中最低也有 10W 以上，
+        /// 取 2W 留足余量。
+        const SOC_HOLD_POWER_W: f32 = 2.0;
+
+        let Some(slot) = self.addons.slot("soc_limit") else {
+            return false;
+        };
+        if slot.is_tripped() {
+            return false;
+        }
+        let status = slot.status();
+        if !status.enabled || !status.supported {
+            return false;
+        }
+        let d = &status.detail;
+        let Some(target) = d.get("soc_target").and_then(Value::as_u64) else {
+            return false;
+        };
+        let in_effect = d
+            .get("soc_in_effect")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        in_effect && u64::from(sample.soc) >= target && sample.power_w() < SOC_HOLD_POWER_W
     }
 
     /// 跑一拍
@@ -453,7 +521,7 @@ impl Engine {
         let caps = self.caps();
 
         let prev_phase = self.state.phase;
-        let decision = match thermo_core::decide_with(&sample, &cfg, &self.state, &caps) {
+        let mut decision = match thermo_core::decide_with(&sample, &cfg, &self.state, &caps) {
             Ok(d) => d,
             Err(e) => {
                 rep.errors.push(e.to_string());
@@ -467,6 +535,21 @@ impl Engine {
         rep.reason = Some(decision.reason);
 
         // ④ 写入
+        //
+        // 🔴 充电上限已达标 ⇒ **主控制环挂起**（2026-10-22 真机修复）
+        //
+        // 达到设定 SOC 后系统已经把充电停掉，继续写电流节点没有意义，
+        // 而且会因"功率极低"触发闭环放大 → `23.2A ↔ 29A` 极限环，
+        // 每 3 秒一次无效写。判据与安全阀见 [`Self::soc_limit_holds`]。
+        //
+        // ⚠️ 只拦"正常控制"路径；`release`（交回官方 / 未充电 / 官方模式）
+        //    必须照常执行 —— 那是安全出口，不是控制动作。
+        let soc_hold = decision.should_write && !decision.release && self.soc_limit_holds(&sample);
+        if soc_hold {
+            decision.should_write = false;
+        }
+        self.soc_hold_active = soc_hold;
+
         if decision.should_write && !self.released {
             let (wrote, verified, err) = self.apply(&sample, &decision);
             rep.wrote = wrote;
@@ -638,6 +721,12 @@ impl Engine {
                 // 只在调试模式开启时读（一次 sysfs read）。
                 "gear_actual": self.nodes.ctrl.as_ref().and_then(|n| n.read_i64().ok()),
                 "should_write": decision.should_write,
+                // 充电上限达标导致主环挂起（2026-10-22 新增）
+                //
+                // 与 `reason` 配合看：本列为 true 时，`should_write` 被强制
+                // 改成 false，`reason` 仍是决策层原本给出的值（通常
+                // `PowerLimit`）—— 没有这一列就分不清"算错了"还是"主动挂起"。
+                "soc_hold": self.soc_hold_active,
                 "release": decision.release,
                 "peak_c": self.state.peak_c,
                 // ── 外部环境（2026-10-17 新增）──
@@ -2956,6 +3045,149 @@ mod tests {
                 fake.read("sys/class/xm_power/charger/smart_charge/soc_limit"),
                 "80",
                 "决策 B：功能关闭时对该节点**零写入**"
+            );
+        });
+    }
+
+    // ────────────────────────────────────────────────────────────
+    //  充电上限达标后主控制环挂起（2026-10-22 真机修复）
+    //
+    //  真机现象：85% 上限生效后系统已停充（电池 0.02~0.4W），模块仍每
+    //  3 秒写一次 wired_chg_curr，值在 23.2A ↔ 29A 之间跳（闭环极限环）。
+    //  写是无效的（驱动钳回 18.4A），但 debug 日志 20 分钟涨到 950KB。
+    // ────────────────────────────────────────────────────────────
+
+    const CURR_NODE: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+    const CURR2_NODE: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr2";
+
+    /// 让假节点树处于"已到上限 + 系统停充 + 上限已生效"的状态
+    fn fake_soc_reached(fake: &FakeSysfs, soc: u8, current_ua: &str) {
+        fake.write("sys/class/power_supply/battery/capacity", &soc.to_string());
+        fake.write("sys/class/power_supply/battery/status", "Charging");
+        fake.write("sys/class/power_supply/battery/current_now", current_ua);
+        // 生效值节点回读 == 目标 ⇒ `soc_in_effect = true`
+        fake.write(
+            "sys/class/xm_power/charger/smart_charge/soc_limit",
+            &soc.to_string(),
+        );
+    }
+
+    #[test]
+    fn 端到端_充电上限达标停充后主环不再写电流节点() {
+        let fake = FakeSysfs::new("soc_hold");
+        // 85% + 0.086W：真机停充后的功率抖动区间
+        fake_soc_reached(&fake, 85, "20000");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on(&fake);
+            engine.cfg.set("limit.enabled", "true").unwrap();
+            engine.cfg.set("limit.soc", "85").unwrap();
+            engine.cfg.set("control.target_power_w", "100").unwrap();
+            // 跳过写探：直接给到真机学到的能力上限（30A）
+            engine.learned_curr_max = Some(30_000_000);
+            crate::addon_host::reload_config(&mut engine.addons, &engine.cfg);
+            engine.addons.probe_all(&mut engine.addon_io);
+
+            // 第一拍：附加功能在 ⑤ 才 tick，本拍决策时还读不到生效值
+            // ⇒ 允许写一次（这是"延迟一拍"的已知边界，不是缺陷）
+            engine.step(1000);
+
+            // 复位到官方值，观察"已生效"之后是否还会被改写
+            fake.write(CURR_NODE, "18400000");
+            fake.write(CURR2_NODE, "18400000");
+
+            for i in 0..4 {
+                let rep = engine.step(1001 + i);
+                assert!(
+                    !rep.wrote,
+                    "已达上限且停充时不得写节点（第 {i} 拍，reason={:?}）",
+                    rep.reason
+                );
+            }
+
+            assert_eq!(
+                fake.read(CURR_NODE),
+                "18400000",
+                "停充后电流节点应保持官方值，不得被闭环空写"
+            );
+            assert_eq!(
+                fake.read(CURR2_NODE),
+                "18400000",
+                "curr2 同样不得被空写（否则双写通道仍在振荡）"
+            );
+            assert!(engine.soc_hold_active, "本拍应报告处于挂起状态");
+        });
+    }
+
+    #[test]
+    fn 端到端_未达充电上限时主环照常写() {
+        let fake = FakeSysfs::new("soc_no_hold");
+        // 60% 未到 85%，即使功率暂低也必须照常控制
+        fake_soc_reached(&fake, 60, "20000");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on(&fake);
+            engine.cfg.set("limit.enabled", "true").unwrap();
+            engine.cfg.set("limit.soc", "85").unwrap();
+            engine.cfg.set("control.target_power_w", "100").unwrap();
+            engine.learned_curr_max = Some(30_000_000);
+            crate::addon_host::reload_config(&mut engine.addons, &engine.cfg);
+            engine.addons.probe_all(&mut engine.addon_io);
+
+            engine.step(1000);
+            fake.write(CURR_NODE, "18400000");
+            fake.write(CURR2_NODE, "18400000");
+
+            let rep = engine.step(1001);
+            assert!(rep.wrote, "SOC 未达上限时主环必须照常控制");
+            assert!(!engine.soc_hold_active, "未达上限不得挂起");
+            assert_eq!(
+                fake.read(CURR_NODE),
+                "25000000",
+                "100W ÷ 4.0V = 25A，应照常写入功率换算后的电流"
+            );
+        });
+    }
+
+    /// 挂起必须是**可逆**的：SOC 回落到上限以下、重新开始充电时自动接管
+    ///
+    /// 用户明确要求（2026-10-22）：「达到上限后停止控制，但回落后要自动恢复」。
+    /// 若这条不成立，充电上限就变成"一次充电只能控制前半程"。
+    #[test]
+    fn 端到端_充电上限回落后主环自动恢复控制() {
+        let fake = FakeSysfs::new("soc_hold_resume");
+        fake_soc_reached(&fake, 85, "20000");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on(&fake);
+            engine.cfg.set("limit.enabled", "true").unwrap();
+            engine.cfg.set("limit.soc", "85").unwrap();
+            engine.cfg.set("control.target_power_w", "100").unwrap();
+            engine.learned_curr_max = Some(30_000_000);
+            crate::addon_host::reload_config(&mut engine.addons, &engine.cfg);
+            engine.addons.probe_all(&mut engine.addon_io);
+
+            // 让附加功能读到生效值，并确认已挂起
+            engine.step(1000);
+            fake.write(CURR_NODE, "18400000");
+            fake.write(CURR2_NODE, "18400000");
+            let held = engine.step(1001);
+            assert!(!held.wrote, "到上限且停充时应挂起");
+            assert!(engine.soc_hold_active);
+
+            // 模拟 SOC 回落到 84% 且重新开始充电（功率 6W）
+            fake.write("sys/class/power_supply/battery/capacity", "84");
+            fake.write("sys/class/power_supply/battery/current_now", "1500000");
+
+            let resumed = engine.step(1002);
+            assert!(resumed.wrote, "SOC 回落到上限以下必须自动恢复控制");
+            assert!(!engine.soc_hold_active, "恢复后不得再报挂起");
+            // 具体值不锁死：恢复后功率 6W 远低于目标 100W，闭环按设计
+            // 放大到能力上限（驱动再钳位）。这里只验证"节点被重新接管"。
+            assert_ne!(
+                fake.read(CURR_NODE),
+                "18400000",
+                "恢复后电流节点应被重新写入，而不是保持挂起时的官方值"
             );
         });
     }
