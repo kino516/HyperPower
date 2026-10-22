@@ -12,6 +12,7 @@
 |---|---|
 | tag | `v<ver>` |
 | Release 标题 | `v<ver> · 澎湃充控 HyperPower` |
+| **Release 资源名** | **`HyperPower-v<ver>.zip`** |
 | `dist/release-notes-<ver>.md` 首行 | `v<ver> · 澎湃充控 HyperPower` |
 | commit message 首行 | `release: v<ver>（摘要）` |
 
@@ -34,7 +35,7 @@ cd ..
 cargo xtask webui      # 必须先于 pack（R14）
 cargo xtask pack
 
-unzip -l dist/HyperPower.zip
+unzip -l dist/HyperPower-v$VER.zip
 # 必须含：module.prop / bin/thermo / defaults/ / profiles/ / webroot/index.html / checksum.sha256
 # 必须不含：*.apk
 ```
@@ -44,13 +45,13 @@ unzip -l dist/HyperPower.zip
 ```bash
 git tag "v$VER"
 git push origin main "v$VER"
-gh release create "v$VER" dist/HyperPower.zip \
+gh release create "v$VER" dist/HyperPower-v$VER.zip \
   --title "v$VER · 澎湃充控 HyperPower" \
   --notes-file "dist/release-notes-$VER.md"
 ```
 
 ## 发布后
 
-- 从 Release 下载 `HyperPower.zip`，核对 SHA-256 与本地 `dist/HyperPower.zip` 一致；
+- 从 Release 下载 `HyperPower-v$VER.zip`，核对 SHA-256 与本地 `dist/HyperPower-v$VER.zip` 一致；
 - 核对包内 `module.prop` 的 `version` / `versionCode` 与 tag 一致；
 - 真机安装后**重启**，跑 `thermo verify`。

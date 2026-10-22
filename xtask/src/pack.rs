@@ -68,8 +68,13 @@ pub fn pack(release: bool) -> Result<()> {
     println!("    {count} 项");
 
     // ---------- 打 zip ----------
+    //
+    // 🔴 产物名必须带版本号（用户要求 2026-10-22）：
+    //    Release「资源」里同时存在多个版本时，只叫 `HyperPower.zip` 无法区分。
+    //    版本号取自 `module/src/module.prop`（唯一真源），不在这里另存一份。
     println!("==> 打包 zip");
-    let zip_path = dist.join("HyperPower.zip");
+    let ver = module_version(&src)?;
+    let zip_path = dist.join(format!("HyperPower-v{ver}.zip"));
     if zip_path.exists() {
         fs::remove_file(&zip_path)?;
     }
@@ -82,6 +87,21 @@ pub fn pack(release: bool) -> Result<()> {
     println!("  大小: {:.1} KB", size as f64 / 1024.0);
 
     Ok(())
+}
+
+/// 从 `module/src/module.prop` 读取模块版本号
+///
+/// 打包产物名（`HyperPower-v<ver>.zip`）与安装脚本都依赖它。
+/// 读不到或为空时**直接失败**，不用猜的版本号（R17 不猜）。
+pub(crate) fn module_version(src: &Path) -> Result<String> {
+    let prop = fs::read_to_string(src.join("module.prop")).context("读不到 module.prop")?;
+    let ver = prop
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("version="))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .context("module.prop 缺少 version= 或值为空")?;
+    Ok(ver.to_string())
 }
 
 fn repo_root() -> Result<PathBuf> {

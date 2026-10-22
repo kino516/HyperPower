@@ -166,7 +166,10 @@ jobs:
       - name: Verify zip contents
         run: |
           set -e
-          ZIP=dist/HyperPower.zip
+          # 产物名带版本号：HyperPower-v<ver>.zip（见 cargo xtask pack）
+          ZIP=$(ls dist/HyperPower-v*.zip | head -n 1)
+          [ -n "$ZIP" ] || { echo "::error::未找到版本化 zip（dist/HyperPower-v*.zip）"; exit 1; }
+          echo "使用 $ZIP"
           echo "=== zip 内容 ==="
           unzip -l "$ZIP"
 
@@ -188,5 +191,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hyperpower-module
-          path: dist/HyperPower.zip
+          path: dist/HyperPower-v*.zip
           if-no-files-found: error

@@ -23,7 +23,10 @@ set -e
 # ⚠️ 数据目录（`/data/adb/hyperpower`）**与模块 id 无关**，本脚本不碰它，
 #    因此改 id 或重装模块都不会丢配置/档案/历史。
 MOD=/data/adb/modules/a_hyperpower
-ZIP=/data/local/tmp/HyperPower.zip
+# 产物名带版本号（`cargo xtask pack` 生成 `HyperPower-v<ver>.zip`）
+# 兼容旧的无版本名；找不到时保持旧路径让报错信息更直观
+ZIP=$(ls /data/local/tmp/HyperPower-v*.zip 2>/dev/null | tail -n 1 || true)
+[ -n "$ZIP" ] || ZIP=/data/local/tmp/HyperPower.zip
 STAGE=/data/local/tmp/thermo_stage
 
 # 曾经用过的模块 id（改 id 后需清理旧目录，见 ①B）

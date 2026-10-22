@@ -14,4 +14,4 @@ compatibility:
   architectures: [arm64-v8a]
 
 release:
-  assetPattern: "HyperPower*.zip"
+  assetPattern: "HyperPower-v*.zip"

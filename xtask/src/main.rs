@@ -688,7 +688,9 @@ fn test_args() -> Vec<&'static str> {
 /// adb push
 fn push(dest: &str) -> Result<()> {
     let root = repo_root()?;
-    let zip = root.join("dist").join("HyperPower.zip");
+    // 产物名带版本号（与 `cargo xtask pack` 一致）
+    let ver = crate::pack::module_version(&root.join("module").join("src"))?;
+    let zip = root.join("dist").join(format!("HyperPower-v{ver}.zip"));
     if !zip.exists() {
         anyhow::bail!(
             "未找到模块 zip（请先运行 cargo xtask pack）: {}",
@@ -711,7 +713,10 @@ fn push(dest: &str) -> Result<()> {
 
 /// 经管理器安装
 fn install(via: Installer) -> Result<()> {
-    let modpath = "/data/local/tmp/HyperPower.zip";
+    let root = repo_root()?;
+    // 与 push 的目标名保持一致（产物名带版本号）
+    let ver = crate::pack::module_version(&root.join("module").join("src"))?;
+    let modpath = format!("/data/local/tmp/HyperPower-v{ver}.zip");
     let cmd = match via {
         Installer::Ksud => format!("ksud module install {modpath}"),
         Installer::Apatch => format!("apd module install {modpath}"),
