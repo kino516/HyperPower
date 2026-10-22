@@ -198,7 +198,7 @@ pub struct ClearableRecord {
 pub fn clearable_records() -> Vec<ClearableRecord> {
     vec![
         ClearableRecord {
-            path: data_dir().join("thermo-report.txt"),
+            path: data_dir().join("HyperPower-report.txt"),
             label: "诊断报告",
         },
         // 调试模式下产生的数据

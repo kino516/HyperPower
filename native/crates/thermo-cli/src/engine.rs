@@ -183,6 +183,13 @@ pub struct Engine {
     /// ⇒ 一旦确认"不需要限制"，就写一次放开值并把本标记置位，
     ///   之后**不再碰电流节点** —— 驱动想怎么调由它去。
     ///   需要重新限制时（收紧 / 用户设了更低的功率上限）清掉标记。
+    ///
+    /// ⚠️ 只对**电流节点**成立 —— **档位仍须每拍校正**：
+    ///    档位不是驱动自适应量，而是官方 `MONITOR-BAT` 会竞争写的节点
+    ///    （40.5℃ → 14，`docs/03` §2C.2）。档位 14/15 会把电荷泵从
+    ///    4:1 切成 2:1（功率 44W → 1.9W），漏掉校正的后果是
+    ///    「温度没到阈值却只剩十几瓦」（2026-10-22 真机报告）。
+    ///    见 `apply()` 的 `curr_opened` 分支与 `Nodes::ensure_gear`。
     pub curr_opened: bool,
     /// **上一次采样时的充电状态**（缓存）
     ///
@@ -574,6 +581,7 @@ impl Engine {
     /// | `pcap_ua` | 功率上限单独算出的电流上限 |
     /// | `final_ua` | 与实际写入值一致（两者取严 + 钳位之后） |
     /// | `gear` | 档位（虽不参与收紧，但要能看到它是否被改） |
+    /// | `gear_actual` | 档位节点的**真实读值** —— 官方竞争写会与 `gear` 不一致（2026-10-22 新增） |
     /// | `should_write` / `release` | 本拍到底有没有动作 |
     /// | `peak_c` | 收紧期的峰值温度 |
     ///
@@ -621,6 +629,14 @@ impl Engine {
                 "pcap_ua": decision.power_cap_ua,
                 "final_ua": decision.curr_ua,
                 "gear": decision.gear,
+                // 🔴 节点**真实档位**（2026-10-22 新增）
+                //
+                // `gear` 是决策意图；官方 `MONITOR-BAT` 会竞争写同一节点，
+                // 两者可能不一致。没有这一列就无法判断"模块以为放开了、
+                // 实际却被官方压在 14 档"—— 2026-10-22 的「41℃ 只有十几瓦」
+                // 报告就缺这个关键证据（报告里 `gear_now` 只是意图值）。
+                // 只在调试模式开启时读（一次 sysfs read）。
+                "gear_actual": self.nodes.ctrl.as_ref().and_then(|n| n.read_i64().ok()),
                 "should_write": decision.should_write,
                 "release": decision.release,
                 "peak_c": self.state.peak_c,
@@ -911,8 +927,34 @@ impl Engine {
                 self.curr_opened = false;
                 self.nodes.apply_dual(decision.gear, decision.curr_ua, prev)
             } else if self.curr_opened {
-                // 已放开：**完全不碰电流节点**，让驱动自己管
-                Ok(())
+                // 电流已放开：**不碰电流节点**（避免每 3 秒协商重置，见字段文档），
+                // 但档位必须每拍压制官方竞争写。
+                //
+                // 🔴 2026-10-22 真机报告：极速模式、41℃、亮屏只有十几瓦。
+                //    官方 `MONITOR-BAT` 在 40.5℃ 把档位竞争写成 14
+                //    （`docs/03` §2C.2），而档位 14/15 会把电荷泵从 4:1
+                //    切到 2:1（功率 44W → 1.9W，§2A.3）。旧实现这里直接
+                //    `Ok(())`，等于把档位也一起撒手 ⇒ 官方收紧后没人纠正。
+                match self.nodes.ensure_gear(decision.gear) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // ⚠️ 档位压制失败**不**递增 `write_failures`：
+                        //
+                        //    官方 `MONITOR-BAT` 会竞争写同一节点，偶发 EBUSY
+                        //    属常态。若按 R5「连续 5 次失败 ⇒ 交回官方」处理，
+                        //    就会重演 D-035 那类「整场充电被交回官方」的事故 ——
+                        //    而电流通道此刻仍在正常控制，档位压制只是辅助。
+                        //
+                        //    ⇒ 记一条事件留痕，下一拍照常重试。
+                        let msg = format!("压制官方档位失败：{e:#}");
+                        self.events.emit(
+                            kind::WRITE_FAIL,
+                            &msg,
+                            json!({ "gear": decision.gear, "fatal": false }),
+                        );
+                        return (false, true, Some(msg));
+                    }
+                }
             } else {
                 // 首次放开：写一次物理上限，读回值由 ② 学下来
                 //
@@ -2038,6 +2080,58 @@ mod tests {
                     "第 {i} 拍：已放开后不该再写电流节点"
                 );
             }
+        });
+    }
+
+    /// 🔴 **回归守卫**：电流已放开后，官方收紧的**档位**仍必须每拍压制
+    ///
+    /// # 真机报告（2026-10-22）
+    ///
+    /// 用户：极速模式、电池 **41℃**、亮屏充电功率**只有十几瓦**。
+    ///
+    /// 链路（全部有实测依据）：
+    ///
+    /// | 步骤 | 事实 | 依据 |
+    /// |---|---|---|
+    /// | ① | 极速模式 `target_power_w = 70`，低功率时闭环把电流放宽到上限 ⇒ `need_limit = false` ⇒ `curr_opened = true` | `apply()` 的放开分支 |
+    /// | ② | 旧实现该分支直接 `Ok(())` —— **电流与档位一起撒手** | 本提交前 |
+    /// | ③ | 官方 `MONITOR-BAT` 在 **40.5℃** 竞争写档位 **14** | `docs/03` §2C.2 |
+    /// | ④ | 档位 14/15 把电荷泵 4:1 切成 2:1，功率 **44W → 1.9W** | `docs/03` §2A.3 |
+    /// | ⑤ | 模块不再纠正 ⇒ 快充被官方切断，只剩十几瓦 | ①+②+③+④ |
+    ///
+    /// ⇒ 修复后：电流仍不碰（避免每 3 秒协商重置），但档位每拍检查，
+    ///   被官方写严就写回本机最松档。
+    #[test]
+    fn 端到端_已放开后仍压制官方收紧的档位() {
+        const CTRL: &str = "sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit";
+        const CURR: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+
+        let fake = FakeSysfs::new("gear_suppress");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on_with_curr(&fake, Some(12_300_000));
+
+            // 模拟"电流已放开 + 已学到 12.3A"
+            engine.learned_curr_max = Some(12_300_000);
+            engine.curr_opened = true;
+            fake.write(CURR, "12300000");
+
+            // 温度 30℃（默认配置收紧线 43℃）⇒ 本拍应为 Normal 放行
+            // 官方 MONITOR-BAT 在 40.5℃ 已把档位竞争写成 14
+            fake.write(CTRL, "14");
+
+            engine.step(1000);
+
+            assert_eq!(
+                fake.read(CTRL),
+                "0",
+                "官方收紧的档位必须被写回本机最松档（gear_open=0）"
+            );
+            assert_eq!(
+                fake.read(CURR),
+                "12300000",
+                "电流已放开时仍不应碰电流节点（避免触发协商重置）"
+            );
         });
     }
 

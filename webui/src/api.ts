@@ -361,7 +361,7 @@ export async function exportDiagnosticLog(): Promise<string> {
    * |---|---|
    * | 稳定 | 数据目录是本模块自己的地盘，权限与 SELinux 都是确定的 |
    * | 可回退 | 万一复制失败（存储未挂载、权限异常），数据目录那份还在，至少能用 `adb` 取 |
-   * | 诊断一致 | 维护者按固定路径 `thermo-report.txt` 也能找到 |
+   * | 诊断一致 | 维护者按固定路径 `HyperPower-report.txt` 也能找到 |
    *
    * # 为什么要复制到下载目录（用户要求，2026-10-14）
    *
@@ -375,11 +375,11 @@ export async function exportDiagnosticLog(): Promise<string> {
    *
    * # 文件名带时间戳
    *
-   * `thermo-report-20261014-1500.txt` —— 用户可能隔一段时间再导一次
+   * `HyperPower-report-20261014-1500.txt` —— 用户可能隔一段时间再导一次
    * （对比问题发生的不同时刻），带时间戳才不会互相覆盖。
    * 时间戳也让维护者一眼知道**报告对应哪个时刻**。
    */
-  const report = `${DATA}/thermo-report.txt`;
+  const report = `${DATA}/HyperPower-report.txt`;
 
   // 用 `{}` 包住一段 shell 脚本，一次执行写完整个文件。
   //
@@ -393,12 +393,12 @@ export async function exportDiagnosticLog(): Promise<string> {
     `TS=$(date +%Y%m%d-%H%M%S)`,
     // ⚠️ `/sdcard` 在所有 Android 上都是指向当前用户内部存储的符号链接
     `DL=/sdcard/Download`,
-    `DLFILE=$DL/thermo-report-$TS.txt`,
+    `DLFILE=$DL/HyperPower-report-$TS.txt`,
     // 调试数据另存一个文件，与报告**同名不同后缀** —— 便于配对
     // （用户手上可能同时有好几次导出）
-    `DBGFILE=$DL/thermo-debug-$TS.jsonl`,
+    `DBGFILE=$DL/HyperPower-debug-$TS.jsonl`,
     `{`,
-    `  echo "===== 澎湃充控 诊断报告 ====="`,
+    `  echo "===== 澎湃充控 HyperPower 诊断报告 ====="`,
     `  echo "生成时间: $(date '+%Y-%m-%d %H:%M:%S %z')"`,
     `  echo`,
     `  echo "----- 版本 -----"`,
@@ -412,7 +412,7 @@ export async function exportDiagnosticLog(): Promise<string> {
     `  echo "页大小  : $(getconf PAGE_SIZE 2>/dev/null) 字节"`,
     `  echo`,
     `  echo "----- 进程 -----"`,
-    `  ps -A -o PID,ETIME,ARGS 2>/dev/null | grep '[t]hermo' || echo "(未发现 thermo 进程)"`,
+    `  ps -A -o PID,ETIME,ARGS 2>/dev/null | grep '[t]hermo' || echo "(未发现 HyperPower 后台进程)"`,
     `  echo`,
     `  echo "----- 当前状态 -----"`,
     `  ${MOD}/bin/ctl status 2>&1 || echo "(ctl status 失败)"`,
@@ -467,7 +467,7 @@ export async function exportDiagnosticLog(): Promise<string> {
     `  echo "----- 调试模式数据 -----"`,
     `  if [ -s ${DATA}/debug/debug.jsonl ]; then`,
     `    echo "调试数据存在：$(wc -c < ${DATA}/debug/debug.jsonl) 字节 / $(wc -l < ${DATA}/debug/debug.jsonl) 行"`,
-    `    echo "（完整数据会另存为一个 thermo-debug-*.jsonl 文件，一并发送即可）"`,
+    `    echo "（完整数据会另存为一个 HyperPower-debug-*.jsonl 文件，一并发送即可）"`,
     `    echo`,
     `    echo "--- 尾部队道预览（最近 30 行）---"`,
     `    tail -n 30 ${DATA}/debug/debug.jsonl 2>/dev/null`,
@@ -499,7 +499,7 @@ export async function exportDiagnosticLog(): Promise<string> {
   // 脚本输出**两行**：
   //
   // ```text
-  // /sdcard/Download/thermo-report-20261014-1500.txt   ← 最终路径
+  // /sdcard/Download/HyperPower-report-20261014-1500.txt   ← 最终路径
   // 20075                                              ← 字节数
   // ```
   const res = await execGuarded(script, TIMEOUT_WRITE_MS, "导出日志");
@@ -757,7 +757,7 @@ async function runBinary(
     if (e instanceof ApiError) {
       throw e;
     }
-    throw new ApiError("E_INTERNAL", `无法执行 thermo：${String(e)}`);
+    throw new ApiError("E_INTERNAL", `无法执行 HyperPower 后端：${String(e)}`);
   }
 
   const out = result.stdout.trim();
@@ -766,7 +766,7 @@ async function runBinary(
       "E_INTERNAL",
       result.stderr.trim() ||
         (result.errno === 127
-          ? "找不到 thermo 二进制（模块是否安装完整？）"
+          ? "找不到 HyperPower 后端二进制（模块是否安装完整？）"
           : `命令无输出（退出码 ${result.errno}）`),
     );
   }

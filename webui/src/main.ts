@@ -143,7 +143,7 @@ const app = createApp(App);
 app.config.errorHandler = (err, _instance, info) => {
   const msg = err instanceof Error ? err.message : String(err);
   recordError(`vue(${info}): ${msg}`);
-  console.error("[thermo] Vue 错误:", err, info);
+  console.error("[HyperPower] Vue 错误:", err, info);
   toastError("界面刚出了点小问题。若显示不正常，可到「更多」页记录诊断数据");
 };
 
@@ -155,7 +155,7 @@ try {
 } catch (e) {
   // 挂载失败是最严重的情况（整页空白）—— 把原因直接写进页面
   const msg = e instanceof Error ? `${e.message}\n${e.stack ?? ""}` : String(e);
-  console.error("[thermo] 挂载失败:", e);
+  console.error("[HyperPower] 挂载失败:", e);
   const host = document.getElementById("app");
   if (host) {
     host.innerHTML = `

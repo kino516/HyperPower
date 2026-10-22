@@ -411,7 +411,7 @@ function fmtBytes(n: number): string {
  * 报告落在**「下载」目录**（用户能在文件管理器里找到并直接分享），
  * 文件名带时间戳，多次导出不会互相覆盖。
  *
- * 若调试模式开着，会**另存**一份 `thermo-debug-*.jsonl` ——
+ * 若调试模式开着，会**另存**一份 `HyperPower-debug-*.jsonl` ——
  * 调试数据有几十 MB，塞进报告本体既发不出去也打不开。
  */
 async function doExport(): Promise<void> {
