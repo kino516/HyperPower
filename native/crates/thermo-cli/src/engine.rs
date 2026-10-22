@@ -941,6 +941,22 @@ impl Engine {
                 //    压到 3~5A（40~42.2℃ 档），模块仍只有 18W。
                 //    ⇒ 电流也必须"被明显压流时写回"，但仍保留 90% 死区，
                 //      避免把驱动的小幅自适应（6.0/7.5/12.3A）误当成压流。
+                // 🔴 2026-10-22 第三次真机实测：写回能到 40W，但模块每 3 秒
+                //    写一次 18.4A，官方高温策略随即 `stop charge`（协商），
+                //    tdie 冲到 63.5℃。
+                //    ⇒ **温度门控**：电池 <42℃ 且电荷泵 <50℃ 时才写回；
+                //      高温完全交给官方（连档位也不写），避免对抗触发协商。
+                //      电荷泵节点读不到时按"不满足"处理（不猜，R17）。
+                let cp_c = self
+                    .nodes
+                    .cp_die_temp
+                    .as_ref()
+                    .and_then(|n| n.read_i64().ok())
+                    .map(|v| v as f32 / 10.0);
+                let cool_enough = sample.temp_c < 42.0 && cp_c.is_some_and(|c| c < 50.0);
+                if !cool_enough {
+                    return (false, true, None);
+                }
                 let gear_r = self.nodes.ensure_gear(decision.gear);
                 let curr_r = self.nodes.ensure_curr(decision.curr_ua);
                 if let Err(e) = gear_r {
@@ -1674,6 +1690,8 @@ mod tests {
                 "sys/class/xm_power/charger/smart_charge",
                 // 电池观测
                 "sys/class/power_supply/battery",
+                // 电荷泵温度（温度门控用）
+                "sys/class/xm_power/cp_master",
                 // 档位表（设备树）
                 "sys/firmware/devicetree/base/soc/mca_charger_thermal",
                 // 场景
@@ -1704,6 +1722,7 @@ mod tests {
             s.write("sys/class/xm_power/charger/smart_charge/smart_chg", "80");
             s.write("sys/class/xm_power/charger/smart_charge/soc_limit", "80");
             s.write("sys/class/power_supply/battery/temp", "300");
+            s.write("sys/class/xm_power/cp_master/tdie", "400");
             s.write("sys/class/power_supply/battery/status", "Charging");
             s.write("sys/class/power_supply/battery/capacity", "50");
             s.write("sys/class/power_supply/battery/current_now", "2000000");
@@ -2207,6 +2226,58 @@ mod tests {
 
             assert_eq!(fake.read(CURR), "29000000", "90% 以内不该追写");
             assert_eq!(fake.read(CURR2), "29000000", "curr2 同样不该追写");
+        });
+    }
+
+    /// 温度门控：电池 ≥42℃ 时不写**任何**节点（档位/电流都交给官方）
+    ///
+    /// 真机 2026-10-22：写回能把功率拉到 40W，但每 3 秒写一次会触发
+    /// `stop charge` 协商，tdie 冲到 63.5℃。高温时官方在做保护，模块不应对抗。
+    #[test]
+    fn 端到端_电池高温时不写节点() {
+        const CTRL: &str = "sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit";
+        const CURR: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+
+        let fake = FakeSysfs::new("temp_gate_cell");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on_with_curr(&fake, Some(18_400_000));
+            engine.learned_curr_max = Some(18_400_000);
+            engine.curr_opened = true;
+
+            // 42.5℃：高于门控 42℃，但低于默认收紧线 43℃
+            fake.write("sys/class/power_supply/battery/temp", "425");
+            fake.write(CURR, "5000000");
+            fake.write(CTRL, "15");
+
+            engine.step(1000);
+
+            assert_eq!(fake.read(CURR), "5000000", "高温时不该写电流");
+            assert_eq!(fake.read(CTRL), "15", "高温时不该写档位");
+        });
+    }
+
+    /// 温度门控：电荷泵 ≥50℃ 时同样不写任何节点
+    #[test]
+    fn 端到端_电荷泵高温时不写节点() {
+        const CTRL: &str = "sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit";
+        const CURR: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+
+        let fake = FakeSysfs::new("temp_gate_cp");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on_with_curr(&fake, Some(18_400_000));
+            engine.learned_curr_max = Some(18_400_000);
+            engine.curr_opened = true;
+
+            fake.write("sys/class/xm_power/cp_master/tdie", "550");
+            fake.write(CURR, "5000000");
+            fake.write(CTRL, "15");
+
+            engine.step(1000);
+
+            assert_eq!(fake.read(CURR), "5000000", "电荷泵高温时不该写电流");
+            assert_eq!(fake.read(CTRL), "15", "电荷泵高温时不该写档位");
         });
     }
 
