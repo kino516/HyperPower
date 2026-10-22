@@ -1096,6 +1096,48 @@ impl Nodes {
         Ok(())
     }
 
+    /// 电流节点被官方**明显压低**时写回目标（"压流纠正"）
+    ///
+    /// # 为什么需要它（2026-10-22 真机实测）
+    ///
+    /// 极速模式、电池 40~41℃、`curr_opened = true` 时，官方
+    /// `mca_strategy_buckchg` **每 2 秒**把 `wired_chg_curr` 写成 3~5 A
+    /// （`SIC-BAT` 40~42.2℃ 档上限 5 A，42.2℃ 以上档最低 3 A），
+    /// 而模块"电流已放开就不碰电流"⇒ 功率被锁在 **18 W**。
+    /// 档位此时是正确的 `0`，问题完全在电流通道。
+    ///
+    /// # 判据（避免重演 2026-10-20 的协商重置）
+    ///
+    /// | 节点值 | 行为 | 理由 |
+    /// |---|---|---|
+    /// | `≥ 目标` | 不写 | R6：只放宽，不收紧 |
+    /// | `< 目标 90%` | 写回目标 | 被官方压流，必须纠正 |
+    /// | `90%~100%` | 不写 | 驱动小幅自适应（6.0/7.5/12.3 A 那类），追写会每 3 秒触发协商重置 |
+    ///
+    /// 读失败 → 跳过（不猜，R17）；返回是否真的写了。
+    pub fn ensure_curr(&self, target_ua: i32) -> Result<bool> {
+        if target_ua <= 0 {
+            return Ok(false);
+        }
+        let threshold = i64::from(target_ua) * 9 / 10;
+        let mut wrote = false;
+        for node in [self.curr.as_ref(), self.curr2.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            match node.read_i64() {
+                Ok(cur) if cur >= threshold => continue,
+                Ok(_) => {
+                    node.write_i64(i64::from(target_ua))
+                        .context("写回电流上限失败")?;
+                    wrote = true;
+                }
+                Err(_) => continue,
+            }
+        }
+        Ok(wrote)
+    }
+
     /// 硬保护：收紧到最紧档位 + 最小电流
     pub fn apply_hard_protect(&self, gear_safe: u8, curr_safe: i32) -> Result<()> {
         if let Some(c) = &self.ctrl {

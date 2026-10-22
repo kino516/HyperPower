@@ -935,26 +935,42 @@ impl Engine {
                 //    （`docs/03` §2C.2），而档位 14/15 会把电荷泵从 4:1
                 //    切到 2:1（功率 44W → 1.9W，§2A.3）。旧实现这里直接
                 //    `Ok(())`，等于把档位也一起撒手 ⇒ 官方收紧后没人纠正。
-                match self.nodes.ensure_gear(decision.gear) {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        // ⚠️ 档位压制失败**不**递增 `write_failures`：
-                        //
-                        //    官方 `MONITOR-BAT` 会竞争写同一节点，偶发 EBUSY
-                        //    属常态。若按 R5「连续 5 次失败 ⇒ 交回官方」处理，
-                        //    就会重演 D-035 那类「整场充电被交回官方」的事故 ——
-                        //    而电流通道此刻仍在正常控制，档位压制只是辅助。
-                        //
-                        //    ⇒ 记一条事件留痕，下一拍照常重试。
-                        let msg = format!("压制官方档位失败：{e:#}");
-                        self.events.emit(
-                            kind::WRITE_FAIL,
-                            &msg,
-                            json!({ "gear": decision.gear, "fatal": false }),
-                        );
-                        return (false, true, Some(msg));
-                    }
+                //
+                // 🔴 2026-10-22 第二次真机实测（10.0.0.18）：档位已经是 0，
+                //    但官方 `mca_strategy_buckchg` 每 2 秒把 `wired_chg_curr`
+                //    压到 3~5A（40~42.2℃ 档），模块仍只有 18W。
+                //    ⇒ 电流也必须"被明显压流时写回"，但仍保留 90% 死区，
+                //      避免把驱动的小幅自适应（6.0/7.5/12.3A）误当成压流。
+                let gear_r = self.nodes.ensure_gear(decision.gear);
+                let curr_r = self.nodes.ensure_curr(decision.curr_ua);
+                if let Err(e) = gear_r {
+                    // ⚠️ 档位压制失败**不**递增 `write_failures`：
+                    //
+                    //    官方 `MONITOR-BAT` 会竞争写同一节点，偶发 EBUSY
+                    //    属常态。若按 R5「连续 5 次失败 ⇒ 交回官方」处理，
+                    //    就会重演 D-035 那类「整场充电被交回官方」的事故 ——
+                    //    而电流通道此刻仍在正常控制，档位压制只是辅助。
+                    //
+                    //    ⇒ 记一条事件留痕，下一拍照常重试。
+                    let msg = format!("压制官方档位失败：{e:#}");
+                    self.events.emit(
+                        kind::WRITE_FAIL,
+                        &msg,
+                        json!({ "gear": decision.gear, "fatal": false }),
+                    );
+                    return (false, true, Some(msg));
                 }
+                if let Err(e) = curr_r {
+                    // 同上：电流写回失败也不升级为整场 release。
+                    let msg = format!("写回被官方压低的电流失败：{e:#}");
+                    self.events.emit(
+                        kind::WRITE_FAIL,
+                        &msg,
+                        json!({ "curr_ua": decision.curr_ua, "fatal": false }),
+                    );
+                    return (false, true, Some(msg));
+                }
+                Ok(())
             } else {
                 // 首次放开：写一次物理上限，读回值由 ② 学下来
                 //
@@ -2132,6 +2148,65 @@ mod tests {
                 "12300000",
                 "电流已放开时仍不应碰电流节点（避免触发协商重置）"
             );
+        });
+    }
+
+    /// 🔴 **回归守卫**：电流已放开后，官方把电流**明显压低**时必须写回
+    ///
+    /// # 真机实测（2026-10-22，10.0.0.18 / myron）
+    ///
+    /// 档位已修好（`wired_ctrl_limit = 0`），但官方 `mca_strategy_buckchg`
+    /// **每 2 秒**把 `wired_chg_curr` 写成 3~5 A（`SIC-BAT` 40~42.2℃ 档
+    /// 上限 5 A），模块 `curr_opened = true` 不写电流 ⇒ 功率锁在 18 W。
+    ///
+    /// ⇒ 被压到目标 90% 以下时必须写回目标电流（`Nodes::ensure_curr`）。
+    #[test]
+    fn 端到端_已放开后写回被官方压低的电流() {
+        const CURR: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+        const CURR2: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr2";
+
+        let fake = FakeSysfs::new("curr_repress");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on_with_curr(&fake, Some(30_000_000));
+            engine.learned_curr_max = Some(30_000_000);
+            engine.curr_opened = true;
+
+            // 官方把电流压到 5A（远低于 30A 的 90% = 27A）
+            fake.write(CURR, "5000000");
+            fake.write(CURR2, "5000000");
+
+            engine.step(1000);
+
+            assert_eq!(fake.read(CURR), "30000000", "被压到 5A 必须写回 30A");
+            assert_eq!(fake.read(CURR2), "30000000", "curr2 也要写回 30A");
+        });
+    }
+
+    /// 驱动小幅自适应（≥ 目标 90%）**不追写**，避免协商重置
+    ///
+    /// 2026-10-20 K70 Pro 真机教训：电量接近上限时驱动会在
+    /// 6.0 / 7.5 / 12.3 A 之间自己调，追着写会每 3 秒触发协商重置。
+    #[test]
+    fn 端到端_电流小幅自适应不追写() {
+        const CURR: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+        const CURR2: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr2";
+
+        let fake = FakeSysfs::new("curr_deadband");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on_with_curr(&fake, Some(30_000_000));
+            engine.learned_curr_max = Some(30_000_000);
+            engine.curr_opened = true;
+
+            // 96.7% ≥ 90% ⇒ 视为驱动自适应，不写
+            fake.write(CURR, "29000000");
+            fake.write(CURR2, "29000000");
+
+            engine.step(1000);
+
+            assert_eq!(fake.read(CURR), "29000000", "90% 以内不该追写");
+            assert_eq!(fake.read(CURR2), "29000000", "curr2 同样不该追写");
         });
     }
 
