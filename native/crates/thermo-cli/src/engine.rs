@@ -24,7 +24,7 @@ use thermo_core::{Decision, Reason, Sample, State};
 
 use crate::config_store::ConfigStore;
 use crate::observability::{kind, EventLog, SnapshotWriter};
-use crate::sysfs::{GearTable, Nodes};
+use crate::sysfs::{GearTable, Nodes, WriteOutcome};
 
 /// 连续失败多少次后交回官方（fail-closed）
 pub const FAIL_LIMIT: u32 = 5;
@@ -213,6 +213,19 @@ pub struct Engine {
     /// 只用于调试日志（`trace` 的 `soc_hold` 列）。判据见
     /// [`Engine::soc_limit_holds`]。
     pub soc_hold_active: bool,
+    /// 已上报过的**写入层非致命警告**（原文去重）
+    ///
+    /// # 为什么需要去重（2026-10-23 真机：K70）
+    ///
+    /// 电流节点（`constant_charge_current`）对 `ksu` 域只读时，
+    /// 未充电的每一拍都会尝试"交回官方"并产生同一条警告。
+    /// 若每拍都写事件，事件流几十秒就被同一条刷满（与
+    /// `release` 事件在拍迁移时才记同一类问题）。
+    ///
+    /// ⇒ 同一句话只在**本次进程**里记一次；节点恢复可写后
+    /// （例如重启后 sepolicy 生效）新的警告文案自然不同（含路径/原因），
+    /// 不影响下次诊断。
+    pub reported_warnings: std::collections::BTreeSet<String>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -301,6 +314,7 @@ impl Engine {
             // worker 的启动路径已经显式跑过首拍了。
             last_charging: false,
             soc_hold_active: false,
+            reported_warnings: std::collections::BTreeSet::new(),
         }
     }
 
@@ -986,6 +1000,8 @@ impl Engine {
             self.curr_opened = false;
             self.nodes
                 .apply_hard_protect(decision.gear, decision.curr_ua)
+                // 硬保护只有 `Result<()>`：写入失败必须显式失败（安全路径）
+                .map(|()| WriteOutcome::default())
         } else if decision.reason == Reason::Normal || decision.reason == Reason::PowerLimit {
             // ── 判断"到底需不需要限制电流" ──
             //
@@ -1014,7 +1030,9 @@ impl Engine {
             if need_limit {
                 // 要限制：每次都强制写精确目标
                 self.curr_opened = false;
-                self.nodes.apply_dual(decision.gear, decision.curr_ua, prev)
+                self.nodes
+                    .apply_dual(decision.gear, decision.curr_ua, prev)
+                    .map(|()| WriteOutcome::default())
             } else if self.curr_opened {
                 // 电流已放开：**不碰电流节点**（避免每 3 秒协商重置，见字段文档），
                 // 但档位必须每拍压制官方竞争写。
@@ -1072,7 +1090,7 @@ impl Engine {
                     );
                     return (false, true, Some(msg));
                 }
-                Ok(())
+                Ok(WriteOutcome::default())
             } else {
                 // 首次放开：写一次物理上限，读回值由 ② 学下来
                 //
@@ -1087,8 +1105,19 @@ impl Engine {
                 r
             }
         } else {
-            self.nodes.apply_dual(decision.gear, decision.curr_ua, prev)
+            self.nodes
+                .apply_dual(decision.gear, decision.curr_ua, prev)
+                .map(|()| WriteOutcome::default())
         };
+
+        // ④-b 写入层的**非致命**问题（电流节点只读等）→ 记事件留痕
+        //
+        // ⚠️ 必须在 `if let Err(e) = result` **之前** —— 那里会把 result move 掉。
+        // ⚠️ 不递增 `write_failures`：档位（主通道）写成功了，这不算写入失败；
+        //    否则未充电时每拍 +1 ⇒ 5 拍后误触发"交回官方"。
+        if let Ok(out) = &result {
+            self.report_write_warnings("写入", out);
+        }
 
         // ② 🔴 读回值**只用来学一次**，绝不跟着波动走（2026-10-20 真机踩坑）
         //
@@ -1182,23 +1211,44 @@ impl Engine {
     }
 
     /// 立即交回官方（安全出口）
+    ///
+    /// # ⚠️ 档位释放成功即算成功（2026-10-23 真机：K70）
+    ///
+    /// 旧实现只要 `release_control` 返回 `Err`（哪怕只是电流节点
+    /// `Permission denied`）就不置 `released`、每拍重试，用户看到的是
+    /// 永远刷不完的「交回官方失败」。现在 `release_control` 把电流 /
+    /// curr2 / 移除标记的失败降级为 [`WriteOutcome::warnings`]：
+    ///
+    /// | 情况 | `Err` | 行为 |
+    /// |---|---|---|
+    /// | 档位写不进去 | 是 | 真失败 ⇒ 不置 `released`，记事件（下一拍再试） |
+    /// | 仅电流写不进去 | 否 | 档位已放开 ⇒ 置 `released`，warning 留痕 |
     pub fn release_now(&mut self, reason: &str) {
         if self.released {
             return;
         }
-        match self
+        let result = self
             .nodes
-            .release_control(self.caps().gear.open, self.release_curr_ua())
-        {
-            Ok(()) => {
+            .release_control(self.caps().gear.open, self.release_curr_ua());
+        match result {
+            Ok(out) => {
                 self.released = true;
                 self.state.reset();
+                // 先记 warning（含"该怎么办"），再记 release 事件
+                self.report_write_warnings("交回官方", &out);
                 self.events.emit(
                     kind::RELEASE,
                     &format!("交回官方：{reason}"),
-                    json!({ "reason": reason }),
+                    json!({ "reason": reason, "warnings": out.warnings }),
                 );
-                log::warn!("已交回官方控制：{reason}");
+                if out.is_clean() {
+                    log::warn!("已交回官方控制：{reason}");
+                } else {
+                    log::warn!(
+                        "已交回官方控制：{reason}（{} 项非致命问题，见最近事件）",
+                        out.warnings.len()
+                    );
+                }
             }
             Err(e) => {
                 self.events.emit(
@@ -1207,6 +1257,25 @@ impl Engine {
                     json!({ "reason": reason }),
                 );
             }
+        }
+    }
+
+    /// 上报写入层的**非致命**警告（同一句话本次进程只记一次）
+    ///
+    /// 未充电时"交回官方"每拍都会执行；若每拍都把同一条警告写进事件流，
+    /// 几十秒就能刷满近千条（与 [`Self::step`] 里 `release` 事件只记
+    /// 状态迁移是同一类处理）。
+    fn report_write_warnings(&mut self, scene: &str, out: &WriteOutcome) {
+        for w in &out.warnings {
+            if !self.reported_warnings.insert(w.clone()) {
+                continue;
+            }
+            log::warn!("[{scene}] {w}");
+            self.events.emit(
+                kind::WRITE_FAIL,
+                w,
+                json!({ "scene": scene, "fatal": false }),
+            );
         }
     }
 
@@ -2801,6 +2870,145 @@ mod tests {
                 "1000000",
                 "电流应被放开，不能停留在旧的限速值"
             );
+        });
+    }
+
+    /// 🔴 2026-10-23 真机（K70）：「交回官方失败：放开电流失败: 打开（写）失败:
+    /// `/sys/class/power_supply/battery/constant_charge_current`: Permission denied」
+    ///
+    /// 根因：该节点在运行期对 `ksu` 域只读（SELinux 拒绝 `open`/驱动状态变化），
+    /// 而旧实现把"电流放开失败"当成整个释放失败 ⇒ 每拍重试 ⇒ 事件刷屏。
+    ///
+    /// 本测试钉死修复后的行为：
+    /// | 断言 | 含义 |
+    /// |---|---|
+    /// | `rep.errors` 为空 | 电流不可写不是致命错误 |
+    /// | 档位被写成 0 | 主通道仍然完成"交回官方" |
+    /// | 事件含"电流节点不可写" | 不静默（R17） |
+    /// | 事件不含"交回官方失败" | 旧 bug 的直接回归断言 |
+    #[test]
+    fn 端到端_电流节点不可写时交回官方不算失败() {
+        let fake = FakeSysfs::new("rel_curr_perm");
+        fake.write("sys/class/power_supply/battery/status", "Discharging");
+        // 制造"模块之前收紧过"的现场
+        fake.write(
+            "sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit",
+            "10",
+        );
+        fake.write(
+            "sys/class/xm_power/charger/charger_thermal/wired_chg_curr",
+            "1000000",
+        );
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on(&fake);
+            // 模拟真机：运行期电流节点对当前域只读。
+            // 用假树里**不存在**的路径 ⇒ `open(O_WRONLY)` 失败，
+            // 与真机 EACCES 走同一条"权限/不可写"降级分支（跨平台可测）。
+            engine.nodes.curr = Some(crate::sysfs::Node::new(
+                "/sys/class/power_supply/battery/constant_charge_current",
+            ));
+            // 同时让档案电流上限大于 0，确保会进入"需要放开"的分支
+            engine.profile.profile.capabilities.current.max_ua = 6_000_000;
+
+            let rep = engine.step(1000);
+            assert!(rep.sampled);
+            assert!(rep.wrote, "档位仍应被放开");
+            assert!(
+                rep.errors.is_empty(),
+                "电流节点不可写不能算致命错误（旧实现会在这里报 Permission denied）：{:?}",
+                rep.errors
+            );
+
+            assert_eq!(
+                fake.read("sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit"),
+                "0",
+                "档位必须已放开（交回官方的主通道）"
+            );
+
+            let events = std::fs::read_to_string(fake.path("events.jsonl")).unwrap_or_default();
+            assert!(
+                !events.contains("交回官方失败"),
+                "电流节点不可写不应再被报成整体失败：\n{events}"
+            );
+            assert!(
+                events.contains("电流节点不可写"),
+                "必须留下可诊断的警告（R17 不静默）：\n{events}"
+            );
+        });
+    }
+
+    /// 档位（主通道）写不进去时，交回官方**仍然要报错** ——
+    /// 修复不能把真正的失败也一起吞掉。
+    #[test]
+    fn 端到端_档位节点不可写时交回官方仍然报错() {
+        let fake = FakeSysfs::new("rel_gear_perm");
+        fake.write("sys/class/power_supply/battery/status", "Discharging");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on(&fake);
+            engine.nodes.ctrl = Some(crate::sysfs::Node::new(
+                "/sys/class/power_supply/battery/charge_control_limit",
+            ));
+
+            let rep = engine.step(1000);
+            assert!(
+                !rep.errors.is_empty(),
+                "档位写不进去必须报错（那是主通道，不是可选节点）"
+            );
+            assert!(!rep.wrote || !rep.verified, "档位失败时不应报告写入成功");
+
+            let events = std::fs::read_to_string(fake.path("events.jsonl")).unwrap_or_default();
+            assert!(
+                events.contains("打开（写）失败") || events.contains("放开档位失败"),
+                "事件里应有可诊断的失败原因：\n{events}"
+            );
+        });
+    }
+
+    /// 充电中、电流节点不可写：**正常控制必须 fail-closed**。
+    ///
+    /// 温度收紧只调电流（D-017/R11），档位此时是最松档 —— 只写档位等于
+    /// 假装在控温。因此本路径仍返回 `Err`，连续 5 拍后交回官方；
+    /// 而交回官方本身已能容忍电流节点只读（见上一个测试），不会再刷
+    /// 「交回官方失败」。
+    #[test]
+    fn 端到端_电流节点不可写时正常控制仍会交回官方() {
+        let fake = FakeSysfs::new("curr_perm_control");
+        fake.write("sys/class/power_supply/battery/temp", "440");
+        fake.write(
+            "sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit",
+            "10",
+        );
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on(&fake);
+            engine.nodes.curr = Some(crate::sysfs::Node::new(
+                "/sys/class/power_supply/battery/constant_charge_current",
+            ));
+
+            // 温度收紧有 `thermal.delay_s = 5` 的延迟（首拍是 DelayPending），
+            // 再给足 5 拍让 `write_failures` 达到阈值
+            for i in 0..=15 {
+                engine.step(1000 + i);
+            }
+            assert!(
+                engine.write_failures >= FAIL_LIMIT,
+                "电流写不进去应累计失败并触发交回官方，实得 {}",
+                engine.write_failures
+            );
+            assert!(
+                engine.released,
+                "达到阈值后必须已交回官方（fail-closed，不能假装在控温）"
+            );
+
+            // 交回官方本身不能失败：档位放开成功即算成功
+            let events = std::fs::read_to_string(fake.path("events.jsonl")).unwrap_or_default();
+            assert!(
+                !events.contains("交回官方失败"),
+                "电流节点只读不应让「交回官方」也失败：\n{events}"
+            );
+            assert!(events.contains("交回官方"), "应记录已交回官方：\n{events}");
         });
     }
 

@@ -935,5 +935,7 @@ pub fn write_safe_values(profile_source: ProfileSource) -> Result<()> {
         700_000
     };
     let _ = profile_source;
-    nodes.release_control(caps.gear.open, curr_max)
+    // 崩溃恢复路径只关心"档位是否放开"：电流节点不可写属于非致命
+    // （见 `WriteOutcome`），不能因此让 supervisor 的重试逻辑以为整场失败。
+    nodes.release_control(caps.gear.open, curr_max).map(|_| ())
 }

@@ -343,6 +343,62 @@ impl Node {
     }
 }
 
+/// 一次写入的结果：`Err` 表示**致命**失败，`warnings` 收集**已降级**的非致命问题
+///
+/// # 为什么需要它（2026-10-23 真机：K70「交回官方失败」）
+///
+/// 真机报错：
+///
+/// ```text
+/// 交回官方失败：放开电流失败: 打开（写）失败:
+///   /sys/class/power_supply/battery/constant_charge_current: Permission denied
+/// ```
+///
+/// `/sys/class/power_supply/battery/constant_charge_current` 在部分机型 /
+/// 部分充电状态下对 `ksu` 域**只读**（SELinux 拒绝 `open`，或驱动在运行期
+/// 把属性改成只读）。旧实现把它当成致命错误，后果是：
+///
+/// | 路径 | 旧行为 | 后果 |
+/// |---|---|---|
+/// | 交回官方 | `release_control` 返回 `Err` | 整个释放失败 ⇒ 每拍重试 ⇒ 事件刷屏（**本次已修**） |
+/// | 正常控制 | `apply_dual` 返回 `Err` | 连续 5 拍后交回官方（**有意保留**：温度收紧只调电流，只写档位等于假装在控温） |
+///
+/// 关键事实是：**写不进去的节点，我们本来也没能限制它** ——
+/// 既然限制从未生效，**释放**时跳过它就是安全的。因此只把释放路径的
+/// 电流失败降级成 warning（不静默：调用方必须记事件，见 R17），
+/// 只有档位（主通道）写不进去才算致命。控制路径维持 fail-closed（D-018）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteOutcome {
+    /// 非致命问题；每个元素都是**给用户看**的中文句子（含"该怎么办"）
+    pub warnings: Vec<String>,
+}
+
+impl WriteOutcome {
+    /// 记一条非致命问题
+    pub fn warn(&mut self, msg: impl Into<String>) {
+        self.warnings.push(msg.into());
+    }
+
+    /// 是否一切正常
+    pub fn is_clean(&self) -> bool {
+        self.warnings.is_empty()
+    }
+}
+
+/// 错误链里是否有 `EACCES`(13) / `EPERM`(1)
+///
+/// 这两类错误是**权限问题**：节点对当前域只读。重试不会变好，
+/// 应降级为 warning 而不是每拍失败（R17 不静默、但不制造噪音）。
+///
+/// ⚠️ 用数字而不是 `libc::EACCES`：本文件要能在 Windows 上编译/测试。
+fn is_permission_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            .is_some_and(|code| code == 13 || code == 1)
+    })
+}
+
 /// **值相同就不写**的整数写入
 ///
 /// # 为什么需要它（真机实测的性能修复）
@@ -380,6 +436,36 @@ fn write_if_different(node: &Node, value: i64) -> Result<()> {
         }
     }
     node.write_i64(value)
+}
+
+/// 放开**一路电流**节点：只放宽、权限失败降级为 warning
+///
+/// 语义见 [`Nodes::release_control`] 的文档：节点写不进去 ⇒ 我们此前也
+/// 没能限制它 ⇒ 拖动整个"交回官方"失败没有意义，但必须留一条可诊断的
+/// 警告（R17：不静默）。
+fn release_curr_node(node: &Node, curr_max_ua: i32, label: &str, out: &mut WriteOutcome) {
+    // 只放宽：当前值已经不低于目标值 ⇒ 已是放开状态，无需写
+    let already_open = node
+        .read_i64()
+        .map(|v| v >= i64::from(curr_max_ua))
+        .unwrap_or(false);
+    if already_open {
+        return;
+    }
+    match node.write_i64(i64::from(curr_max_ua)) {
+        Ok(()) => {}
+        Err(e) if is_permission_error(&e) || !node.is_writable() => {
+            out.warn(format!(
+                "{label}节点不可写（{}）—— 已跳过放开（模块此前也未能限制它）；\
+                 若本机需要电流控制，请确认 sepolicy.rule 已放行该节点的 SELinux 类型，然后重启手机",
+                node.path_str()
+            ));
+        }
+        Err(e) => {
+            // 驱动忙 / 节点消失等：释放是**尽力而为**，不让整个"交回官方"失败
+            out.warn(format!("{label}放开失败（已跳过）：{e:#}"));
+        }
+    }
 }
 
 // ============================================================
@@ -956,6 +1042,15 @@ impl Nodes {
     ///
     /// 失败时回滚到 `prev`。
     ///
+    /// # ⚠️ 电流节点不可写时**仍然返回 `Err`**（与释放路径不同）
+    ///
+    /// 2026-10-23 K70 的只读节点暴露了一个容易走错的"优化"：电流写不进去时
+    /// 只写档位、继续控制。但温度收紧**只调电流**（D-017 / R11），档位此时
+    /// 是最松档 —— 保留它等于**假装在控温**，实际功率一点没降。
+    ///
+    /// ⇒ 本路径维持 fail-closed：连续失败达阈值后交回官方，由官方热控接管
+    ///   （届时 `release_control` 已能容忍电流节点只读，见那里的说明）。
+    ///
     /// # ⚠️ 值相同则跳过写（真机实测的性能修复）
     ///
     /// 每次写 sysfs 都会触发内核驱动的实际通信（PMIC / I2C），
@@ -1034,7 +1129,22 @@ impl Nodes {
     ///
     /// 反向场景仍然正确：模块之前收紧过（写了 700000），
     /// 现在释放 ⇒ `700000 < 5000000` ⇒ 照常写入，限制被解除 ✓
-    pub fn release_control(&self, gear_open: u8, curr_max_ua: i32) -> Result<()> {
+    ///
+    /// # ⚠️ 电流不可写时**不算整体失败**（2026-10-23 真机：K70）
+    ///
+    /// 真机报错：
+    ///
+    /// ```text
+    /// 交回官方失败：放开电流失败: 打开（写）失败:
+    ///   /sys/class/power_supply/battery/constant_charge_current: Permission denied (os error 13)
+    /// ```
+    ///
+    /// 档位已经放开、电流节点只是对它只读 —— 此时返回 `Err` 会让引擎
+    /// 每拍重试并刷事件，用户永远看到"交回官方失败"。⇒ 电流/curr2/移除标记
+    /// 的失败一律降级进 [`WriteOutcome::warnings`]；**档位**失败仍是 `Err`
+    /// （那是主通道，且档位写不进去说明整个控制都没生效）。
+    pub fn release_control(&self, gear_open: u8, curr_max_ua: i32) -> Result<WriteOutcome> {
+        let mut out = WriteOutcome::default();
         if let Some(c) = &self.ctrl {
             // ⚠️ 值相同则跳过写。**这里必须读节点当前值**，不能拿缓存比较：
             //    官方 `MONITOR-BAT` 会在充电中**竞争写**更严的档位
@@ -1045,29 +1155,18 @@ impl Nodes {
             write_if_different(c, i64::from(gear_open)).context("放开档位失败")?;
         }
         if let Some(c) = &self.curr {
-            // 只放宽：当前值已经不低于目标值 ⇒ 已是放开状态，无需写
-            let already_open = c
-                .read_i64()
-                .map(|v| v >= i64::from(curr_max_ua))
-                .unwrap_or(false);
-            if !already_open {
-                c.write_i64(i64::from(curr_max_ua))
-                    .context("放开电流失败")?;
-            }
+            release_curr_node(c, curr_max_ua, "电流", &mut out);
         }
         if let Some(c) = &self.curr2 {
-            let already_open = c
-                .read_i64()
-                .map(|v| v >= i64::from(curr_max_ua))
-                .unwrap_or(false);
-            if !already_open {
-                c.write_i64(i64::from(curr_max_ua)).ok();
-            }
+            release_curr_node(c, curr_max_ua, "第二路电流", &mut out);
         }
         if let Some(r) = &self.remove {
-            r.write_i64(0).ok();
+            if let Err(e) = r.write_i64(0) {
+                // 移除标记是"锦上添花"：档位已经放开，它写不进去不影响安全
+                out.warn(format!("移除限流标记失败（已跳过）：{e:#}"));
+            }
         }
-        Ok(())
+        Ok(out)
     }
 
     /// 只检查/纠正**档位**，不动电流节点
@@ -1128,6 +1227,16 @@ impl Nodes {
             match node.read_i64() {
                 Ok(cur) if cur >= threshold => continue,
                 Ok(_) => {
+                    // 节点对当前域只读（2026-10-23 K70：`constant_charge_current`
+                    // 被 SELinux 拒绝）⇒ 写不进去，跳过。
+                    //
+                    // 不返回 `Err`：调用方会把它记成"写回失败"并每拍重试，
+                    // 而档位通道（`ensure_gear`）才是温度保护的主通道。
+                    // 该节点在 `apply_dual` / `release_control` 里已留下
+                    // 可诊断的 warning，不需要这里再刷一条。
+                    if !node.is_writable() {
+                        continue;
+                    }
                     node.write_i64(i64::from(target_ua))
                         .context("写回电流上限失败")?;
                     wrote = true;
@@ -2407,6 +2516,29 @@ algo_type\tmonitor
                 "官方曲线是设备树属性，路径应在 devicetree 下：{d}"
             );
         }
+    }
+
+    /// 权限错误必须能从 anyhow 链里识别出来
+    ///
+    /// 这是 2026-10-23 K70 修复的判据：`is_permission_error` 认不出 EACCES 的话，
+    /// 电流节点只读又会被当成致命失败，整场「交回官方」重演刷屏。
+    #[test]
+    fn 权限错误识别() {
+        let eacces = anyhow::Error::new(std::io::Error::from_raw_os_error(13))
+            .context("打开（写）失败: /sys/class/power_supply/battery/constant_charge_current");
+        assert!(
+            is_permission_error(&eacces),
+            "EACCES(13) 必须被识别为权限问题"
+        );
+
+        let eperm =
+            anyhow::Error::new(std::io::Error::from_raw_os_error(1)).context("打开（写）失败");
+        assert!(is_permission_error(&eperm), "EPERM(1) 必须被识别为权限问题");
+
+        // ENOENT 不是权限问题 —— 由 `!node.is_writable()` 兜底（节点消失也走降级）
+        let enoent =
+            anyhow::Error::new(std::io::Error::from_raw_os_error(2)).context("打开（写）失败");
+        assert!(!is_permission_error(&enoent), "ENOENT 不是权限问题");
     }
 
     // ────────────────────────────────────────────────────────────

@@ -927,11 +927,24 @@ fn restore(ctx: &Ctx<'_>, args: &Value) -> Response {
             700_000
         };
         match ctx.nodes.release_control(caps.gear.open, curr_max) {
-            Ok(()) => ctx.data(json!({
-                "mode": "release",
-                "curr_ua": curr_max,
-                "note": "已交回官方控制",
-            })),
+            Ok(out) => {
+                // 契约只增不改：`warnings` 是新字段，老客户端忽略即可。
+                //
+                // 电流节点不可写（2026-10-23 K70：`constant_charge_current`
+                // Permission denied）不再让整条命令失败 —— 档位已交回官方，
+                // 用户需要知道的是"电流通道没放开"以及该怎么办。
+                let note = if out.is_clean() {
+                    "已交回官方控制"
+                } else {
+                    "已交回官方控制（部分节点不可写，详见 warnings）"
+                };
+                ctx.data(json!({
+                    "mode": "release",
+                    "curr_ua": curr_max,
+                    "note": note,
+                    "warnings": out.warnings,
+                }))
+            }
             Err(e) => Ctx::err(ErrorCode::BadCond, format!("交回失败：{e:#}")),
         }
     }
