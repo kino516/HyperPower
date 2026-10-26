@@ -30,6 +30,41 @@ pub fn send(command: &str, args: &[String], plain: bool, pretty: bool) -> Result
     render(&resp, plain, pretty)
 }
 
+/// 连接控制通道；失败时**自愈拉起**后台进程并重试一次
+///
+/// # 为什么需要它（2026-10-26 真机：隔几天就打不开状态页）
+///
+/// 真机现象：WebUI 报「连接 worker 失败（`control.sock` 不存在）」，
+/// **必须重启手机**才能恢复，隔几天出现一次。
+///
+/// 根因：supervisor 是 worker 的唯一拉起者，而它自己只由 `service.sh`
+/// 在开机时拉起一次；被系统回收后无人再拉起它 ⇒ worker 也消失、
+/// socket 不存在。详见 [`crate::supervisor::ensure_running`]。
+///
+/// 自愈只**拉起进程**，不写任何充电节点（R1）；拉起后仍由 worker 决策。
+#[cfg(unix)]
+fn connect_client() -> Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::net::UnixStream;
+
+    let sock = crate::paths::control_sock();
+    match UnixStream::connect(&sock) {
+        Ok(conn) => Ok(conn),
+        Err(_) => {
+            let outcome = crate::supervisor::ensure_running();
+            log::debug!("连接 worker 失败，自愈结果：{outcome:?}");
+
+            UnixStream::connect(&sock).with_context(|| {
+                format!(
+                    "连接 worker 失败（{}）—— {}\n\
+                     常见原因：模块刚启动还没就绪（等几秒重试）、或后台进程已被系统回收。",
+                    sock.display(),
+                    outcome.hint()
+                )
+            })
+        }
+    }
+}
+
 /// 订阅事件流（长连接）
 pub fn watch() -> Result<()> {
     #[cfg(not(unix))]
@@ -38,15 +73,8 @@ pub fn watch() -> Result<()> {
     #[cfg(unix)]
     {
         use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixStream;
 
-        let sock_path = crate::paths::control_sock();
-        let conn = UnixStream::connect(&sock_path).with_context(|| {
-            format!(
-                "连接 worker 失败（{}）—— worker 是否在运行？",
-                sock_path.display()
-            )
-        })?;
+        let conn = connect_client()?;
 
         // ⚠️ `watch` 是长连接且**故意不设读超时** —— 事件本来就可能几分钟才有。
         //    但写请求仍要设超时，否则连接卡住时连订阅请求都发不出去。
@@ -85,16 +113,9 @@ pub fn watch() -> Result<()> {
 #[cfg(unix)]
 fn roundtrip(command: &str, args: &[String], want_stream: bool) -> Result<String> {
     use std::io::{BufReader, Read, Write};
-    use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
-    let sock_path = crate::paths::control_sock();
-    let mut conn = UnixStream::connect(&sock_path).with_context(|| {
-        format!(
-            "连接 worker 失败（{}）—— worker 是否在运行？",
-            sock_path.display()
-        )
-    })?;
+    let mut conn = connect_client()?;
 
     conn.set_write_timeout(Some(Duration::from_secs(WRITE_TIMEOUT_S)))
         .context("设置写超时失败")?;

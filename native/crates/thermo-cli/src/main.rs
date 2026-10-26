@@ -46,6 +46,7 @@ mod history;
 mod io_watchdog;
 mod ipc;
 mod logging;
+mod night;
 mod observability;
 mod paths;
 mod profile_io;

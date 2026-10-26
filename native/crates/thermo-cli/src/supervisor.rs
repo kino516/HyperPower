@@ -27,9 +27,18 @@
 //! 因此额外监测 worker 的**心跳**（`runtime.json` 的更新时间）：
 //! 超过阈值没更新就判定卡死，写安全值并发事件提醒用户重启。
 
-use std::path::PathBuf;
-use std::process::{Child, Command};
-use std::time::Duration;
+// 本模块需要 `flock`（单实例锁 + 客户端自愈探测）与 `setsid`（脱离
+// `ksu.exec` 会话拉起 supervisor）：标准库没有安全封装，属于本 crate 的
+// **底层系统调用例外**（与 `worker` / `server` 同一条纪律：unsafe 只出现在
+// 这里，且每一处都带 `SAFETY` 注释、只做参数合法的单次调用）。
+#![allow(unsafe_code)]
+
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -182,9 +191,280 @@ fn ensure_detected(events: &EventLog) {
     }
 }
 
+// ============================================================
+//  客户端自愈：确保 supervisor 在运行
+// ============================================================
+
+/// 拉起失败后的节流窗口
+///
+/// supervisor 若因环境问题起不来，界面每 3 秒轮询就会 spawn 一次 ——
+/// 那是进程风暴。30 秒内只允许一次尝试，用户仍可手动点「重试」。
+const SPAWN_THROTTLE: Duration = Duration::from_secs(30);
+
+/// 已有 supervisor 时等 socket 的上限（覆盖 worker 重启窗口）
+const WAIT_RUNNING: Duration = Duration::from_millis(1500);
+
+/// 刚拉起 supervisor 时等 socket 的上限（首次启动会先跑一次只读检测）
+const WAIT_STARTED: Duration = Duration::from_secs(5);
+
+/// 自愈结果（给客户端拼错误信息用）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnsureOutcome {
+    /// 已有 supervisor，socket 已就绪
+    AlreadyRunning,
+    /// 刚拉起，socket 已就绪
+    Started,
+    /// 进程在（或刚拉起），但 socket 还没出现
+    NotReady,
+    /// 节流窗口内已经尝试过拉起
+    Throttled,
+    /// 拉起失败（含原因）
+    Failed(String),
+}
+
+impl EnsureOutcome {
+    /// 给用户看的处置建议（会拼进命令错误信息）
+    pub fn hint(&self) -> String {
+        match self {
+            Self::AlreadyRunning | Self::Started => "后台进程已恢复".to_string(),
+            Self::NotReady => {
+                "后台进程正在启动（首次启动会先跑一次检测），请稍后点「重试」".to_string()
+            }
+            Self::Throttled => {
+                "后台进程未运行，30 秒内已尝试拉起过；请稍后重试，仍失败请重启设备".to_string()
+            }
+            Self::Failed(e) => format!("自动拉起后台进程失败（{e}），请重启设备"),
+        }
+    }
+}
+
+/// 客户端自愈：确认 supervisor 在运行，不在则拉起
+///
+/// # 为什么需要它（2026-10-26 真机：隔几天就打不开状态页）
+///
+/// 真机现象：WebUI 报「连接 worker 失败（`control.sock` 不存在）」，
+/// **必须重启手机**才能恢复，隔几天出现一次。
+///
+/// 根因：supervisor 是 worker 的**唯一拉起者**，而它自己只由
+/// `service.sh` 在开机时拉起一次 —— 一旦被系统回收，就再也没有人
+/// 拉起它（worker 也随之消失）。模块进程是 root，但 Android 仍会
+/// 在内存/省电压力下回收长期空闲的后台进程。
+///
+/// 本函数由客户端在**连接失败时**调用（见 `ipc::roundtrip`）：
+///
+/// | 探测结果 | 行为 |
+/// |---|---|
+/// | `supervisor.lock` 被占用 | 已有 supervisor ⇒ 只等 socket（覆盖 worker 重启窗口） |
+/// | 锁空闲 | 拉起一个（30 秒节流，失败不刷屏） |
+///
+/// ⚠️ **不写任何充电节点**（R1）：拉起后仍由 worker 决策；首次运行若
+/// 未检测，supervisor 会先跑一次**只读**快速检测（既有行为）。
+pub fn ensure_running() -> EnsureOutcome {
+    // 非 root 无法管理模块进程（数据目录 0700 / socket 0600），
+    // 硬拉只会得到一个立即失败的子进程。
+    // SAFETY: `geteuid` 无参数、无副作用，只读取当前进程的有效 UID。
+    if unsafe { libc::geteuid() } != 0 {
+        return EnsureOutcome::Failed("需要 root 权限才能拉起后台进程".to_string());
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return EnsureOutcome::Failed(format!("取当前可执行文件失败：{e}")),
+    };
+    // 数据目录不存在时先建出来（节流时间戳要写在这里；root 下无害）
+    std::fs::create_dir_all(crate::paths::data_dir()).ok();
+    ensure_running_at(
+        &crate::paths::supervisor_lock(),
+        &crate::paths::supervisor_spawn_stamp(),
+        &crate::paths::control_sock(),
+        &crate::paths::log_dir().join("daemon.out"),
+        &exe,
+    )
+}
+
+/// [`ensure_running`] 的可注入版本（测试用）
+fn ensure_running_at(
+    lock: &Path,
+    stamp: &Path,
+    sock: &Path,
+    log: &Path,
+    exe: &Path,
+) -> EnsureOutcome {
+    match probe_supervisor_lock(lock) {
+        LockProbe::Held => {
+            // 已有 supervisor：worker 可能正在重启，等它把 socket 建出来
+            if wait_socket(sock, WAIT_RUNNING) {
+                EnsureOutcome::AlreadyRunning
+            } else {
+                EnsureOutcome::NotReady
+            }
+        }
+        LockProbe::Free => {
+            if throttled(stamp, SPAWN_THROTTLE) {
+                return EnsureOutcome::Throttled;
+            }
+            // 先落时间戳再 spawn：spawn 失败也要被节流（否则会反复重试）
+            let _ = std::fs::write(stamp, crate::observability::now_unix().to_string());
+            if let Err(e) = spawn_supervisor(exe, log) {
+                return EnsureOutcome::Failed(format!("{e:#}"));
+            }
+            if wait_socket(sock, WAIT_STARTED) {
+                EnsureOutcome::Started
+            } else {
+                EnsureOutcome::NotReady
+            }
+        }
+        LockProbe::Error(e) => EnsureOutcome::Failed(format!("探测 supervisor 锁失败：{e}")),
+    }
+}
+
+/// `supervisor.lock` 的探测结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LockProbe {
+    /// 锁空闲 ⇒ 没有 supervisor 在跑
+    Free,
+    /// 锁被占用 ⇒ supervisor 在跑
+    Held,
+    /// 无法判断（权限/文件系统错误）
+    Error(String),
+}
+
+/// 用 `flock(LOCK_EX|LOCK_NB)` 探测锁是否被占用
+///
+/// ⚠️ 探测成功后**立即释放**：本函数只是"看一眼"，真正的持有者是
+/// `run()` 里的 [`crate::worker::InstanceLock`]。
+fn probe_supervisor_lock(path: &Path) -> LockProbe {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => return LockProbe::Error(e.to_string()),
+    };
+
+    // SAFETY: `as_raw_fd` 返回本进程持有的有效 fd；`flock` 只是设置/查询锁状态
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        // 拿到锁 ⇒ 没人持有 ⇒ 立即释放（不影响真正要启动的 supervisor）
+        // SAFETY: 同上，fd 有效
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+        LockProbe::Free
+    } else {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            LockProbe::Held
+        } else {
+            LockProbe::Error(e.to_string())
+        }
+    }
+}
+
+/// 节流窗口内是否已经尝试过拉起
+fn throttled(stamp: &Path, window: Duration) -> bool {
+    let Ok(meta) = std::fs::metadata(stamp) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    mtime.elapsed().map(|d| d < window).unwrap_or(false)
+}
+
+/// 等到控制 socket 出现（每 50 ms 查一次）
+fn wait_socket(sock: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if sock.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 脱离当前会话拉起 supervisor（`setsid` + 日志重定向到 `daemon.out`）
+///
+/// 必须 `setsid`：客户端的父进程是 KernelSU 的 `ksu.exec` 会话，
+/// 会话结束时不希望把 supervisor 一起带走（与 `service.sh` 的 `setsid` 一致）。
+fn spawn_supervisor(exe: &Path, log: &Path) -> Result<()> {
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("supervisor").stdin(Stdio::null());
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+    {
+        Ok(f) => match f.try_clone() {
+            Ok(f2) => {
+                cmd.stdout(f);
+                cmd.stderr(f2);
+            }
+            Err(_) => {
+                cmd.stdout(Stdio::null());
+                cmd.stderr(Stdio::null());
+            }
+        },
+        Err(_) => {
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
+    }
+
+    // SAFETY: 这段代码在 fork 后的子进程里执行（std 保证）；`setsid` 只创建新会话，
+    // 失败时立即返回错误、不会继续执行任何用户代码。
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    cmd.spawn()
+        .with_context(|| format!("拉起 supervisor 失败：{}", exe.display()))?;
+    Ok(())
+}
+
 /// 拉起并监督 worker
 pub fn run() -> Result<()> {
     crate::paths::ensure_dirs().context("初始化数据目录失败")?;
+
+    // ── 单实例：拿不到锁 ⇒ 已有 supervisor 在跑，本进程直接退出 ──
+    //
+    // # 为什么现在必须有（2026-10-26）
+    //
+    // 之前 supervisor 只由 `service.sh` 在开机拉起一次、**没有任何单实例
+    // 保护**。现在客户端会在连接失败时自愈拉起（见 [`ensure_running`]），
+    // 于是存在两条拉起路径（开机脚本 + 客户端）。若不加锁，极端时序下
+    // 会出现两个 supervisor 同时监督 worker：重复拉起、重复写安全值。
+    //
+    // `flock` 由内核保证独占；进程退出时自动释放（无需清理残留）。
+    let _instance = match crate::worker::InstanceLock::acquire(
+        &crate::paths::supervisor_lock(),
+        &crate::paths::supervisor_pidfile(),
+    ) {
+        Ok(lock) => lock,
+        Err(e) => {
+            log::info!("supervisor 已在运行，本进程退出（{e:#}）");
+            return Ok(());
+        }
+    };
 
     let events = EventLog::new(crate::paths::events_jsonl(), 512);
     let me = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("thermo"));
@@ -206,12 +486,6 @@ pub fn run() -> Result<()> {
     // 若检测放在 worker 之后，第一次运行的那一轮 worker 仍会以
     // "未检测"启动（零写入），要等下次重启才生效。
     ensure_detected(&events);
-
-    // 记录自己的 pid（供 uninstall.sh 停止）
-    if let Ok(mut f) = std::fs::File::create(crate::paths::supervisor_pidfile()) {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", std::process::id());
-    }
 
     let mut backoff_s = 0u64;
     let mut last_start = std::time::Instant::now();
@@ -538,4 +812,127 @@ fn spawn_worker(exe: &std::path::Path) -> Result<Child> {
         .arg("worker")
         .spawn()
         .with_context(|| format!("执行 {} worker 失败", exe.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// 每个测试一个独立临时目录（含 pid，CI 并行安全）
+    fn temp_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("thermo_sup_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn 拉起节流窗口生效() {
+        let dir = temp_dir("throttle");
+        let stamp = dir.join("supervisor.spawn");
+
+        assert!(
+            !throttled(&stamp, SPAWN_THROTTLE),
+            "没有时间戳 ⇒ 不节流（首次拉起必须放行）"
+        );
+
+        std::fs::write(&stamp, "1").unwrap();
+        assert!(
+            throttled(&stamp, SPAWN_THROTTLE),
+            "刚写过 ⇒ 30 秒内不得重复拉起"
+        );
+        assert!(
+            !throttled(&stamp, Duration::ZERO),
+            "窗口为 0 ⇒ 永不节流（用于测试/诊断）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 锁探测必须区分「有人在跑」与「没人跑」——
+    /// 这是自愈是否会重复拉起 supervisor 的唯一判据。
+    #[test]
+    fn 探测supervisor单实例锁() {
+        let dir = temp_dir("lockprobe");
+        let lock = dir.join("supervisor.lock");
+        let pid = dir.join("supervisor.pid");
+
+        assert_eq!(
+            probe_supervisor_lock(&lock),
+            LockProbe::Free,
+            "没有进程持锁 ⇒ Free"
+        );
+
+        let held = crate::worker::InstanceLock::acquire(&lock, &pid).expect("应能拿到锁");
+        assert_eq!(
+            probe_supervisor_lock(&lock),
+            LockProbe::Held,
+            "已有 supervisor 持锁 ⇒ Held（客户端不得重复拉起）"
+        );
+
+        drop(held);
+        assert_eq!(
+            probe_supervisor_lock(&lock),
+            LockProbe::Free,
+            "持锁进程退出后 ⇒ 恢复 Free"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 拉起失败也必须被节流：否则界面每 3 秒轮询就会 spawn 一次
+    #[test]
+    fn 拉起失败后不重复刷屏() {
+        let dir = temp_dir("spawnfail");
+        let lock = dir.join("supervisor.lock");
+        let stamp = dir.join("supervisor.spawn");
+        let sock = dir.join("control.sock");
+        let log = dir.join("daemon.out");
+        let missing_exe = dir.join("no_such_thermo");
+
+        let first = ensure_running_at(&lock, &stamp, &sock, &log, &missing_exe);
+        assert!(
+            matches!(first, EnsureOutcome::Failed(_)),
+            "拉起不存在的程序应失败，实得 {first:?}"
+        );
+        assert!(
+            first.hint().contains("重启设备"),
+            "失败提示必须告诉用户该做什么：{}",
+            first.hint()
+        );
+
+        let second = ensure_running_at(&lock, &stamp, &sock, &log, &missing_exe);
+        assert_eq!(
+            second,
+            EnsureOutcome::Throttled,
+            "失败后 30 秒内不得重复拉起"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// socket 未出现时必须超时返回 false，不能永久挂住客户端
+    #[test]
+    fn 等待socket超时() {
+        let dir = temp_dir("waitsock");
+        let sock = dir.join("control.sock");
+
+        let t = Instant::now();
+        assert!(!wait_socket(&sock, Duration::from_millis(120)));
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "等待必须有上限（客户端不能被拖死）"
+        );
+
+        std::fs::write(&sock, "").unwrap();
+        assert!(
+            wait_socket(&sock, Duration::from_millis(120)),
+            "socket 存在 ⇒ 立即返回 true"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

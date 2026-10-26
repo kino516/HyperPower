@@ -244,7 +244,7 @@ const chargerCellLabel = computed(() => {
         {{ sysState.lastError ?? "模块后台没有响应。" }}
       </MiuixText>
       <MiuixText type="footnote1" color="var(--m-color-on-error-container)">
-        常见原因：模块刚启动还没就绪（等几秒重试）、或模块未启用（重启后生效）。
+        后台进程可能已被系统回收。点「重试」会自动拉起后台进程；若仍失败，请重启设备。
       </MiuixText>
       <div class="retry">
         <MiuixButton :disabled="sysState.loading" @click="onRetry">

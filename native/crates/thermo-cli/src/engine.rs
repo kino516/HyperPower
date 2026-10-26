@@ -23,6 +23,7 @@ use thermo_core::config::CURR_MAX_UA;
 use thermo_core::{Decision, Reason, Sample, State};
 
 use crate::config_store::ConfigStore;
+use crate::night::{NightAction, NightState};
 use crate::observability::{kind, EventLog, SnapshotWriter};
 use crate::sysfs::{GearTable, Nodes, WriteOutcome};
 
@@ -226,6 +227,15 @@ pub struct Engine {
     /// （例如重启后 sepolicy 生效）新的警告文案自然不同（含路径/原因），
     /// 不影响下次诊断。
     pub reported_warnings: std::collections::BTreeSet<String>,
+    /// 夜间模式状态（跨重启恢复「进入前的模式」）
+    pub night: NightState,
+    /// 夜间状态文件路径（`night.json`）
+    pub night_path: std::path::PathBuf,
+    /// 测试用：注入"一天中的分钟数"
+    ///
+    /// 单测不能依赖真实时钟（否则只有恰好在窗口内跑才通过），因此留这个钩子；
+    /// **生产路径永远是 `None`**（用系统本地时间）。
+    pub night_clock: Option<u32>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -267,6 +277,10 @@ pub struct EngineInit {
     pub history_path: std::path::PathBuf,
     /// 充电历史草稿文件的路径
     pub history_draft_path: std::path::PathBuf,
+    /// 夜间模式状态文件（`night.json`）
+    ///
+    /// 与 history 路径一样从外面传入 —— 测试可指向假节点树内的临时文件。
+    pub night_state_path: std::path::PathBuf,
     /// 启动时刻（单调秒）
     pub now_s: i64,
 }
@@ -315,6 +329,11 @@ impl Engine {
             last_charging: false,
             soc_hold_active: false,
             reported_warnings: std::collections::BTreeSet::new(),
+            // 夜间状态从磁盘恢复：worker 在夜间窗口内重启时仍能记住
+            // 「进入前是什么模式」，从而在窗口结束时正确恢复。
+            night: crate::night::load(&init.night_state_path),
+            night_path: init.night_state_path,
+            night_clock: None,
         }
     }
 
@@ -435,6 +454,12 @@ impl Engine {
         //    写入器是进程内的静态状态，CLI 开了 worker 也看不见。
         //    worker 是唯一的写者 ⇒ 它自己按配置决定记不记。
         self.sync_debug_mode();
+
+        // ①-c 夜间模式：到点切换 / 时段结束恢复
+        //
+        // ⚠️ 必须在采样与决策**之前**：切换会改变 `self.cfg`，
+        //    本拍必须用切换后的配置决策（否则会晚一拍生效）。
+        self.tick_night(now_s);
 
         // ② 采样
         let outcome = self.sample();
@@ -847,6 +872,13 @@ impl Engine {
         // ① 控制通道 —— 这是轻拍的**唯一目的**
         rep.commands = self.poll_server(now_s);
 
+        // ①-b 夜间模式：未充电时打开界面（轻拍）也要到点切换
+        //
+        // 为什么不能只在全拍里查：夜里没插充电器、用户打开 WebUI 时走的是
+        // 轻拍；若这里不查，就要等到插电才切换 —— 与"到点自动切换"的直觉不符。
+        // 深度休眠（无客户端）仍然不唤醒：不控制充电时切换没有意义。
+        self.tick_night(now_s);
+
         // ② 把事件推给 `watch` 订阅者
         //
         // 客户端可能正连着 `watch`（日志页），别让事件卡在缓冲里。
@@ -857,6 +889,95 @@ impl Engine {
         // `ticks` 的语义是"跑了多少拍控制逻辑"。轻拍没有跑控制逻辑，
         // 若也计数，界面上的"累计 N 拍"会被客户端的轮询灌水。
         rep
+    }
+
+    /// 夜间模式调度：每拍（全拍 + 轻拍）检查一次
+    ///
+    /// # 语义（详见 [`crate::night`]）
+    ///
+    /// | 时刻 | 行为 |
+    /// |---|---|
+    /// | 进入时段 | 记住当前模式 → 切到 `night.mode` |
+    /// | 离开时段 | 切回进入前的模式 |
+    /// | 时段内用户手动切换 | 尊重用户：本次不再自动恢复（记 `user_override`） |
+    /// | 进入时已在目标模式 | 不切换；离开也不恢复 |
+    /// | 跨午夜（22:00~07:00） | 支持 |
+    ///
+    /// 状态变化时写 `night.json`（跨 worker 重启恢复）。切换失败时回滚状态、
+    /// 本时段不再重试（避免每拍刷事件），并**只记一次**事件。
+    fn tick_night(&mut self, now_s: i64) {
+        let now_min = self
+            .night_clock
+            .unwrap_or_else(|| crate::night::local_minutes(now_s));
+
+        let in_win = self.cfg.get_bool("night.enabled")
+            && crate::night::parse_hhmm(self.cfg.get_str("night.start"))
+                .zip(crate::night::parse_hhmm(self.cfg.get_str("night.end")))
+                .is_some_and(|(s, e)| crate::night::in_window(now_min, s, e));
+
+        let target = self.cfg.get_str("night.mode").to_string();
+        let current = self.cfg.current_mode().to_string();
+
+        let before = self.night.clone();
+        let action = crate::night::transition(&mut self.night, in_win, &target, &current);
+
+        match action {
+            NightAction::Enter => self.apply_night_mode(&target, "夜间模式开始"),
+            NightAction::Leave(mode) => self.apply_night_mode(&mode, "夜间模式结束"),
+            NightAction::Override => {
+                self.events.emit(
+                    kind::CONFIG,
+                    "夜间模式：检测到手动切换，本次时段不再自动恢复",
+                    json!({ "night": true, "current": current, "target": target }),
+                );
+            }
+            NightAction::EnterAlready | NightAction::LeaveNoop | NightAction::None => {}
+        }
+
+        if before != self.night {
+            if let Err(e) = crate::night::save(&self.night_path, &self.night) {
+                // 保存失败只影响"跨重启恢复"，不影响本次切换 —— 记日志即可
+                log::warn!("夜间状态保存失败（本次切换仍生效）：{e}");
+            }
+        }
+    }
+
+    /// 执行一次夜间模式切换（成功 / 失败都留痕）
+    fn apply_night_mode(&mut self, target: &str, why: &str) {
+        let from = self.cfg.current_mode().to_string();
+        match self.cfg.switch_mode(target) {
+            Ok((_from, to)) => {
+                let to_label = crate::config_store::mode_label(&to);
+                let from_label = crate::config_store::mode_label(&from);
+                if let Err(e) = self.cfg.save() {
+                    self.events.emit(
+                        kind::CONFIG,
+                        &format!("{why}：已切到「{to_label}」，但保存失败：{e:#}"),
+                        json!({ "night": true, "from": from, "to": to, "persisted": false }),
+                    );
+                } else {
+                    self.events.emit(
+                        kind::CONFIG,
+                        &format!("{why}：{from_label} → {to_label}"),
+                        json!({ "night": true, "from": from, "to": to, "persisted": true }),
+                    );
+                }
+            }
+            Err(e) => {
+                // 切换失败（配置非法等）：回滚状态，本时段不再重复尝试。
+                // 只在第一次失败时记事件 —— 否则每拍一条，事件流会被刷满。
+                self.night.active = false;
+                self.night.applied = false;
+                self.night.prev_mode = None;
+                self.night.user_override = false;
+
+                let msg = format!("{why}切换失败：{e}");
+                if self.reported_warnings.insert(msg.clone()) {
+                    self.events
+                        .emit(kind::CONFIG, &msg, json!({ "night": true, "fatal": false }));
+                }
+            }
+        }
     }
 
     /// 上一次采样时的充电状态（缓存值，见字段文档）
@@ -1985,6 +2106,7 @@ mod tests {
             snapshot,
             history_path: fake.path("history.json"),
             history_draft_path: fake.path("history.current.jsonl"),
+            night_state_path: fake.path("night.json"),
             now_s: 1000,
         })
     }
@@ -2747,6 +2869,7 @@ mod tests {
                 snapshot,
                 history_path: fake.path("history.json"),
                 history_draft_path: fake.path("history.current.jsonl"),
+                night_state_path: fake.path("night.json"),
                 now_s: 2000,
             });
 
@@ -3514,6 +3637,144 @@ mod tests {
             assert!(
                 slot.consecutive_failures() > 0,
                 "卡死必须被计为失败，让它最终熔断停用"
+            );
+        });
+    }
+
+    // ────────────────────────────────────────────────────────────
+    //  夜间模式（2026-10-26）
+    // ────────────────────────────────────────────────────────────
+
+    /// 用测试时钟构造一个已开启夜间模式的引擎
+    ///
+    /// `now_min` 是"一天中的分钟数"，由 `night_clock` 注入 ——
+    /// 否则测试只有在真实时钟恰好落在窗口内才会通过。
+    fn engine_with_night(fake: &FakeSysfs, now_min: u32) -> Engine {
+        let mut engine = engine_on(fake);
+        engine.cfg.set("night.enabled", "true").unwrap();
+        engine.cfg.set("night.start", "22:00").unwrap();
+        engine.cfg.set("night.end", "07:00").unwrap();
+        engine.cfg.set("night.mode", "conservative").unwrap();
+        engine.night_clock = Some(now_min);
+        engine
+    }
+
+    #[test]
+    fn 端到端_夜间模式到点切换并在结束后恢复() {
+        let fake = FakeSysfs::new("night_basic");
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_with_night(&fake, 22 * 60);
+            assert_eq!(engine.cfg.current_mode(), "custom", "初始为自定义");
+
+            // 22:00 进入窗口 → 切保守
+            engine.step(1000);
+            assert_eq!(
+                engine.cfg.current_mode(),
+                "conservative",
+                "到点应自动切到夜间模式"
+            );
+
+            // 03:00 仍在窗口内 → 不重复切换
+            engine.night_clock = Some(3 * 60);
+            engine.step(1001);
+            assert_eq!(engine.cfg.current_mode(), "conservative");
+
+            // 07:00 离开窗口 → 恢复进入前的「自定义」
+            engine.night_clock = Some(7 * 60);
+            engine.step(1002);
+            assert_eq!(
+                engine.cfg.current_mode(),
+                "custom",
+                "时段结束应恢复到进入前的模式"
+            );
+
+            // 事件流里应能看出发生了什么
+            let events = std::fs::read_to_string(fake.path("events.jsonl")).unwrap_or_default();
+            assert!(
+                events.contains("夜间模式开始") && events.contains("夜间模式结束"),
+                "事件流应记录夜间模式的进入与退出：\n{events}"
+            );
+        });
+    }
+
+    /// 轻拍（未充电 + 有客户端）也要到点切换 ——
+    /// 否则夜里打开界面会看不到模式变化，直到插电。
+    #[test]
+    fn 端到端_夜间模式在轻拍里也生效() {
+        let fake = FakeSysfs::new("night_light");
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_with_night(&fake, 23 * 60);
+            engine.light_step(1000);
+            assert_eq!(
+                engine.cfg.current_mode(),
+                "conservative",
+                "轻拍也应检查夜间窗口"
+            );
+        });
+    }
+
+    /// 窗口内用户手动切换：尊重用户，本时段不再自动恢复
+    #[test]
+    fn 端到端_夜间模式内手动切换后不再自动恢复() {
+        let fake = FakeSysfs::new("night_override");
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_with_night(&fake, 23 * 60);
+
+            engine.step(1000);
+            assert_eq!(engine.cfg.current_mode(), "conservative");
+
+            // 模拟用户在窗口内手动切到极速（命令面走 `switch_mode`）
+            engine.cfg.switch_mode("turbo").unwrap();
+            engine.night_clock = Some(23 * 60 + 1);
+            engine.step(1001);
+            assert_eq!(
+                engine.cfg.current_mode(),
+                "turbo",
+                "不得把用户手动切换覆盖回夜间模式"
+            );
+
+            // 07:00 离开窗口：保持用户选择的极速（不恢复）
+            engine.night_clock = Some(7 * 60);
+            engine.step(1002);
+            assert_eq!(
+                engine.cfg.current_mode(),
+                "turbo",
+                "用户覆盖过 ⇒ 时段结束也不得改回"
+            );
+
+            let events = std::fs::read_to_string(fake.path("events.jsonl")).unwrap_or_default();
+            assert!(
+                events.contains("手动切换"),
+                "应记录一次「检测到手动切换」：\n{events}"
+            );
+        });
+    }
+
+    /// 进出窗口只写一次 `night.json` 状态；跨重启等价于重新加载
+    #[test]
+    fn 端到端_夜间状态可跨重启恢复() {
+        let fake = FakeSysfs::new("night_restart");
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_with_night(&fake, 23 * 60);
+            engine.step(1000);
+            assert_eq!(engine.cfg.current_mode(), "conservative");
+
+            let raw = std::fs::read_to_string(fake.path("night.json")).unwrap_or_default();
+            assert!(
+                raw.contains("\"active\": true") && !raw.contains("turbo"),
+                "应保存 active 状态：{raw}"
+            );
+            assert!(raw.contains("\"prev_mode\""), "应保存进入前的模式：{raw}");
+
+            // 重启：同一份配置 + 同一份 night.json
+            let mut restarted = engine_with_night(&fake, 23 * 60);
+            assert!(restarted.night.active, "重启后应恢复 active 状态");
+            restarted.night_clock = Some(8 * 60); // 已离开窗口
+            restarted.step(2000);
+            assert_eq!(
+                restarted.cfg.current_mode(),
+                "custom",
+                "重启后离开窗口仍应恢复进入前的模式"
             );
         });
     }

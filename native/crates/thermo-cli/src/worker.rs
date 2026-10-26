@@ -179,8 +179,9 @@ impl InstanceLock {
         // LOCK_EX | LOCK_NB：独占且不等待
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
+            // 文案保持中性：supervisor 也复用本类型（见 `supervisor::run`）
             anyhow::bail!(
-                "已有 worker 在运行（{} 被占用）—— 单实例保护",
+                "已有同类进程在运行（{} 被占用）—— 单实例保护",
                 lock_path.display()
             );
         }
@@ -451,6 +452,7 @@ pub fn run() -> Result<()> {
         snapshot,
         history_path: crate::paths::history_json(),
         history_draft_path: crate::paths::history_draft_jsonl(),
+        night_state_path: crate::paths::night_json(),
         now_s: crate::observability::now_unix(),
     });
 

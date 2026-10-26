@@ -80,5 +80,11 @@
   "debug": {
     "enabled": false,
     "max_mb": 20
+  },
+  "night": {
+    "enabled": false,
+    "start": "22:00",
+    "end": "07:00",
+    "mode": "conservative"
   }
 }

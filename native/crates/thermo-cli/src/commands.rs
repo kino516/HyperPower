@@ -2497,4 +2497,20 @@ mod tests {
             "光写文件名不够 —— 要说明「清了会停止控制充电」这个后果：{kept}"
         );
     }
+
+    /// `get --section night` 必须返回完整的夜间配置（界面靠它渲染卡片）
+    #[test]
+    fn 夜间配置分区可读且包含四个字段() {
+        let (ctx, _c, _p, _n, _a) = ctx_with(ConfigStore::with_defaults("x.json"));
+        let (resp, _) = dispatch(&ctx, "get", &json!(["--section", "night"]), false);
+        match resp {
+            Response::Ok { data: Some(d), .. } => {
+                assert_eq!(d["enabled"], false, "出厂默认关闭");
+                assert_eq!(d["start"], "22:00");
+                assert_eq!(d["end"], "07:00");
+                assert_eq!(d["mode"], "conservative");
+            }
+            other => panic!("get --section night 应返回数据，实际：{other:?}"),
+        }
+    }
 }

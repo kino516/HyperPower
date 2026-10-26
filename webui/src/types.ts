@@ -390,6 +390,23 @@ export interface ControlSection {
   target_power_w: number;
 }
 
+/**
+ * `get --section night` —— 夜间模式（模式调度）
+ *
+ * 语义：到点自动切换到 `mode`；时段结束恢复到进入前的模式。
+ * 时段内用户手动切换模式后，本次时段不再自动恢复。
+ */
+export interface NightSection {
+  /** 夜间模式总开关 */
+  enabled: boolean;
+  /** 开始时间 `HH:MM`（本地时间） */
+  start: string;
+  /** 结束时间 `HH:MM`（早于开始表示跨午夜） */
+  end: string;
+  /** 目标模式 id（conservative / official / turbo / custom） */
+  mode: string;
+}
+
 /** 曲线的一段 */
 export interface CurvePoint {
   /** 该段允许的最大电流（μA） */

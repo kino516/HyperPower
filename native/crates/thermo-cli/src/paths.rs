@@ -126,6 +126,38 @@ pub fn supervisor_pidfile() -> PathBuf {
     data_dir().join("supervisor.pid")
 }
 
+/// supervisor 的单实例锁（`flock` 目标）
+///
+/// # 为什么需要它（2026-10-26 真机：隔几天连不上 worker）
+///
+/// supervisor 原先**没有任何单实例保护**：它由 `service.sh` 在开机时拉起，
+/// 一旦进程被系统回收，就再也没人拉起它 —— 用户只能重启手机。
+///
+/// 现在客户端（WebUI / `ctl`）在连接失败时会自愈拉起 supervisor，
+/// 因此必须有这把锁，保证「客户端拉起」与「开机拉起」不会同时跑两个
+/// supervisor（那会导致重复拉起 worker、重复写安全值）。
+pub fn supervisor_lock() -> PathBuf {
+    data_dir().join("supervisor.lock")
+}
+
+/// 自愈拉起的时间戳（节流用，内容为 Unix 秒）
+///
+/// 防止"supervisor 起不来"时每次界面轮询都 spawn 一次（进程风暴）。
+pub fn supervisor_spawn_stamp() -> PathBuf {
+    data_dir().join("supervisor.spawn")
+}
+
+/// 夜间模式状态（**运行时状态**，不是配置）
+///
+/// 记录"是否已进窗、进入前的模式、是否被用户手动覆盖"，
+/// 用于 worker 重启后仍能把模式恢复回去。见 [`crate::night`]。
+///
+/// ⚠️ 它不在 [`crate::config_store::KEYS`] 里：这是调度器的**瞬时状态**，
+///    不是用户意图。放进 `config.json` 会让"清空配置"把恢复线索也丢掉。
+pub fn night_json() -> PathBuf {
+    data_dir().join("night.json")
+}
+
 /// 日志目录
 pub fn log_dir() -> PathBuf {
     data_dir().join("logs")

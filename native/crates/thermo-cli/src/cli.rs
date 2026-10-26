@@ -1894,8 +1894,9 @@ fn device_show() -> Result<()> {
 ///
 /// # 为什么走外部 `kill` 命令而不是 `libc::kill`
 ///
-/// 本 crate 的 `#![deny(unsafe_code)]` **只对 `worker` / `server` 开例外**
-/// （它们的 `timerfd` / `poll` / `getsockopt` 在标准库中没有安全封装）。
+/// 本 crate 的 `#![deny(unsafe_code)]` **只对 `worker` / `server` /
+/// `supervisor` 开例外**（它们的 `timerfd` / `poll` / `getsockopt` /
+/// `flock` / `setsid` 在标准库中没有安全封装）。
 /// 检测功能不属于例外范围，因此不能直接调 `libc::kill`。
 ///
 /// 调 `kill(1)` 命令同样可靠（本模块运行在 root 且有完整 busybox/toybox 环境），

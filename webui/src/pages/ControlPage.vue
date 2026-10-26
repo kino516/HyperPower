@@ -71,6 +71,7 @@ import { refresh, sysState } from "../stores/sys";
 import type {
   AddonStatus,
   ModeInfo,
+  NightSection,
   PpsDetail,
   SocLimitDetail,
   ThermalSection,
@@ -266,16 +267,20 @@ async function load(): Promise<void> {
   const deviceP = api.fetchDeviceCached().catch(() => null);
   // PPS 是**非关键路径**：它读不到不该让整页报错（老版本后端没有这个功能）
   const ppsP = api.fetchPps().catch(() => null);
+  // 夜间模式同理：老版本后端没有 `night` 分区
+  const nightP = api.fetchNight().catch(() => null);
   try {
-    const [modeList, thermalData, hw, addon, range, dev, pps] = await Promise.all([
-      api.fetchModes(),
-      api.fetchThermal(),
-      api.fetchHardwareMaxTemp(),
-      api.fetchLimit(),
-      api.fetchSocRange(),
-      deviceP,
-      ppsP,
-    ]);
+    const [modeList, thermalData, hw, addon, range, dev, pps, nightCfg] =
+      await Promise.all([
+        api.fetchModes(),
+        api.fetchThermal(),
+        api.fetchHardwareMaxTemp(),
+        api.fetchLimit(),
+        api.fetchSocRange(),
+        deviceP,
+        ppsP,
+        nightP,
+      ]);
 
     modes.value = modeList.modes;
     currentMode.value = modeList.current;
@@ -284,6 +289,13 @@ async function load(): Promise<void> {
     limitInfo.value = addon;
     socRange.value = range;
     ppsInfo.value = pps;
+
+    // 夜间配置：`null` = 后端版本较老（卡片会显示降级提示）
+    if (nightCfg !== null) {
+      syncNightForm(nightCfg);
+    } else {
+      night.value = null;
+    }
 
     // 顺带同步 `forge_broadcast` 的真实值（不阻塞首屏）
     if (pps !== null) {
@@ -890,6 +902,110 @@ async function loadPps(): Promise<void> {
   await loadPpsForgeOnly();
 }
 
+// ── 卡片 6：夜间模式（2026-10-26） ──
+//
+// 语义：到点自动切换充电模式，时段结束恢复到进入前的模式。
+// 只在"全拍 + 轻拍"检查；深度休眠时不会为了切换而唤醒（省电）。
+const night = ref<NightSection | null>(null);
+const nightEnabled = ref(false);
+const nightStart = ref("22:00");
+const nightEnd = ref("07:00");
+const nightMode = ref("conservative");
+const nightBusy = ref(false);
+
+/** 把后端读到的夜间配置同步到表单 */
+function syncNightForm(cfg: NightSection): void {
+  night.value = cfg;
+  nightEnabled.value = cfg.enabled;
+  nightStart.value = cfg.start;
+  nightEnd.value = cfg.end;
+  nightMode.value = cfg.mode;
+}
+
+/** 模式中文名（找不到就给 id，宁可不显示空） */
+function modeLabel(id: string): string {
+  return modes.value.find((m) => m.id === id)?.label ?? id;
+}
+
+/**
+ * 读夜间配置
+ *
+ * ⚠️ 非关键路径：老版本后端没有 `night` 分区（`get --section night`
+ *    会报未知分区），这里吞掉错误并让卡片显示降级提示，不拖垮整页。
+ */
+async function loadNight(): Promise<void> {
+  try {
+    syncNightForm(await api.fetchNight());
+  } catch {
+    night.value = null;
+  }
+}
+
+/**
+ * 提交一个夜间配置键
+ *
+ * 失败时回读真实值（避免界面显示一个没存进去的时间/模式）。
+ */
+async function submitNight(pair: [string, string]): Promise<boolean> {
+  if (nightBusy.value) {
+    return false;
+  }
+  nightBusy.value = true;
+  try {
+    await api.setConfig([pair]);
+    await wait(SETTLE_MS);
+    await loadNight();
+    return true;
+  } catch (e) {
+    fail(e);
+    await loadNight();
+    return false;
+  } finally {
+    nightBusy.value = false;
+  }
+}
+
+/** 开启 / 关闭夜间模式 */
+async function onToggleNight(v: boolean): Promise<void> {
+  const prev = nightEnabled.value;
+  nightEnabled.value = v; // 立刻跟手
+  if (!(await submitNight(["night.enabled", v ? "true" : "false"]))) {
+    nightEnabled.value = prev;
+    return;
+  }
+  if (v) {
+    void showSnackbar({
+      message: `夜间模式已开启：${nightStart.value} ~ ${nightEnd.value}`,
+      duration: "long",
+    });
+  }
+}
+
+/** 改开始 / 结束时间（`<input type="time">` 的 change 事件） */
+async function onNightTime(which: "start" | "end", e: Event): Promise<void> {
+  const el = e.target as HTMLInputElement;
+  const v = el.value;
+  if (!v) {
+    // 清空输入框不提交（后端的 Time 键拒绝空值），恢复显示当前生效值
+    el.value = which === "start" ? nightStart.value : nightEnd.value;
+    return;
+  }
+  const key = which === "start" ? "night.start" : "night.end";
+  if (!(await submitNight([key, v]))) {
+    el.value = which === "start" ? nightStart.value : nightEnd.value;
+  }
+}
+
+/** 改时段内使用的模式 */
+async function onNightMode(id: string): Promise<void> {
+  if (id === nightMode.value) {
+    return;
+  }
+  if (await submitNight(["night.mode", id])) {
+    void showSnackbar({ message: `夜间目标模式：${modeLabel(id)}`, duration: "short" });
+  }
+}
+
 /** 提交目标电量 */
 async function applySoc(): Promise<void> {
   if (pendingSoc.value === null || busy.value) {
@@ -985,6 +1101,106 @@ async function applySoc(): Promise<void> {
       <!-- 当前模式的后果说明；「官方」那一项写得最细 -->
       <div v-if="currentNote" class="notice">
         <MiuixText type="footnote1">{{ currentNote }}</MiuixText>
+      </div>
+    </MiuixCard>
+
+    <!-- ── 卡片 6：夜间模式（模式调度，2026-10-26） ── -->
+    <MiuixSmallTitle text="夜间模式" />
+    <MiuixCard v-if="night === null">
+      <MiuixText
+        type="footnote1"
+        color="var(--m-color-on-surface-secondary)"
+        class="hint"
+      >
+        读不到夜间模式配置（后端版本较老）。可用命令行确认：
+        <code>ctl get --section night</code>
+      </MiuixText>
+    </MiuixCard>
+    <MiuixCard v-else>
+      <MiuixText
+        type="footnote1"
+        color="var(--m-color-on-surface-secondary)"
+        class="lead"
+      >
+        在设定的时段内自动切换到指定模式，时段结束后恢复到进入前的模式。
+        时段内手动切换模式后，本次时段不再自动恢复。
+      </MiuixText>
+
+      <!-- 总开关 -->
+      <div class="row">
+        <div class="row__text">
+          <MiuixText type="body1">启用</MiuixText>
+          <MiuixText type="footnote1" color="var(--m-color-on-surface-secondary)">
+            到达开始时间后自动切换
+          </MiuixText>
+        </div>
+        <MiuixSwitch
+          :model-value="nightEnabled"
+          :disabled="loading || nightBusy"
+          @update:model-value="onToggleNight"
+        />
+      </div>
+
+      <MiuixDivider class="gap" />
+
+      <!-- 时段 -->
+      <div class="field">
+        <div class="field__head">
+          <div class="field__text">
+            <MiuixText type="body1">时段</MiuixText>
+            <MiuixText type="footnote1" color="var(--m-color-on-surface-secondary)">
+              本地时间；结束早于开始表示跨午夜（如 22:00 ~ 07:00）
+            </MiuixText>
+          </div>
+        </div>
+        <div class="night-times">
+          <input
+            class="night-time"
+            type="time"
+            :value="nightStart"
+            :disabled="loading || nightBusy"
+            aria-label="夜间模式开始时间"
+            @change="onNightTime('start', $event)"
+          />
+          <MiuixText type="body2" color="var(--m-color-on-surface-secondary)">
+            至
+          </MiuixText>
+          <input
+            class="night-time"
+            type="time"
+            :value="nightEnd"
+            :disabled="loading || nightBusy"
+            aria-label="夜间模式结束时间"
+            @change="onNightTime('end', $event)"
+          />
+        </div>
+      </div>
+
+      <MiuixDivider class="gap" />
+
+      <!-- 目标模式 -->
+      <div class="field">
+        <div class="field__head">
+          <div class="field__text">
+            <MiuixText type="body1">时段内使用</MiuixText>
+            <MiuixText type="footnote1" color="var(--m-color-on-surface-secondary)">
+              到点后自动切到该模式
+            </MiuixText>
+          </div>
+        </div>
+        <div class="chips">
+          <button
+            v-for="m in modes"
+            :key="`night-${m.id}`"
+            type="button"
+            class="chip chip--pick"
+            :class="{ 'chip--on': nightMode === m.id }"
+            :disabled="loading || nightBusy"
+            @click="onNightMode(m.id)"
+          >
+            {{ m.label }}
+          </button>
+        </div>
       </div>
     </MiuixCard>
 
@@ -1857,6 +2073,36 @@ async function applySoc(): Promise<void> {
 }
 
 .chip--pick:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* ── 夜间模式：时间选择器 ── */
+
+.night-times {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0 10px;
+}
+
+/*
+ * 用系统原生 `<input type="time">`，不自造时间选择器：
+ * Android WebView 会调起系统时间选择器，省一套组件与无障碍适配。
+ */
+.night-time {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--m-color-outline);
+  background: var(--m-color-surface-container-high);
+  color: var(--m-color-on-surface);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.night-time:disabled {
   cursor: not-allowed;
   opacity: 0.5;
 }

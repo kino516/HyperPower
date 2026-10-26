@@ -56,6 +56,8 @@ pub const SECTIONS: &[&str] = &[
     "history",
     // 调试模式（排障用；界面在「反馈问题」里查它的开关与上限）
     "debug",
+    // 夜间模式（模式调度；`get --section night` 供界面读取开关/时段/目标模式）
+    "night",
 ];
 
 // ============================================================
@@ -83,6 +85,11 @@ pub enum KeyKind {
     },
     /// 枚举（候选值）
     Enum(&'static [&'static str]),
+    /// 时间 `HH:MM`（本地时间，00:00 ~ 23:59）
+    ///
+    /// 写入时校验格式并**规范化**成两位（`7:05` → `07:05`），
+    /// 避免同一时刻在配置里出现多种写法。
+    Time,
     /// 数组（**只读**，不参与标量读写）
     Array,
 }
@@ -436,6 +443,17 @@ pub const KEYS: &[KeySpec] = &[
             max: crate::debug_log::MAX_MAX_MB as i64,
         },
     ),
+    // ── §12 夜间模式分区（4，**模式调度**，不参与单拍决策）──
+    //
+    // 见 `crate::night`：到点自动切换**充电模式**，结束后恢复。
+    //
+    // ⚠️ 它是**全局**分区（不在 `MODE_SCOPED_SECTIONS` 里）——
+    //    否则"切到夜间模式"会把夜间配置本身也换掉，逻辑自指。
+    spec("night.enabled", KeyKind::Bool),
+    spec("night.start", KeyKind::Time),
+    spec("night.end", KeyKind::Time),
+    // 目标模式复用四套模式 id（与 `mode` 键同一组候选）
+    spec("night.mode", KeyKind::Enum(MODES)),
 ];
 
 /// 按点号键查规格
@@ -569,6 +587,16 @@ pub fn default_config() -> Value {
         "debug": {
             "enabled": false,
             "max_mb": crate::debug_log::DEFAULT_MAX_MB
+        },
+        // 夜间模式（到点自动切换充电模式，结束后恢复）
+        //
+        // ⚠️ 出厂**关闭**：用户没有明确要求时，不应自己改变充电模式。
+        //    默认时段 22:00 ~ 07:00、目标「保守」—— 夜间慢充最安全。
+        "night": {
+            "enabled": false,
+            "start": "22:00",
+            "end": "07:00",
+            "mode": "conservative"
         },
     })
 }
@@ -1478,6 +1506,17 @@ fn coerce(spec: &KeySpec, raw: &str) -> Result<Value, ConfigError> {
                 )))
             }
         }
+        KeyKind::Time => {
+            // 规范化成 HH:MM：`7:05` 与 `07:05` 是同一种时刻，
+            // 存两种写法会让"字符串比较"出错（例如界面回显与配置不一致）。
+            let min = crate::night::parse_hhmm(raw).ok_or_else(|| {
+                type_err(format!(
+                    "{} 需要 HH:MM 格式的时间（00:00 ~ 23:59），实得 {raw:?}",
+                    spec.key
+                ))
+            })?;
+            Ok(json!(crate::night::format_hhmm(min)))
+        }
         KeyKind::Array => Err(ConfigError {
             code: ErrorCode::Readonly,
             msg: format!("{} 是数组类型，不支持标量写入", spec.key),
@@ -1549,24 +1588,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 键总数为五十一() {
-        // 43 = 40（原 41，移除重复的 `device.power_limit_w`）+ 3（充电历史分区）
+    fn 键总数为五十五() {
+        // 51 = 移除 device.power_limit_w、加入充电历史（+3）、调试模式（+2）
+        //      与 PPS 解锁（+6）后的基线。
         //
-        // 移除理由见 KEYS 里的注释：它与 `control.target_power_w`
-        // 语义完全重复，且曾导致"界面显示的值 ≠ 实际生效的值"。
-        //
-        // 新增的 3 个见 §10：`history.enabled` / `history.keep` / `history.sample_s`。
-        //
-        // +2（2026-10-17）见 §11：`debug.enabled` / `debug.max_mb` —— 调试模式。
-        //
-        // +6（2026-10-20）见 §8.5：`pps.*` —— PPS 解锁（独立分区，
-        //    与 `limit.*` 完全隔离，写坏一个不影响另一个）。
-        assert_eq!(
-            key_count(),
-            51,
-            "移除 device.power_limit_w、加入充电历史（+3）、调试模式（+2）\
-             与 PPS 解锁（+6）后合计 51 个键"
-        );
+        // +4（2026-10-26）见 §12：`night.*` —— 夜间模式（模式调度，独立分区）：
+        //     `night.enabled` / `night.start` / `night.end` / `night.mode`。
+        assert_eq!(key_count(), 55, "夜间模式（+4）后合计 55 个键");
+    }
+
+    /// 时间键：接受 `H:MM` 并规范化；非法值拒绝且**不改原值**
+    #[test]
+    fn 时间键规范化并拒绝非法值() {
+        let mut s = ConfigStore::with_defaults("x.json");
+
+        s.set("night.start", "7:05").unwrap();
+        assert_eq!(s.get_str("night.start"), "07:05", "应规范化为两位");
+
+        s.set("night.start", "22:00").unwrap();
+        assert_eq!(s.get_str("night.start"), "22:00");
+
+        for bad in ["24:00", "12:60", "abc", "1200", ""] {
+            assert!(s.set("night.start", bad).is_err(), "{bad:?} 必须被拒绝");
+            assert_eq!(
+                s.get_str("night.start"),
+                "22:00",
+                "拒绝时不得改动原值（{bad:?}）"
+            );
+        }
+    }
+
+    /// 夜间模式目标只接受四套模式 id
+    #[test]
+    fn 夜间模式目标只接受已知模式() {
+        let mut s = ConfigStore::with_defaults("x.json");
+        s.set("night.mode", "turbo").unwrap();
+        assert_eq!(s.get_str("night.mode"), "turbo");
+
+        assert!(s.set("night.mode", "nonsense").is_err());
+        assert_eq!(s.get_str("night.mode"), "turbo");
     }
 
     // ────────────────────────────────────────────────────────────

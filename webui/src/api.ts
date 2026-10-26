@@ -38,6 +38,7 @@ import type {
   ModeList,
   PowerMeasurement,
   ProbeResult,
+  NightSection,
   RuntimeEvent,
   StatusSnapshot,
   ThermalSection,
@@ -878,6 +879,16 @@ export function fetchThermal(): Promise<ThermalSection> {
 /** 读取控制分区 */
 export function fetchControl(): Promise<ControlSection> {
   return run(["get", "--section", "control"]) as Promise<ControlSection>;
+}
+
+/**
+ * 读取夜间模式分区
+ *
+ * 老版本后端没有这个分区（`get --section night` 会报未知分区）——
+ * 调用方用 `.catch(() => null)` 兜底，不要让它拖垮整页加载。
+ */
+export function fetchNight(): Promise<NightSection> {
+  return run(["get", "--section", "night"]) as Promise<NightSection>;
 }
 
 /** 读取温度曲线 */
