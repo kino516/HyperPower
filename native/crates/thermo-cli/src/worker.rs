@@ -347,6 +347,18 @@ pub fn run() -> Result<()> {
     // ── 单实例 ──
     let _lock = InstanceLock::acquire(&crate::paths::lockfile(), &crate::paths::pidfile())?;
 
+    // ── 控制通道：**尽早绑定**（2026-10-27 软重启修复）──
+    //
+    // 为什么提前到引擎初始化之前：
+    //
+    // 客户端自愈（`supervisor::ensure_running`）只等 4 秒。而引擎初始化
+    // （历史恢复、附加功能、节点探测、档位表解析）可能占掉大半时间 ——
+    // socket 晚出现，自愈就会误判"没起来"，用户只能重启手机。
+    //
+    // 绑定失败**不致命**：worker 仍会控制充电（无 ctl），主循环每 15 秒重试。
+    #[cfg(unix)]
+    let server_bind = crate::server::ControlServer::bind(crate::paths::control_sock());
+
     // ── 加载配置与档案 ──
     let mut cfg = ConfigStore::load(crate::paths::config_json());
     let profile = crate::profile_io::effective_profile();
@@ -456,17 +468,17 @@ pub fn run() -> Result<()> {
         now_s: crate::observability::now_unix(),
     });
 
-    // ── 控制通道 ──
+    // ── 控制通道（启动时已提前绑定，见 `run` 开头） ──
     let mut started_server = false;
     #[cfg(unix)]
     {
-        match crate::server::ControlServer::bind(crate::paths::control_sock()) {
+        match server_bind {
             Ok(s) => {
                 engine.server = Some(s);
                 started_server = true;
             }
             Err(e) => {
-                log::error!("控制通道启动失败（将无 ctl 能力）：{e:#}");
+                log::error!("控制通道启动失败（将无 ctl 能力，主循环会重试）：{e:#}");
                 events.emit(
                     kind::DENY,
                     &format!("控制通道启动失败：{e:#}"),
@@ -603,7 +615,33 @@ pub fn run() -> Result<()> {
     //    否则第一轮会因缓存里是"未充电"而直接进入休眠。
     let mut woke_up = true;
 
+    // 控制通道缺失时，下一次重试绑定的节流时刻（见 loop 开头）
+    #[cfg(unix)]
+    let mut last_server_try: Option<std::time::Instant> = None;
+
     loop {
+        // ── 控制通道缺失 ⇒ 每 15 秒重试绑定一次 ──
+        //
+        // 场景（2026-10-27 软重启）：启动时绑定失败（残留 socket / 竞争），
+        // 之后不会自动恢复 —— 用户永远连不上，只能重启手机。
+        // 这里在**持有 `worker.lock` 的前提下**重试（不会有第二个 worker），
+        // 成功即恢复全部 ctl 能力。
+        #[cfg(unix)]
+        if engine.server.is_none() {
+            let due = last_server_try.is_none_or(|t| t.elapsed().as_secs() >= 15);
+            if due {
+                last_server_try = Some(std::time::Instant::now());
+                match crate::server::ControlServer::bind(crate::paths::control_sock()) {
+                    Ok(s) => {
+                        engine.server = Some(s);
+                        log::info!("控制通道已恢复（此前绑定失败）");
+                        events.emit(kind::LIFECYCLE, "控制通道已恢复", serde_json::json!({}));
+                    }
+                    Err(e) => log::warn!("控制通道重试绑定失败：{e:#}"),
+                }
+            }
+        }
+
         if TERM_REQUESTED.load(Ordering::Relaxed) {
             log::info!("收到终止信号，交回官方后退出");
             // ⚠️ 这里传的是**内部原因串**（`release_now` 会把它写进

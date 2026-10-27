@@ -202,10 +202,13 @@ fn ensure_detected(events: &EventLog) {
 const SPAWN_THROTTLE: Duration = Duration::from_secs(30);
 
 /// 已有 supervisor 时等 socket 的上限（覆盖 worker 重启窗口）
-const WAIT_RUNNING: Duration = Duration::from_millis(1500);
+const WAIT_RUNNING: Duration = Duration::from_secs(2);
 
 /// 刚拉起 supervisor 时等 socket 的上限（首次启动会先跑一次只读检测）
-const WAIT_STARTED: Duration = Duration::from_secs(5);
+///
+/// ⚠️ 必须显著小于 WebUI 的读超时（6 秒）：自愈等待 + 重连 + 命令启动
+/// 都在这 6 秒里。4 秒留出足够余量；余下时间交给用户点「重试」。
+const WAIT_STARTED: Duration = Duration::from_secs(4);
 
 /// 自愈结果（给客户端拼错误信息用）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +292,11 @@ fn ensure_running_at(
     log: &Path,
     exe: &Path,
 ) -> EnsureOutcome {
+    // 软重启/异常退出可能留下「文件在、无人监听」的陈旧 socket。
+    // 先清掉：worker 启动时虽然也会自行清理（`ControlServer::bind`），
+    // 但提前删能避免「自愈判定 socket 已存在 ⇒ 直接重连失败」的竞态。
+    cleanup_stale_socket(sock);
+
     match probe_supervisor_lock(lock) {
         LockProbe::Held => {
             // 已有 supervisor：worker 可能正在重启，等它把 socket 建出来
@@ -389,6 +397,34 @@ fn wait_socket(sock: &Path, timeout: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 清理「文件存在但无人监听」的陈旧 socket
+///
+/// # 为什么需要它（2026-10-27 软重启）
+///
+/// 软重启会杀掉 root 守护进程，但**不会执行 `service.sh`**（那是开机脚本），
+/// 因此 `control.sock` 文件可能残留。残留文件的后果：
+///
+/// | 谁 | 后果 |
+/// |---|---|
+/// | 客户端自愈 | `wait_socket` 看到文件就以为好了 ⇒ 重连却 ECONNREFUSED |
+/// | 新 worker | `bind` 探测失败后会删除重建（已有逻辑，但晚一步） |
+///
+/// 这里提前删：**只删 connect 失败的**，活跃监听一律不动。
+fn cleanup_stale_socket(sock: &Path) {
+    use std::os::unix::net::UnixStream;
+
+    if !sock.exists() {
+        return;
+    }
+    if UnixStream::connect(sock).is_ok() {
+        return; // 有人在监听 ⇒ 不是残留
+    }
+    match std::fs::remove_file(sock) {
+        Ok(()) => log::warn!("已清理陈旧控制 socket：{}", sock.display()),
+        Err(e) => log::warn!("清理陈旧 socket 失败（{}）：{e}", sock.display()),
     }
 }
 
@@ -893,10 +929,17 @@ mod tests {
         let log = dir.join("daemon.out");
         let missing_exe = dir.join("no_such_thermo");
 
+        // 预置一个「软重启残留」的陈旧 socket（普通文件，无人监听）
+        std::fs::write(&sock, b"stale").unwrap();
+
         let first = ensure_running_at(&lock, &stamp, &sock, &log, &missing_exe);
         assert!(
             matches!(first, EnsureOutcome::Failed(_)),
             "拉起不存在的程序应失败，实得 {first:?}"
+        );
+        assert!(
+            !sock.exists(),
+            "自愈前应清理陈旧 socket，否则 worker 绑定会撞上它"
         );
         assert!(
             first.hint().contains("重启设备"),
@@ -932,6 +975,29 @@ mod tests {
             wait_socket(&sock, Duration::from_millis(120)),
             "socket 存在 ⇒ 立即返回 true"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 陈旧 socket 清理：只删「无人监听」的，活跃监听不能动
+    #[test]
+    fn 清理陈旧socket但不删活跃监听() {
+        let dir = temp_dir("stalesock");
+
+        // 不存在 ⇒ 不报错、不 panic
+        cleanup_stale_socket(&dir.join("none.sock"));
+
+        // 普通文件（模拟软重启残留）⇒ 删除
+        let stale = dir.join("stale.sock");
+        std::fs::write(&stale, b"stale").unwrap();
+        cleanup_stale_socket(&stale);
+        assert!(!stale.exists(), "陈旧 socket 应被删除");
+
+        // 活跃监听 ⇒ 保留（误删会让正在运行的 worker 失去控制通道）
+        let live = dir.join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        cleanup_stale_socket(&live);
+        assert!(live.exists(), "活跃监听不得删除");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
