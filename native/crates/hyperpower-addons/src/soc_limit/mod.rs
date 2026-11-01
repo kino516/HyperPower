@@ -674,7 +674,40 @@ impl Addon for SocLimit {
         //    关掉后不还原，电池图标就会一直显示假电量。
         if !self.config.enabled {
             self.restore_display(io);
-            return TickOutcome::idle(interval);
+            // 🔴 还要把**我们开过的使能位**关回去（2026-11-01 K70 Pro 真机实测）
+            //
+            // # 原来的 bug
+            //
+            // `release()` 里有「开过 en 就关回 0」的逻辑，但**这条分支
+            // 根本不调 release()** —— 它直接 `idle` 返回。于是：
+            //
+            // | 操作 | `charge_control_en` |
+            // |---|---|
+            // | 启用上限（写了 85） | 1（我们开的） |
+            // | `ctl limit off` | **仍是 1** ❌ |
+            // | 卸载（走 `release_all`） | 0 ✓ |
+            //
+            // 即「关闭功能」不还原使能位，只有「卸载」才还原。而 `en=1`
+            // 时驱动会**继续执行**我们上次写的阈值 —— 用户以为关掉了，
+            // 实际充到 85 就停。这违反 R12「关闭 ≠ 卸载」。
+            //
+            // 判据用**节点真实值**而不是 `enable_engaged`：worker 重启后
+            // 内存标记是 false，但节点可能仍是上次的 1（见 ①-1 的说明）。
+            let mut wrote = false;
+            if let Some(en) = self.node_enable.clone() {
+                let engaged = io.read(&en).ok().map(|v| v.trim() != "0").unwrap_or(false);
+                if engaged && io.write(&en, "0").is_ok() {
+                    wrote = true;
+                    log::info!("[soc_limit] 功能已关闭，使能位 {en} 已写回 0");
+                }
+            }
+            self.enable_engaged = false;
+            self.last_written = None;
+            return if wrote {
+                TickOutcome::wrote(interval)
+            } else {
+                TickOutcome::idle(interval)
+            };
         }
 
         // ①-0 把系统显示电量校正成驱动真实值（用户要求，见方法文档）
@@ -800,7 +833,37 @@ impl Addon for SocLimit {
         self.last_target = Some(target);
 
         // ⑥ 已一致 → 不写（这是常态：绝大多数拍什么都不做）
-        if !logic::needs_rewrite(target, actual) {
+        //
+        // 🔴 **但标准方言下使能位为 0 时不算"已一致"**（2026-11-01 K70 Pro 真机）
+        //
+        // # 这个坑很隐蔽
+        //
+        // `charge_control_en = 0` 时驱动**不执行**阈值，但仍会把上次写入的
+        // 值留在 `charge_control_end_threshold` 里。于是：
+        //
+        // ```text
+        // 用户设 85 → 写入 → 读回 85  → 判定"已一致" ✓
+        // 某次 en 被清成 0（系统重置 / 我们的 off 分支）
+        //   ⇒ 阈值节点**仍然读 85** ⇒ needs_rewrite=false ⇒ 直接 idle
+        //   ⇒ 使能位永远没人去开 ⇒ 限制实际失效，电量继续涨过 85
+        // ```
+        //
+        // 真机实测（K70 Pro，2026-11-01）：
+        //
+        // | en | 阈值节点 | 实际是否停充 |
+        // |---|---|---|
+        // | 0 | 85 | **否**（电量涨到 87） |
+        // | 1 | 85 | 是（`current_now = -79 mA`） |
+        //
+        // ⇒ 判据必须带上使能位：`en=0` ⇒ 强制重写（走 ⑦ 重新开 en）。
+        let enable_off = match (self.dialect, self.node_enable.as_deref()) {
+            (Dialect::Percent, Some(en)) => {
+                io.read(en).ok().map(|v| v.trim() == "0").unwrap_or(false)
+            }
+            _ => false,
+        };
+
+        if !logic::needs_rewrite(target, actual) && !enable_off {
             return TickOutcome::idle(interval);
         }
 

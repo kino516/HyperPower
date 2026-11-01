@@ -1473,3 +1473,95 @@ fn 解除熔断后立即安排下一拍() {
     let ran = runner.tick_due(&mut io2, now);
     assert_eq!(ran.len(), 1, "解除熔断后应立即重试");
 }
+
+// ============================================================
+//  ⑨ 关闭功能必须还原使能位（R12「关闭 ≠ 卸载」）
+// ============================================================
+
+/// **未启用时也要把 `charge_control_en` 关回 0**
+///
+/// # 防的事故（2026-11-01 K70 Pro 真机实测）
+///
+/// 旧实现里「关使能位」只写在 `release()` 中，而 `tick()` 的
+/// `!enabled` 分支**直接 idle 返回、从不调 `release()`**：
+///
+/// | 操作 | `charge_control_en` |
+/// |---|---|
+/// | 启用上限并写入 85 | 1（我们开的） |
+/// | `ctl limit off` | **仍是 1** ❌ |
+/// | 卸载（`release_all` → `release`） | 0 ✓ |
+///
+/// `en=1` 时驱动会继续执行我们上次写的阈值 ⇒ 用户以为关了，
+/// 实际充到 85 就停。违反 R12「关闭 ≠ 卸载」。
+#[test]
+fn 关闭功能时使能位必须写回零() {
+    // 先模拟"模块已经把 en 开到 1"
+    let mut io = FakeIo::k70pro();
+    io.files.insert(STD_EN.to_string(), "1".to_string());
+
+    // 配置为**未启用**
+    let mut cfg = enabled_config(85);
+    cfg.enabled = false;
+
+    let mut addon = probed(cfg, &mut io);
+    // 直接跑一拍
+    let _ = addon.tick(&mut io, 0);
+
+    let en = io.files.get(STD_EN).map(|s| s.as_str()).unwrap_or("?");
+    assert_eq!(
+        en, "0",
+        "关闭功能后 charge_control_en 必须写回 0（实际 {en}）"
+    );
+
+    // 且确实产生了一次写入（而不是碰巧初始就是 0）
+    assert!(
+        io.write_log.iter().any(|(p, v)| p == STD_EN && v == "0"),
+        "应当真的写过 en=0，写入记录：{:?}",
+        io.write_log
+    );
+}
+
+/// 使能位本来就是 0 时**不重复写**（避免无谓的 I2C 开销）
+#[test]
+fn 使能位已是零时不重复写() {
+    let mut io = FakeIo::k70pro(); // en 初始为 "0"
+    let mut cfg = enabled_config(85);
+    cfg.enabled = false;
+
+    let mut addon = probed(cfg, &mut io);
+    let _ = addon.tick(&mut io, 0);
+
+    assert!(
+        !io.write_log.iter().any(|(p, _)| p == STD_EN),
+        "en 已经是 0 就不该再写，写入记录：{:?}",
+        io.write_log
+    );
+}
+
+/// **使能位为 0 时必须强制重写**（不能被"阈值已一致"短路）
+///
+/// # 防的事故（2026-11-01 K70 Pro 真机）
+///
+/// `charge_control_en = 0` 时驱动不执行阈值，但仍把上次的值留在
+/// `charge_control_end_threshold` 里。于是「阈值 == 目标」⇒
+/// `needs_rewrite = false` ⇒ 直接 idle ⇒ **使能位永远没人去开** ⇒
+/// 限制实际失效，电量继续涨过上限。
+///
+/// 真机表现：设 85，电量涨到 86、87 仍不停；手动 `en=1` 后立刻
+/// `current_now = -79 mA`（停充）。
+#[test]
+fn 使能位为零时即使阈值一致也要重写并开启() {
+    // 阈值节点「看起来已经是 85」，但使能位是 0
+    let mut io = FakeIo::k70pro();
+    io.files.insert(STD_CTRL.to_string(), "85".to_string());
+    io.files.insert(STD_EN.to_string(), "0".to_string());
+
+    let mut addon = probed(enabled_config(85), &mut io);
+    let _ = addon.tick(&mut io, 0);
+
+    let en = io.files.get(STD_EN).map(|s| s.as_str()).unwrap_or("?");
+    assert_eq!(
+        en, "1",
+        "阈值虽然一致，但 en=0 ⇒ 必须重新开启使能位（实际 {en}）"
+    );
+}
