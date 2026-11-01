@@ -793,7 +793,33 @@ pub fn run_verify(json: bool) -> Result<()> {
     }
 
     // ─────────── ⑥ 配置 ───────────
-    let cfg = crate::config_store::ConfigStore::load(crate::paths::config_json());
+    //
+    // 🔴 必须**先钳位再校验**（2026-11-01 真机发现，K70 Pro / manet）
+    //
+    // # 原来的 bug
+    //
+    // 旧实现用 `ConfigStore::load()` 的**原始值**直接 `validate_against()`，
+    // 而 worker 启动时会先 `clamp_to_caps()` 再使用。两者口径不同 ⇒
+    // **`verify` 在自己能正常工作的机器上报红**：
+    //
+    // ```text
+    // 出厂默认 curve 峰值 = 18 400 000 μA（K90 Pro Max 的实测值）
+    // K70 Pro 实测上限   =  6 000 000 μA
+    // ⇒ verify：「配置超出本机能力边界，控制会被拒绝」  ✗ 失败
+    // ⇒ 但 worker 日志实际写着：
+    //    「curve: 整体缩放 ×0.326（峰值 18400000 → 6000000 μA）」✓ 正常
+    // ```
+    //
+    // 用户看到 `verify` 报红会以为模块坏了，实际上温控好好的 ——
+    // 这正是 R17「不猜、不静默」要防的反面：**报错也必须准确**。
+    //
+    // ⇒ 这里补上与 worker 一致的一步：先钳位（只在内存、不落盘，
+    //    符合 R7「运行期钳位绝不落盘」），再校验。
+    let mut cfg = crate::config_store::ConfigStore::load(crate::paths::config_json());
+    let profile_for_clamp = crate::profile_io::effective_profile();
+    let clamp_caps = crate::profile_io::to_core_caps(&profile_for_clamp.profile.capabilities);
+    let clamped = cfg.clamp_to_caps(&clamp_caps);
+
     match cfg.to_core() {
         Ok(c) => {
             // 配置能加载 ≠ 能通过设备边界校验。后者要用真实档案，
@@ -802,7 +828,22 @@ pub fn run_verify(json: bool) -> Result<()> {
             let profile = crate::profile_io::effective_profile();
             let core_caps = crate::profile_io::to_core_caps(&profile.profile.capabilities);
             match c.validate_against(&core_caps) {
-                Ok(()) => checks.push(Check::ok("配置", "合法且在本机边界内".to_string())),
+                Ok(()) => {
+                    if clamped.is_empty() {
+                        checks.push(Check::ok("配置", "合法且在本机边界内".to_string()));
+                    } else {
+                        // 钳位过 ⇒ 提示用户：出厂默认值与本机能力不符，
+                        // 运行期已自动适配，但**文件里仍是原值**。
+                        checks.push(Check::ok(
+                            "配置",
+                            format!(
+                                "合法（运行期已按本机能力钳位 {} 项：{}）",
+                                clamped.len(),
+                                clamped.join("；")
+                            ),
+                        ));
+                    }
+                }
                 Err(e) => checks.push(Check::fail(
                     "配置",
                     format!("超出本机能力边界：{e}（控制会被拒绝）"),

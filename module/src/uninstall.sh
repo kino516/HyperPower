@@ -266,12 +266,44 @@ fi
 if [ -n "$SOC_CTRL" ]; then
   case "$SOC_CTRL" in
     */charge_control_end_threshold)
-      # 标准框架：纯百分比
+      # ── 标准框架：纯百分比 ──
+      #
+      # 🔴 顺序至关重要（2026-11-01 K70 Pro 真机实测）
+      #
+      # `charge_control_en = 0` 时写 `charge_control_end_threshold`
+      # **返回成功但值被驱动吞掉**，读回恒为 0：
+      #
+      # | 操作 | 结果 |
+      # |---|---|
+      # | en=0，写 100 | 读回 **0** ❌ |
+      # | en=0，写 95 | 读回 **0** ❌ |
+      # | en=1 后写 100 | 读回 **100** ✅ |
+      #
+      # 原先的顺序是「先写阈值、后关使能位」⇒ 阈值写入被吞，
+      # 用户卸载后上限仍停在旧值（充不满）。必须改成：
+      #
+      #   ① 先 en=1 → ② 写 100 → ③ 再 en=0
+      #
+      # ⚠️ 注意第 ③ 步：这里**要**把 en 关回 0（模块从未介入的状态），
+      #    但必须先让 100 真正写进去。关 en 不会回滚已生效的阈值。
+      EN_NODE_PRE=$(pick_node /sys/class/qcom-battery charge_control_en)
+      [ -z "$EN_NODE_PRE" ] && EN_NODE_PRE=$(pick_node /sys/class/power_supply/battery charge_control_en)
+
+      if [ -n "$EN_NODE_PRE" ]; then
+        write_node "$EN_NODE_PRE" "1" "charge_control_en（先开启以便写入阈值）"
+        sleep 1
+      fi
+
       write_node "$SOC_CTRL" "100" "充电上限（百分比）"
+      sleep 1
       verify_node "$SOC_CTRL" "100" "充电上限生效值"
+
+      if [ -n "$EN_NODE_PRE" ]; then
+        write_node "$EN_NODE_PRE" "0" "charge_control_en（还原为未启用）"
+      fi
       ;;
     *)
-      # 小米控制字
+      # ── 小米控制字 ──
       if write_node "$SOC_CTRL" "0x640011" "充电上限 smart_chg"; then
         sleep 1
         _read_node="$(dirname "$SOC_CTRL")/soc_limit"
