@@ -62,12 +62,12 @@ jobs:
           test -x "$LINKER" || { echo "::error::linker not found: $LINKER"; exit 1; }
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$LINKER"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,relro,-z,now"
-          cargo build --release --target aarch64-linux-android -p thermo-cli
+          cargo build --release --target aarch64-linux-android -p hyperpower-cli
 
       - name: Verify 16 KB alignment (release gate)
         run: |
           set -e
-          BIN=native/target/aarch64-linux-android/release/thermo
+          BIN=native/target/aarch64-linux-android/release/hyperpower
           file "$BIN"
           echo "=== LOAD segments ==="
           # -W 强制宽格式，避免 llvm-readelf 把 Program Header 拆成多行
@@ -83,8 +83,8 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: thermo-aarch64
-          path: native/target/aarch64-linux-android/release/thermo
+          name: hyperpower-aarch64
+          path: native/target/aarch64-linux-android/release/hyperpower
           if-no-files-found: error
 
   # ---------- WebUI ----------
@@ -120,14 +120,20 @@ jobs:
   module:
     name: Module zip
     runs-on: ubuntu-24.04
-    needs: [native]
+    # 🔴 必须同时依赖 webui（2026-11-01 审计 H-08 / R14）
+    #
+    # 旧配置只 `needs: [native]`，且下载 webroot 用了
+    # `continue-on-error: true` ⇒ CI 会**静默产出没有 WebUI 的 zip
+    # 且全绿**。`xtask pack` 只复制 `module/src/**`，不构建也不校验
+    # webroot —— 这正是 R14 记录的事故路径。
+    needs: [native, webui]
     steps:
       - uses: actions/checkout@v4
 
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          name: thermo-aarch64
+          name: hyperpower-aarch64
           # 打包脚本（xtask pack）从这里读取二进制再复制进模块
           path: native/target/aarch64-linux-android/release
 
@@ -136,7 +142,8 @@ jobs:
         with:
           name: webroot
           path: module/src/webroot
-        continue-on-error: true
+        # ⚠️ **不能** continue-on-error：拿不到 webroot 就必须失败，
+        #    否则会打出没有界面的模块包。
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -153,14 +160,14 @@ jobs:
       #    `cargo xtask pack`。CI 不再用 shell 重复一遍规则
       #    （见 docs/08-交接摘要.md §3.2 —— 两套实现会静默分叉）。
       #
-      #    THERMO_SKIP_BUILD=1：二进制已由 native job 构建并下载，无需重复编译。
+      #    HYPERPOWER_SKIP_BUILD=1：二进制已由 native job 构建并下载，无需重复编译。
       - name: Pack module (single source of truth)
         env:
-          THERMO_SKIP_BUILD: "1"
+          HYPERPOWER_SKIP_BUILD: "1"
           # CI 上的 linker 由 setup-ndk 提供，无需本机绝对路径
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android31-clang
         run: |
-          chmod +x module/src/bin/thermo module/src/bin/ctl module/src/bin/daemon module/src/*.sh || true
+          chmod +x module/src/bin/hyperpower module/src/bin/ctl module/src/bin/daemon module/src/*.sh || true
           cargo run --release --manifest-path xtask/Cargo.toml -- pack
 
       - name: Verify zip contents
@@ -186,6 +193,28 @@ jobs:
           unzip -l "$ZIP" | grep -q 'profiles/' \
             || { echo "::error::缺少 profiles/ 目录"; exit 1; }
           echo "✓ defaults/ 与 profiles/ 均在包内"
+
+          # 🔴 WebUI 必须在包里（2026-11-01 审计 H-09 / R14）
+          #
+          # `xtask pack` 只**复制** `module/src/webroot/`，不构建、
+          # 也不校验它是否存在。`module/src/webroot/` 又是 gitignored ——
+          # 新克隆直接 pack 会打出**没有界面的 zip 且全绿**。
+          # 上面 `needs: [native, webui]` 保证产物存在，这里再断言一次
+          # 「真的进了 zip」，两道都要。
+          unzip -l "$ZIP" | grep -q 'webroot/index.html' \
+            || { echo "::error::缺少 webroot/index.html —— 包内没有 WebUI"; exit 1; }
+          # 主 JS 产物也要在（只有 index.html 而 assets 空 = 白屏）
+          unzip -l "$ZIP" | grep -q 'webroot/assets/.*\.js' \
+            || { echo "::error::webroot/assets 下没有 JS 产物"; exit 1; }
+          # 产物里不能残留 crossorigin（KernelSU WebView 不返回 CORS 头 ⇒ 空白）
+          #
+          # ⚠️ 用 if 而不是 `grep && exit`：`set -e` 下 grep 未命中返回 1
+          #    会直接终止脚本，把「检查通过」误判成失败。
+          if unzip -p "$ZIP" webroot/index.html | grep -q 'crossorigin'; then
+            echo "::error::webroot/index.html 残留 crossorigin（会导致白屏）"
+            exit 1
+          fi
+          echo "✓ webroot/ 完整（index.html + assets + 无 crossorigin）"
 
       - name: Upload module zip
         uses: actions/upload-artifact@v4

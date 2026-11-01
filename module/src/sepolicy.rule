@@ -72,10 +72,46 @@ allow ksu sysfs_charger:file { open read write getattr };
 #
 # ⇒ `qcom_battery` 上面已经放行；这里补另外两个**只读**类型。
 
-# 小米封装层（`xm_power/typec/*`）：PPS 门控读 SVID 与 apdo_max
+# 小米封装层（`xm_power/*`）
 #
-# ⚠️ 本模块对它**只读不写**，但 `read` 也需要 `open` + `getattr`。
+# ⚠️ 本模块对 `xm_power` 下的 **PPS 观测节点**（`typec/adapter_svid`、
+#    `apdo_max`）只读不写，但控制节点（档位/电流/上限）另见下面的
+#    真机实测结论 —— 它们用的**不是**这个类型。
 allow ksu vendor_sysfs_xm_power:file { open read getattr };
+
+# ────────────────────────────────────────────────────────────
+#  🔴 真机实测修正（2026-11-01，REDMI K90 Pro Max / myron）
+# ────────────────────────────────────────────────────────────
+#
+# 上面按「路径所属目录」推断类型是**错的方法** —— 符号链接本身的
+# 标签是 `u:object_r:sysfs:s0`，真正的类型在**链接目标**上：
+#
+# ```text
+# /sys/class/xm_power/charger/charger_thermal  -> ../../../platform/soc/soc:mca_charger_thermal
+#   wired_ctrl_limit / wired_chg_curr / wired_chg_curr2 / wired_thermal_remove
+#       ⇒ u:object_r:sysfs_thermal:s0
+#
+# /sys/class/xm_power/charger/smart_charge/smart_chg
+#       ⇒ u:object_r:sysfs:s0
+# ```
+#
+# 也就是说，本机**控制节点实际是 `sysfs_thermal` / `sysfs`**，
+# 而 `vendor_sysfs_xm_power` 只覆盖 PPS 那几个观测节点。
+#
+# 实测结论（Enforcing 模式下）：
+#
+# | 操作 | 结果 |
+# |---|---|
+# | `echo <原值> > wired_chg_curr`（`sysfs_thermal`） | ✅ 成功，`dmesg` 无 avc |
+# | `echo <原值> > wired_ctrl_limit`（`sysfs_thermal`） | ✅ 成功 |
+# | `getenforce` | `Enforcing` |
+#
+# 即 **`ksu` 域对这些类型已有基线放行**，本文件不是它们的开关。
+# 下面两条是**幂等加固**：显式声明一次意图，避免未来基线收紧或换机型
+# （`vendor_sysfs_*` 那类命名的机型）时出现「界面正常但写不进去」。
+# 多放行一个 file 类的 read/write 不扩大攻击面到其它对象。
+allow ksu sysfs_thermal:file { open read write getattr };
+allow ksu sysfs:file { open read write getattr };
 
 # USB 侧供电节点（`power_supply/usb/*`）：PPS 门控读电压
 #

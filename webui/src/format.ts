@@ -37,7 +37,7 @@ export function f0(v: number | null | undefined): string {
  * 太短的（如 `1mah`）是型号里的巧合数字，不该采信。
  *
  * 提取不到时返回 `--` —— 不猜、也不显示原始型号：
- * 型号已经在 `device.json` 里，`thermo device show` 能看到。
+ * 型号已经在 `device.json` 里，`hyperpower device show` 能看到。
  */
 export function batteryCapacityMah(
   model: string | null | undefined,

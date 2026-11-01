@@ -27,7 +27,7 @@ import vue from "@vitejs/plugin-vue";
  */
 function stripCrossorigin(): Plugin {
   return {
-    name: "thermo:strip-crossorigin",
+    name: "hyperpower:strip-crossorigin",
     transformIndexHtml: {
       order: "post",
       handler(html: string) {
@@ -49,7 +49,7 @@ function stripCrossorigin(): Plugin {
  */
 function stripHtmlComments(): Plugin {
   return {
-    name: "thermo:strip-html-comments",
+    name: "hyperpower:strip-html-comments",
     transformIndexHtml: {
       order: "post",
       handler(html: string) {
@@ -88,7 +88,7 @@ function stripHtmlComments(): Plugin {
  */
 function forbidRuntimeTemplate(): Plugin {
   return {
-    name: "thermo:forbid-runtime-template",
+    name: "hyperpower:forbid-runtime-template",
     apply: "build",
     generateBundle(_options, bundle) {
       for (const [file, chunk] of Object.entries(bundle)) {

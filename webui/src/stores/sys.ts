@@ -165,6 +165,16 @@ export function stopPolling(): void {
  * ⚠️ 页面隐藏时必须停轮询：WebView 在后台仍会跑定时器，
  * 3 秒一次的命令执行会白白耗电。
  */
+/**
+ * `visibilitychange` 监听器引用（用于清理）
+ *
+ * ⚠️ 必须可撤销（2026-11-01 审计 L-10）：`initSys()` 若被调用多次
+ * （热重载、或未来加了"切换实例"逻辑），匿名监听器会**不断叠加**，
+ * 每次 `visibilitychange` 触发多条 `refresh` + 多个 `setInterval`，
+ * 表现为切回页面后请求量成倍增长且耗电翻番。
+ */
+let onVisibilityChange: (() => void) | null = null;
+
 export async function initSys(): Promise<void> {
   perfMark("fetch-start");
   await refresh(true);
@@ -172,12 +182,28 @@ export async function initSys(): Promise<void> {
 
   startPolling();
 
-  document.addEventListener("visibilitychange", () => {
+  // 先撤掉上一轮的监听器，避免重复注册
+  if (onVisibilityChange) {
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+  }
+  onVisibilityChange = () => {
     if (document.hidden) {
       stopPolling();
     } else {
       void refresh(true);
       startPolling();
     }
-  });
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
+}
+
+/**
+ * 释放全局监听与轮询（页面卸载 / 销毁实例时调用）
+ */
+export function disposeSys(): void {
+  stopPolling();
+  if (onVisibilityChange) {
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    onVisibilityChange = null;
+  }
 }

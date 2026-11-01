@@ -6,4 +6,4 @@
 # ============================================================
 
 MODDIR=${0%/*}
-exec "$MODDIR/thermo" worker "$@"
+exec "$MODDIR/hyperpower" worker "$@"

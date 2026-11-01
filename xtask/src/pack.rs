@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::fs_walk;
 
 const TARGET: &str = "aarch64-linux-android";
-const BIN_NAME: &str = "thermo";
+const BIN_NAME: &str = "hyperpower";
 
 /// 生成 SHA-256 清单时排除的文件
 ///
@@ -55,6 +55,13 @@ pub fn pack(release: bool) -> Result<()> {
     // ---------- 反向断言：不得含 APK ----------
     println!("==> 反向断言");
     assert_no_apk(&stage)?;
+    // ---------- 正向断言：必须有 WebUI（R14 / H-09）----------
+    //
+    // `pack` 只**复制** `module/src/**`，从不构建 webroot，也不校验它。
+    // 而 `module/src/webroot/` 是 gitignored —— 新克隆直接 pack 会打出
+    // **没有界面的 zip 且全绿**（R14 记录的事故）。这里把它变成硬失败，
+    // 与 CI 的 zip 断言形成双保险。
+    assert_webroot_present(&stage)?;
 
     // ---------- 16 KB 对齐检查（发布硬门槛）----------
     if release {
@@ -129,6 +136,60 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             fs::copy(src.join(&rel), &target)?;
         }
     }
+    Ok(())
+}
+
+/// 正向断言：模块必须包含完整 WebUI（`webroot/index.html` + assets JS）
+///
+/// # 为什么要有这条（2026-11-01 审计 H-09 / R14）
+///
+/// `pack` 的设计是「只复制 `module/src/**`」，**不构建、不校验** webroot。
+/// 而 `module/src/webroot/` 被 `.gitignore` 排除 —— 于是：
+///
+/// | 场景 | 旧行为 | 后果 |
+/// |---|---|---|
+/// | 新克隆直接 `pack` | ✅ 全绿 | 打出**没有 WebUI** 的 zip |
+/// | 忘跑 `cargo xtask webui` | ✅ 全绿 | 同上 |
+/// | webroot 只残留一个 index.html | ✅ 全绿 | 界面白屏/资源 404 |
+///
+/// 这些都是「CI 全绿但用户装了空白模块」的事故形态，因此必须硬失败。
+fn assert_webroot_present(stage: &Path) -> Result<()> {
+    let root = stage.join("webroot");
+    let index = root.join("index.html");
+
+    if !index.is_file() {
+        anyhow::bail!(
+            "缺少 webroot/index.html —— 包内没有 WebUI。\n\
+             请先运行 `cargo xtask webui` 再打包（顺序：webui → pack）。"
+        );
+    }
+
+    // 只有 index.html 而 assets 里没有 JS ⇒ 页面必然白屏（脚本 404）
+    let assets = root.join("assets");
+    let has_js = assets.is_dir()
+        && fs::read_dir(&assets)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .any(|e| e.path().extension().is_some_and(|x| x == "js"))
+            })
+            .unwrap_or(false);
+    if !has_js {
+        anyhow::bail!(
+            "webroot/assets 下没有 JS 产物 —— WebUI build 不完整（会白屏）。\n\
+             请重新运行 `cargo xtask webui`。"
+        );
+    }
+
+    // `crossorigin` 会让 KernelSU WebView 因缺 CORS 头而加载失败（真机白屏事故）
+    let html = fs::read_to_string(&index).unwrap_or_default();
+    if html.contains("crossorigin") {
+        anyhow::bail!(
+            "webroot/index.html 残留 `crossorigin` —— KernelSU WebView 不返回 \
+             CORS 头，会导致内容区空白。请检查 WebUI 构建门禁（剥离步骤）。"
+        );
+    }
+
+    println!("    ✓ webroot 完整（index.html + assets JS，无 crossorigin）");
     Ok(())
 }
 

@@ -36,7 +36,7 @@ cargo xtask webui      # 必须先于 pack（R14）
 cargo xtask pack
 
 unzip -l dist/HyperPower-v$VER.zip
-# 必须含：module.prop / bin/thermo / defaults/ / profiles/ / webroot/index.html / checksum.sha256
+# 必须含：module.prop / bin/hyperpower / defaults/ / profiles/ / webroot/index.html / checksum.sha256
 # 必须不含：*.apk
 ```
 
@@ -54,4 +54,4 @@ gh release create "v$VER" dist/HyperPower-v$VER.zip \
 
 - 从 Release 下载 `HyperPower-v$VER.zip`，核对 SHA-256 与本地 `dist/HyperPower-v$VER.zip` 一致；
 - 核对包内 `module.prop` 的 `version` / `versionCode` 与 tag 一致；
-- 真机安装后**重启**，跑 `thermo verify`。
+- 真机安装后**重启**，跑 `hyperpower verify`。

@@ -307,6 +307,13 @@ async function probe(): Promise<void> {
     verifyGear.value = false;
     // 用检测结果直接刷新界面（省一次往返）
     device.value = r.profile;
+    // 🔴 必须让**全局档案缓存**失效（2026-11-01 审计 M-04）
+    //
+    // `fetchDeviceCached()` 缓存的是一个 Promise（见 `api.ts`）。状态页的
+    // 设备名/来源徽标、控制页的功率滑块量程 `hwMaxW`、收紧温度上限 `hwMax`
+    // 全都读它。检测并 `--save` 之后若不失效，这些页面会**继续用旧档案**
+    // ⇒ 用户看到「检测了但没生效」，只有重开页面才刷新。
+    api.invalidateDeviceCache();
 
     const failed = r.profile.probe_meta.failed_items;
     void showSnackbar({
@@ -332,7 +339,7 @@ async function probe(): Promise<void> {
 /**
  * ⚠️ `measure()` 已删除 —— 它服务于已移除的「实际功率」卡
  *
- * 后端命令 `thermo measure` 仍然存在（README 的命令表里有），
+ * 后端命令 `hyperpower measure` 仍然存在（README 的命令表里有），
  * 需要精确测量时可以从命令行调用；界面不再提供入口，因为状态页
  * 已经有 3 秒一刷的实时功率。
  */
@@ -466,7 +473,7 @@ async function probe(): Promise<void> {
       | 设备代号 | 属于"身份"，已在状态页显示设备名 |
       | 内存页大小 | 只是 16 KB 对齐的**实现细节**，用户无从也无需操作 |
 
-      ⇒ 删掉整张卡。想查的人可以用 `thermo device show`（README 有命令表）。
+      ⇒ 删掉整张卡。想查的人可以用 `hyperpower device show`（README 有命令表）。
     -->
 
     <!-- ── 电池 ── -->
@@ -582,7 +589,7 @@ async function probe(): Promise<void> {
       而且是 3 秒一刷的**实时**值；而这里的「测量实际功率」要按一下、
       等 3 秒、只给一次瞬时峰值 —— 功能重叠且更笨拙。
 
-      同理删掉了整张卡（含测量按钮）。后端 `thermo measure` 命令保留，
+      同理删掉了整张卡（含测量按钮）。后端 `hyperpower measure` 命令保留，
       需要精确测量时仍可从命令行调用（README 有说明）。
     -->
 

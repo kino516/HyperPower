@@ -36,7 +36,7 @@ slog() {
 slog "===== service.sh 启动 ====="
 
 # 权限自愈：模块目录可能因重启丢失可执行位
-chmod 755 "$MODDIR/bin/thermo" 2>/dev/null
+chmod 755 "$MODDIR/bin/hyperpower" 2>/dev/null
 chmod 755 "$MODDIR/bin/ctl"    2>/dev/null
 chmod 755 "$MODDIR/bin/daemon" 2>/dev/null
 
@@ -50,9 +50,9 @@ rm -f "$DATADIR/worker.pid" 2>/dev/null
 rm -f "$DATADIR/supervisor.pid" 2>/dev/null
 rm -f "$DATADIR/ipc/control.sock" 2>/dev/null
 
-BIN="$MODDIR/bin/thermo"
+BIN="$MODDIR/bin/hyperpower"
 if [ ! -x "$BIN" ]; then
-  slog "错误：thermo 二进制不可执行"
+  slog "错误：hyperpower 二进制不可执行"
   exit 0
 fi
 

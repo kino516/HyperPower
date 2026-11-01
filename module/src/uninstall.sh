@@ -8,16 +8,16 @@
 #    3. 清理运行残留
 #
 #  ────────────────────────────────────────────────────────────
-#  🔴 为什么本脚本【自包含】，不调用 thermo 二进制
+#  🔴 为什么本脚本【自包含】，不调用 hyperpower 二进制
 #
 #     卸载时模块目录可能已被移除、二进制可能已损坏 ——
 #     本脚本是"最后一道保障"，因此：
 #       · 不复用任何 lib/ 脚本（模块目录可能已不可读）
-#       · 不调用 thermo 二进制（同样可能不可用）
+#       · 不调用 hyperpower 二进制（同样可能不可用）
 #       · 不依赖 device.json 一定存在（用户可能从未跑过检测）
 #
 #     代价：候选路径表需在本脚本内维护一份，
-#     必须与 native/crates/thermo-cli/src/sysfs.rs 的候选表保持一致。
+#     必须与 native/crates/hyperpower-cli/src/sysfs.rs 的候选表保持一致。
 #
 #  ────────────────────────────────────────────────────────────
 #  🔴 两条控制轴（互不相干，都要恢复）
@@ -79,10 +79,21 @@ if [ -f "$DATADIR/worker.pid" ]; then
 fi
 
 # supervisor：按"二进制路径 + 子命令"匹配，避免误杀同名进程
-_pids=$(pgrep -f "$MODDIR/bin/thermo supervisor" 2>/dev/null)
-for _p in $_pids; do
-  kill "$_p" 2>/dev/null
-  slog "已停止 supervisor（pid=$_p）"
+#
+# ⚠️ 必须同时认旧名 `bin/thermo`（2026-11-01 改名前的二进制）。
+#    从旧版本直接卸载时，跑着的是 thermo supervisor/worker，
+#    只认新名会漏杀 ⇒ 卸载后进程继续写 sysfs，上限残留。
+for _bin in "$MODDIR/bin/hyperpower" "$MODDIR/bin/thermo"; do
+  _pids=$(pgrep -f "$_bin supervisor" 2>/dev/null)
+  for _p in $_pids; do
+    kill "$_p" 2>/dev/null
+    slog "已停止 supervisor（pid=$_p）"
+  done
+  _pids=$(pgrep -f "$_bin worker" 2>/dev/null)
+  for _p in $_pids; do
+    kill "$_p" 2>/dev/null
+    slog "已停止 worker（pid=$_p）"
+  done
 done
 
 sleep 1
@@ -96,16 +107,43 @@ sleep 1
 CTRL_DIR_CANDIDATES="
 /sys/class/xm_power/charger/charger_thermal
 /sys/class/charger/charger_thermal
+/sys/class/power_supply/wired/charger_thermal
+/sys/class/power_supply/battery
 "
 
 SOC_CTRL_CANDIDATES="
 /sys/class/xm_power/charger/smart_charge/smart_chg
 /sys/class/charger/smart_charge/smart_chg
+/sys/class/power_supply/smart_charge/smart_chg
+/sys/class/power_supply/battery/charge_control_end_threshold
 "
+
+# 控制节点的**文件名**候选（与 sysfs.rs 的 CTRL_NAMES / CURR_NAMES 同源）
+#
+# ⚠️ 小米封装层用 `wired_*`，标准 power_supply 框架用上游名字。
+#    只认前者的话，标准框架机型**卸载后不恢复**（2026-11-01 审计 O-02/O-04）。
+GEAR_NAME_CANDIDATES="wired_ctrl_limit charge_control_limit"
+CURR_NAME_CANDIDATES="wired_chg_curr constant_charge_current"
+CURR2_NAME_CANDIDATES="wired_chg_curr2"
+REMOVE_NAME_CANDIDATES="wired_thermal_remove thermal_remove"
+
+# 在 $1 目录下按名字候选找**第一个存在**的节点，回显其绝对路径
+pick_node() {
+  _dir="$1"
+  shift
+  for _nm in "$@"; do
+    if [ -e "$_dir/$_nm" ]; then
+      echo "$_dir/$_nm"
+      return 0
+    fi
+  done
+  return 1
+}
 
 CTRL_DIR=""
 for _d in $CTRL_DIR_CANDIDATES; do
-  if [ -w "$_d/wired_ctrl_limit" ]; then
+  if [ -w "$_d/$(echo $GEAR_NAME_CANDIDATES | cut -d' ' -f1)" ] \
+     || [ -w "$_d/$(echo $GEAR_NAME_CANDIDATES | cut -d' ' -f2)" ]; then
     CTRL_DIR="$_d"
     break
   fi
@@ -113,7 +151,7 @@ done
 
 SOC_CTRL=""
 for _n in $SOC_CTRL_CANDIDATES; do
-  if [ -w "$_n" ]; then
+  if [ -e "$_n" ]; then
     SOC_CTRL="$_n"
     break
   fi
@@ -180,9 +218,14 @@ verify_node() {
 # ============================================================
 
 if [ -n "$CTRL_DIR" ]; then
+  GEAR_NODE=$(pick_node "$CTRL_DIR" $GEAR_NAME_CANDIDATES)
+  CURR_NODE=$(pick_node "$CTRL_DIR" $CURR_NAME_CANDIDATES)
+  CURR2_NODE=$(pick_node "$CTRL_DIR" $CURR2_NAME_CANDIDATES)
+  REMOVE_NODE=$(pick_node "$CTRL_DIR" $REMOVE_NAME_CANDIDATES)
+
   # 4.1 档位放开（0 = 最松）与移除标记归零 —— 通用语义，可安全带写死
-  write_node "$CTRL_DIR/wired_ctrl_limit" "0" "档位 wired_ctrl_limit"
-  write_node "$CTRL_DIR/wired_thermal_remove" "0" "移除标记 wired_thermal_remove"
+  write_node "$GEAR_NODE" "0" "档位"
+  write_node "$REMOVE_NODE" "0" "移除标记"
 
   # 4.2 电流放开 —— 放开值因机型而异，从本机档案读实测上限
   #
@@ -193,8 +236,8 @@ if [ -n "$CTRL_DIR" ]; then
 
   if [ -n "$_max_ua" ] && [ "$_max_ua" -gt 0 ] 2>/dev/null; then
     slog "本机档案记录的电流上限：$_max_ua μA"
-    write_node "$CTRL_DIR/wired_chg_curr" "$_max_ua" "电流 wired_chg_curr"
-    write_node "$CTRL_DIR/wired_chg_curr2" "$_max_ua" "电流 wired_chg_curr2"
+    write_node "$CURR_NODE" "$_max_ua" "电流"
+    write_node "$CURR2_NODE" "$_max_ua" "第二路电流"
   else
     # 🔴 不猜数值。档位与电流是两层并联，只放开档位可能仍被电流层限流；
     #    但写一个凭猜测的电流值风险更大，故选择"不写 + 明确告知"。
@@ -203,24 +246,102 @@ if [ -n "$CTRL_DIR" ]; then
     slog "     （这些节点是驱动运行时状态，重启即丢）"
   fi
 
-  verify_node "$CTRL_DIR/wired_ctrl_limit" "0" "档位"
-  verify_node "$CTRL_DIR/wired_thermal_remove" "0" "移除标记"
+  verify_node "$GEAR_NODE" "0" "档位"
+  verify_node "$REMOVE_NODE" "0" "移除标记"
 fi
 
 # ============================================================
 #  5. 充电上限轴：解除限制
 #
-#  控制字 = (100 << 16) | 0x11 = 0x640011
-#    · 100 = 驱动语义"不限制"
-#    · 0x11 = 使能位（低 16 位 bit0+bit4），缺了不生效
+#  ⚠️ 两种方言语义**完全不同**，必须分流（2026-11-01 审计 O-03）：
+#
+#  | 方言 | 节点 | "不限制"的写法 |
+#  |---|---|---|
+#  | 小米控制字 | `smart_charge/smart_chg` | `0x640011` = (100<<16)\|0x11 |
+#  | 标准百分比 | `battery/charge_control_end_threshold` | 纯十进制 `100` |
+#
+#  往百分比节点写 `0x640011` 是越界值（驱动不接受，或行为未定义）。
 # ============================================================
 
 if [ -n "$SOC_CTRL" ]; then
-  if write_node "$SOC_CTRL" "0x640011" "充电上限 smart_chg"; then
-    sleep 1
-    _read_node="$(dirname "$SOC_CTRL")/soc_limit"
-    # 判断生效【永远读 soc_limit】，不能读 smart_chg（其读值会漂移）
-    verify_node "$_read_node" "100" "充电上限生效值"
+  case "$SOC_CTRL" in
+    */charge_control_end_threshold)
+      # 标准框架：纯百分比
+      write_node "$SOC_CTRL" "100" "充电上限（百分比）"
+      verify_node "$SOC_CTRL" "100" "充电上限生效值"
+      ;;
+    *)
+      # 小米控制字
+      if write_node "$SOC_CTRL" "0x640011" "充电上限 smart_chg"; then
+        sleep 1
+        _read_node="$(dirname "$SOC_CTRL")/soc_limit"
+        # 判断生效【永远读 soc_limit】，不能读 smart_chg（其读值会漂移）
+        verify_node "$_read_node" "100" "充电上限生效值"
+      fi
+      ;;
+  esac
+fi
+
+# ============================================================
+#  5.5 附加功能写入的节点（**卸载必须还原**）
+#
+#  🔴 2026-11-01 审计 O-05：此前这三个节点**完全没有恢复**，
+#     而 worker 退出路径也只做温控轴（见 H-02），⇒ 没有任何一层兜底。
+#
+#  | 节点 | 谁写的 | 不还原的后果 |
+#  |---|---|---|
+#  | `fake_soc` | soc_limit | 电池图标停在虚假电量 |
+#  | `charge_control_en` | soc_limit | 标准框架上限一直有效，充不满 |
+#  | `pd_verifed` | pps | 驱动跳过认证状态残留 |
+#
+#  ⚠️ `pd_verifed` 只在**未充电时**还原：充电中写会让驱动重新协商、
+#     表现为"插上又断开"（真机结论，见 docs/03）。
+# ============================================================
+
+FAKE_SOC_NODE=""
+for _n in /sys/class/qcom-battery/fake_soc /sys/class/power_supply/battery/fake_soc; do
+  [ -e "$_n" ] && { FAKE_SOC_NODE="$_n"; break; }
+done
+
+if [ -n "$FAKE_SOC_NODE" ]; then
+  # fake_soc 是"让系统显示值跟随真实 rsoc"的覆盖节点。
+  # 卸载时把它写成真实容量即可（写成 0 会让图标掉到 0%）。
+  _rsoc=""
+  for _n in /sys/class/qcom-battery/capacity /sys/class/power_supply/battery/capacity; do
+    [ -r "$_n" ] && { _rsoc=$(tr -d ' \t\r\n' < "$_n" 2>/dev/null); break; }
+  done
+  case "$_rsoc" in
+    ''|*[!0-9]*)
+      slog "⚠️ 读不到真实电量，跳过 fake_soc 还原（重启后驱动自行恢复）"
+      ;;
+    *)
+      write_node "$FAKE_SOC_NODE" "$_rsoc" "fake_soc（还原为真实电量）"
+      ;;
+  esac
+fi
+
+# 使能位：模块自己开过才关（写 0 = 关闭使能）
+EN_NODE=""
+for _n in /sys/class/qcom-battery/charge_control_en /sys/class/power_supply/battery/charge_control_en; do
+  [ -e "$_n" ] && { EN_NODE="$_n"; break; }
+done
+[ -n "$EN_NODE" ] && write_node "$EN_NODE" "0" "charge_control_en"
+
+# PPS 认证位：仅未充电时还原
+PD_NODE=""
+for _n in /sys/class/qcom-battery/pd_verifed /sys/class/power_supply/battery/pd_verifed; do
+  [ -e "$_n" ] && { PD_NODE="$_n"; break; }
+done
+if [ -n "$PD_NODE" ]; then
+  _st=""
+  for _n in /sys/class/power_supply/battery/status /sys/class/qcom-battery/status; do
+    [ -r "$_n" ] && { _st=$(tr -d ' \t\r\n' < "$_n" 2>/dev/null); break; }
+  done
+  if [ "$_st" = "Charging" ]; then
+    slog "⚠️ 正在充电，跳过 pd_verifed 还原（充电中写会中断协议握手）"
+    slog "   → 拔电后重启手机即可恢复"
+  else
+    write_node "$PD_NODE" "0" "pd_verifed"
   fi
 fi
 
@@ -236,7 +357,7 @@ rm -f "$DATADIR/worker.pid" "$DATADIR/supervisor.pid" 2>/dev/null
 #
 #  用户明确要求：卸载后不要保留任何数据。
 #  需要保全数据的用户，应在卸载前自行导出：
-#      thermo ctl data export --dir /sdcard/Download
+#      hyperpower ctl data export --dir /sdcard/Download
 #
 #  ⚠️ 删除前的守卫（宁可少删一次，也不在异常时删掉排查线索）：
 #     ① 必须在【交回官方之后】—— 第 4、5 节已完成
@@ -247,9 +368,17 @@ rm -f "$DATADIR/worker.pid" "$DATADIR/supervisor.pid" 2>/dev/null
 _del_ok=1
 
 if [ -n "$CTRL_DIR" ]; then
-  _rem=$(tr -d ' \t\r\n' < "$CTRL_DIR/wired_thermal_remove" 2>/dev/null)
-  _ctl=$(tr -d ' \t\r\n' < "$CTRL_DIR/wired_ctrl_limit" 2>/dev/null)
-  if [ "$_rem" != "0" ]; then
+  # ⚠️ 必须同时判 `-n`（2026-11-01 审计 H-04）
+  #
+  # 节点不存在 / 不可读时 `tr` 输出空串。旧代码只判 `!= "0"`，
+  # 空串不等于 "0" 恒成立 ⇒ `_del_ok=0` ⇒ **数据目录永远删不掉**，
+  # 违反"卸载即无残留"。相邻的 `_ctl` 判断本来就有 `-n`，两者不对称。
+  _rem=""
+  [ -n "$REMOVE_NODE" ] && _rem=$(tr -d ' \t\r\n' < "$REMOVE_NODE" 2>/dev/null)
+  _ctl=""
+  [ -n "$GEAR_NODE" ] && _ctl=$(tr -d ' \t\r\n' < "$GEAR_NODE" 2>/dev/null)
+
+  if [ -n "$_rem" ] && [ "$_rem" != "0" ]; then
     slog "⚠️ 移除标记未复原（当前 '$_rem'）—— 暂不删除数据目录，保留日志供排查"
     _del_ok=0
   fi

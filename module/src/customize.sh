@@ -54,6 +54,27 @@ ui_print "- 模块版本：v${_ver:-unknown}"
 unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >&2
 [ $? -ne 0 ] && abort "! 解包失败"
 
+# ---------- 2.5 停止旧进程（升级 / 覆盖安装）----------
+#
+# 🔴 为什么必须在这里杀：2026-11-01 二进制改名为 `bin/hyperpower`，
+#    而**旧版本**跑的是 `bin/thermo`。KernelSU 更新模块**不会**停止旧进程 ——
+#    它们持有已被删除的可执行文件 inode 继续运行，于是新旧两个 worker
+#    同时写 sysfs，直接违反 R1（唯一写者）。真机表现：限制值随机跳变、
+#    刚设的上限被另一个进程改回去。
+#
+# ⚠️ 必须按**可执行路径**匹配：模块目录 `/data/adb/modules/a_hyperpower`
+#    本身就含 "hyperpower"，裸 `pkill -f hyperpower` 会误杀访问模块目录的进程。
+ui_print "- 停止正在运行的旧进程"
+for _pat in "/bin/thermo supervisor" "/bin/thermo worker" \
+            "/bin/hyperpower supervisor" "/bin/hyperpower worker"; do
+  pkill -f "$_pat" 2>/dev/null || true
+done
+sleep 1
+for _pat in "/bin/thermo supervisor" "/bin/thermo worker" \
+            "/bin/hyperpower supervisor" "/bin/hyperpower worker"; do
+  pkill -9 -f "$_pat" 2>/dev/null || true
+done
+
 # ---------- 3. 完整性校验 ----------
 # 只校验分发的文件（`checksum.sha256` 自己不在清单内）
 if [ -f "$MODPATH/checksum.sha256" ] && [ -f "$MODPATH/verify.sh" ]; then
@@ -74,7 +95,7 @@ fi
 # ⚠️ webroot/ 的权限与 SELinux context 由管理器自动设置，此处绝不触碰
 ui_print "- 设置文件权限"
 
-set_perm "$MODPATH/bin/thermo" 0 0 0755
+set_perm "$MODPATH/bin/hyperpower" 0 0 0755
 set_perm "$MODPATH/bin/ctl"    0 0 0755
 set_perm "$MODPATH/bin/daemon" 0 0 0755
 set_perm "$MODPATH/module.prop" 0 0 0644

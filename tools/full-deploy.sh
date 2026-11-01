@@ -4,13 +4,13 @@
 #
 #  # 为什么需要它
 #
-#  开发时常常只推二进制（`bin/thermo`），于是 webroot 与 shell 脚本
+#  开发时常常只推二进制（`bin/hyperpower`），于是 webroot 与 shell 脚本
 #  还是旧版本 —— 用户看到的现象就是"**模块没更新**"。
 #  本脚本按 zip 内容**全覆盖**，保证设备与产物逐字节一致。
 #
 #  # 为什么先停进程
 #
-#  Linux 不允许写入正在执行的可执行文件。不停进程就覆盖 `bin/thermo`
+#  Linux 不允许写入正在执行的可执行文件。不停进程就覆盖 `bin/hyperpower`
 #  会报 `Text file busy`，而且**部分文件已被覆盖、部分是旧的** ——
 #  这种半更新状态比不更新更难排查。
 # ============================================================
@@ -27,7 +27,7 @@ MOD=/data/adb/modules/a_hyperpower
 # 兼容旧的无版本名；找不到时保持旧路径让报错信息更直观
 ZIP=$(ls /data/local/tmp/HyperPower-v*.zip 2>/dev/null | tail -n 1 || true)
 [ -n "$ZIP" ] || ZIP=/data/local/tmp/HyperPower.zip
-STAGE=/data/local/tmp/thermo_stage
+STAGE=/data/local/tmp/hyperpower_stage
 
 # 曾经用过的模块 id（改 id 后需清理旧目录，见 ①B）
 LEGACY_MODS="/data/adb/modules/a_thermo_charge /data/adb/modules/thermo_charge"
@@ -36,16 +36,32 @@ LEGACY_MODS="/data/adb/modules/a_thermo_charge /data/adb/modules/thermo_charge"
 #  ① 停进程
 # ============================================================
 echo "==> ① 停掉进程"
-pkill -f 'thermo worker' 2>/dev/null || true
-pkill -f 'thermo supervisor' 2>/dev/null || true
+# ⚠️ 必须匹配**可执行路径**，不能只匹配裸名字：
+#    模块目录 `/data/adb/modules/a_hyperpower` 本身就含 "hyperpower"，
+#    裸 `pkill -f hyperpower` 会误杀正在访问模块目录的 shell（含本脚本）。
+# ⚠️ 旧版二进制名是 `bin/thermo`（2026-11-01 改名）。升级时必须一并清理，
+#    否则旧 supervisor/worker 会与新进程**双写** sysfs（违反 R1）。
+PROC_PATTERNS="$MOD/bin/hyperpower worker
+$MOD/bin/hyperpower supervisor
+$MOD/bin/thermo worker
+$MOD/bin/thermo supervisor"
+
+echo "$PROC_PATTERNS" | while IFS= read -r _pat; do
+  [ -n "$_pat" ] && pkill -f "$_pat" 2>/dev/null || true
+done
 sleep 2
 
-LEFT=$(ps -A -o PID,ARGS 2>/dev/null | grep thermo | grep -v grep | wc -l | tr -d ' ')
+LEFT=$(echo "$PROC_PATTERNS" | while IFS= read -r _pat; do
+  [ -n "$_pat" ] && pgrep -f "$_pat" 2>/dev/null
+done | wc -l | tr -d ' ')
+
 if [ "$LEFT" = "0" ]; then
   echo "    ✓ 已全部停止"
 else
   echo "    ⚠️ 仍有 $LEFT 个进程，尝试强杀"
-  pkill -9 -f 'thermo' 2>/dev/null || true
+  echo "$PROC_PATTERNS" | while IFS= read -r _pat; do
+    [ -n "$_pat" ] && pkill -9 -f "$_pat" 2>/dev/null || true
+  done
   sleep 2
 fi
 
@@ -169,7 +185,7 @@ echo "    （清单：$DEPRECATED）"
 # ============================================================
 echo ""
 echo "==> ⑤ 设置权限"
-chmod 755 "$MOD/bin/thermo" "$MOD/bin/ctl" "$MOD/bin/daemon" 2>/dev/null || true
+chmod 755 "$MOD/bin/hyperpower" "$MOD/bin/ctl" "$MOD/bin/daemon" 2>/dev/null || true
 chmod 644 "$MOD/module.prop" 2>/dev/null || true
 for s in service.sh uninstall.sh post-fs-data.sh; do
   [ -f "$MOD/$s" ] && chmod 755 "$MOD/$s"
@@ -217,9 +233,9 @@ fi
 # ============================================================
 echo ""
 echo "==> ⑦ 启动进程"
-nohup "$MOD/bin/thermo" supervisor >/dev/null 2>&1 &
+nohup "$MOD/bin/hyperpower" supervisor >/dev/null 2>&1 &
 sleep 4
-ps -A -o PID,PPID,STAT,ARGS 2>/dev/null | grep thermo | grep -v grep | sed 's/^/    /'
+ps -A -o PID,PPID,STAT,ARGS 2>/dev/null | grep hyperpower | grep -v grep | sed 's/^/    /'
 
 # ============================================================
 #  ⑦ 文件清单（供核对）

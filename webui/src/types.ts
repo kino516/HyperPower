@@ -133,7 +133,7 @@ export interface StatusSnapshot {
   charger: Charger;
   // ⚠️ 这里原有 `scene: string | null`（系统场景），已删除（2026-10-17）。
   //
-  // 它**从不参与决策**（`engine.rs` / `thermo-core` 里一次都没出现），
+  // 它**从不参与决策**（`engine.rs` / `hyperpower-core` 里一次都没出现），
   // 而且翻译不出模式名 —— 映射表 `/vendor/etc/thermal-map.conf` 是加密的
   // （真机拉取验证：4032 字节二进制）。
   // 用户判断：「只能看，没用处」。
@@ -643,10 +643,17 @@ export interface ProbeResult {
   mode: "quick" | "full";
   /** 检测出的档案 */
   profile: DeviceProfileView;
+  /**
+   * 档位表（`device probe` 输出，部分机型无）
+   *
+   * ⚠️ 此前 [`GearRow`] 定义了却没有任何字段引用它（2026-11-01 审计 M-17），
+   *    等于「后端会输出、前端没声明」。这里补上，让类型与契约对齐。
+   */
+  gear_table?: GearRow[];
 }
 
 /**
- * 实际充电功率的测量结果（`thermo measure`）
+ * 实际充电功率的测量结果（`hyperpower measure`）
  *
  * ⚠️ 这是**此刻**的功率，随电量/充电器/温度变化 ——
  * 与档案里的「标称功率」（机型能力上限）是两回事。

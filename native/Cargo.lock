@@ -383,6 +383,52 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hyperpower-addons"
+version = "1.0.12"
+dependencies = [
+ "hyperpower-ipc",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hyperpower-cli"
+version = "1.0.12"
+dependencies = [
+ "android_logger",
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "env_logger",
+ "hyperpower-addons",
+ "hyperpower-core",
+ "hyperpower-ipc",
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "hyperpower-core"
+version = "1.0.12"
+dependencies = [
+ "proptest",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "hyperpower-ipc"
+version = "1.0.12"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -755,53 +801,6 @@ name = "termtree"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
-
-[[package]]
-name = "thermo-addons"
-version = "1.0.10"
-dependencies = [
- "log",
- "serde",
- "serde_json",
- "thermo-ipc",
-]
-
-[[package]]
-name = "thermo-cli"
-version = "1.0.10"
-dependencies = [
- "android_logger",
- "anyhow",
- "assert_cmd",
- "clap",
- "env_logger",
- "libc",
- "log",
- "serde",
- "serde_json",
- "thermo-addons",
- "thermo-core",
- "thermo-ipc",
- "thiserror",
-]
-
-[[package]]
-name = "thermo-core"
-version = "1.0.10"
-dependencies = [
- "proptest",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "thermo-ipc"
-version = "1.0.10"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
 
 [[package]]
 name = "thiserror"

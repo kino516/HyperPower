@@ -1,0 +1,16 @@
+[package]
+name = "hyperpower-ipc"
+description = "IPC 协议、错误码、DTO —— 后端与两个客户端的共同契约"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# ⚠️ 不声明 `thiserror`：本 crate 的错误是 `ErrorCode` 枚举 + 字符串，
+#    没有 `#[derive(Error)]` 的类型（2026-11-01 审计 M-15 核实为零引用）。
+
+[lints]
+workspace = true

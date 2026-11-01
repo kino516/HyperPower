@@ -16,6 +16,7 @@ mod fs_walk;
 mod pack;
 
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -24,7 +25,7 @@ use anyhow::{Context, Result};
 const TARGET: &str = "aarch64-linux-android";
 
 /// 产物二进制名
-const BIN_NAME: &str = "thermo";
+const BIN_NAME: &str = "hyperpower";
 
 const USAGE: &str = "\
 HyperPower 构建编排
@@ -106,11 +107,11 @@ fn main() -> Result<()> {
         Command_::Check => check(),
         Command_::Pack(v) => {
             // CI 场景：二进制已由前一个 job 构建并作为 artifact 下载下来，
-            // 此时设置 THERMO_SKIP_BUILD=1 跳过重复编译。
-            if std::env::var("THERMO_SKIP_BUILD").is_err() {
+            // 此时设置 HYPERPOWER_SKIP_BUILD=1 跳过重复编译。
+            if std::env::var("HYPERPOWER_SKIP_BUILD").is_err() {
                 build(v)?;
             } else {
-                println!("==> 跳过编译（THERMO_SKIP_BUILD 已设置，使用已有二进制）");
+                println!("==> 跳过编译（HYPERPOWER_SKIP_BUILD 已设置，使用已有二进制）");
             }
             pack::pack(v.is_release())
         }
@@ -603,7 +604,7 @@ fn build(variant: Variant) -> Result<()> {
 
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&native)
-        .args(["build", "--target", TARGET, "-p", "thermo-cli"]);
+        .args(["build", "--target", TARGET, "-p", "hyperpower-cli"]);
     if variant.is_release() {
         cmd.arg("--release");
     }
@@ -664,22 +665,83 @@ fn check() -> Result<()> {
         }
     }
 
+    // 🔴 禁用依赖的实际门禁（2026-11-01 审计 M-16）
+    //
+    // `native/deny.toml` 声明了「禁 tokio / async-std / chrono / parking_lot」
+    // 等规则，但**从来没有任何东西执行它**（CI 无 `cargo deny` 步骤、
+    // 本机也没装 cargo-deny）⇒ R16 的禁令实际只靠人记。
+    //
+    // 这里用**不依赖外部工具**的方式把它变成真门禁：直接扫 `Cargo.lock`。
+    // 比起引入 cargo-deny（需额外安装 + 联网取 advisory 库），
+    // 这条检查零依赖、离线可跑，正好覆盖 R16 关心的那些包。
+    println!("==> 禁用依赖检查（R16）");
+    check_banned_deps(&native)?;
+
     println!("✓ 全部检查通过");
+    Ok(())
+}
+
+/// 禁用的第三方依赖（R16 / `native/deny.toml`）
+///
+/// | 包 | 为什么禁 |
+/// |---|---|
+/// | `tokio` / `async-std` | 1~3 Hz 的负载不需要异步运行时；panic 语义与体积更差 |
+/// | `chrono` | 只用到「当前 unix 秒」，`SystemTime` 足够 |
+/// | `parking_lot` | 标准库锁已够用，少一层依赖 |
+const BANNED_DEPS: &[&str] = &[
+    "tokio",
+    "async-std",
+    "async-std-derive",
+    "chrono",
+    "parking_lot",
+];
+
+/// 扫描 `Cargo.lock`，发现禁用依赖即失败
+fn check_banned_deps(native: &Path) -> Result<()> {
+    let lock_path = native.join("Cargo.lock");
+    let text = std::fs::read_to_string(&lock_path)
+        .with_context(|| format!("读取 {} 失败", lock_path.display()))?;
+
+    let mut hits: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        // Cargo.lock 里包名形如：name = "tokio"
+        let Some(rest) = line.strip_prefix("name = \"") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix('"') else {
+            continue;
+        };
+        if BANNED_DEPS.contains(&name) {
+            hits.push(name);
+        }
+    }
+
+    if !hits.is_empty() {
+        hits.sort_unstable();
+        hits.dedup();
+        for h in &hits {
+            eprintln!("    ✗ 禁用依赖出现在 Cargo.lock：{h}");
+        }
+        anyhow::bail!("Cargo.lock 含禁用依赖（R16）—— 见 native/deny.toml 与 AGENTS.md R16");
+    }
+
+    println!("    ✓ 未含禁用依赖（已检查 {} 项禁令）", BANNED_DEPS.len());
     Ok(())
 }
 
 /// 测试参数（按平台选择范围）
 ///
 /// ⚠️ Windows 上无法 `--workspace`：`cargo test` 需要**原生**构建
-///    `thermo-cli`（为二进制建测试宿主），而它依赖 `clap` → `windows-sys`；
+///    `hyperpower-cli`（为二进制建测试宿主），而它依赖 `clap` → `windows-sys`；
 ///    后者在本机 GNU 工具链下编译失败（rustup 自带 dlltool 的 CreateProcess
 ///    缺陷，详见 README「环境与工具链」）。故 Windows 上只测纯逻辑 crate，
 ///    **CI（ubuntu-24.04）跑全量**。
 fn test_args() -> Vec<&'static str> {
     if cfg!(windows) {
-        println!("    注：Windows 上仅测试纯逻辑 crate（thermo-cli 的原生构建受");
+        println!("    注：Windows 上仅测试纯逻辑 crate（hyperpower-cli 的原生构建受");
         println!("        dlltool 限制）；CI 会跑全量。详见 README「环境与工具链」。");
-        vec!["test", "-p", "thermo-core", "-p", "thermo-ipc"]
+        vec!["test", "-p", "hyperpower-core", "-p", "hyperpower-ipc"]
     } else {
         vec!["test", "--workspace"]
     }

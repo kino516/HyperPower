@@ -30,7 +30,7 @@
 |---|---|---|
 | B1 | **模块 / APP 分离** | APP 由独立仓库维护；模块 zip **不含任何 APK**；打包阶段以反向断言强制 |
 | B2 | **支持基线 Android 12+** | 安装脚本门禁 `API ≥ 31`；`module.yaml` 的 `androidMinApi` 与之同步 |
-| B3 | **APP 与模块共用同一后端** | 同一 `thermo` 二进制、同一协议、同一 JSON 契约；APP 自行申请 root，经 root 通道接入 |
+| B3 | **APP 与模块共用同一后端** | 同一 `hyperpower` 二进制、同一协议、同一 JSON 契约；APP 自行申请 root，经 root 通道接入 |
 | B4 | **不设工期约束** | 路线以里程碑与判据推进，不为工期牺牲设计 |
 | B5 | **仅 arm64-v8a** | 不保留 32 位扩展位 |
 | B6 | **不做包签名** | 以逐文件 SHA-256 覆盖完整性校验（签名不影响性能/耗电） |
@@ -54,11 +54,11 @@
 
 | 契约 | 内容 | 落地位置 |
 |---|---|---|
-| ① 节点契约表 | 全部可读写节点的路径、方向、取值、语义、写入纪律 | `native/crates/thermo-cli/src/sysfs.rs` + 检测流程 |
+| ① 节点契约表 | 全部可读写节点的路径、方向、取值、语义、写入纪律 | `native/crates/hyperpower-cli/src/sysfs.rs` + 检测流程 |
 | ② 配置说明书 | `config.json` 的 **55 个配置键**：类型、范围、默认值、校验规则 | `config_store.rs` 的 `KEYS` 表（单一真源） |
-| ③ 接口输出规范 | 命令的 3 种输出形态、错误码与退出码、已依赖细节 | `cli.rs` / `commands.rs` + `thermo-iipc` |
+| ③ 接口输出规范 | 命令的 3 种输出形态、错误码与退出码、已依赖细节 | `cli.rs` / `commands.rs` + `hyperpower-ipc` |
 
-> 📌 **想改代码**：先读 `native/crates/thermo-core/src/`（纯决策内核，
+> 📌 **想改代码**：先读 `native/crates/hyperpower-core/src/`（纯决策内核，
 > 无 I/O、无时钟、无 sysfs）—— 那是理解本项目最快的地方，
 > 所有控制逻辑与边界校验都在那里，且带完整单元测试。
 
@@ -389,7 +389,7 @@ $env:Path = "$ndk;$sc;$env:USERPROFILE\.cargo\bin;$env:Path"
 >
 > 1. **必须让 `default-host` 指向 GNU**：`rust-toolchain.toml` 中的 `1.99.0` 会以 default host 补全；若为 msvc 则报 `linker 'link.exe' not found`。
 > 2. **避开会在本机触发 `dlltool` 的依赖**：`windows-sys 0.61`（被 `clap` / `walkdir` 等引入）在**本机构建**时需用 `dlltool` 生成导入库，而 rustup 精简版在此调用方式下执行失败。因此 `xtask` 刻意不用 `clap` / `walkdir`（手写参数解析 + 标准库遍历）。
->    注：`thermo-cli` 使用 `clap` 不受影响 —— 它只做交叉编译，不构建 Windows 版。
+>    注：`hyperpower-cli` 使用 `clap` 不受影响 —— 它只做交叉编译，不构建 Windows 版。
 
 ### 常用命令
 
@@ -416,16 +416,16 @@ cargo xtask install --via ksud
 BIN=/data/adb/modules/a_hyperpower/bin
 
 # ① 出了任何问题先跑它 —— 端到端逐项自检，有失败项则非零退出
-$BIN/thermo verify
+$BIN/hyperpower verify
 
 # ② 换机型 / 节点没探到时看它 —— 9 张候选表逐条探测 + 未探到功能汇总
-$BIN/thermo probe
+$BIN/hyperpower probe
 
 # ③ 想知道"官方在多少度开始降"—— 官方温控表 + 全部节名清单
-$BIN/thermo probe --official
+$BIN/hyperpower probe --official
 
 # ④ 此刻实际充多快（只读，不写档案）
-$BIN/thermo measure --duration-ms 5000
+$BIN/hyperpower measure --duration-ms 5000
 ```
 
 | 命令 | 回答什么问题 | 需要插充电器？ |
@@ -445,7 +445,7 @@ WebUI「更多 → 检测记录」里两种语气是**分开的**，含义完全
 |---|---|---|
 | **✓** | 测到了 | —— |
 | **–**（灰） | **待补测**：当前插电状态不对，换个状态就能测 | 按提示插上/拔掉充电器再跑一次 |
-| **✕**（红） | **真的失败**：节点缺失或读取失败 | 查 `thermo probe` 的候选表 |
+| **✕**（红） | **真的失败**：节点缺失或读取失败 | 查 `hyperpower probe` 的候选表 |
 
 > 有两个检测项的插电要求**正好相反**，所以任何一次检测都必然有一项是「待补测」：
 >
@@ -462,9 +462,9 @@ WebUI「更多 → 检测记录」里两种语气是**分开的**，含义完全
 
 ```text
 service.sh
-  └─ thermo supervisor            仅进程监督 + 崩溃恢复（写固定安全值）
-       └─ thermo worker           采样 / 决策 / 唯一常规 sysfs 写者
-            ├─ thermo-core        纯决策内核（无 I/O、无时钟、无 sysfs）
+  └─ hyperpower supervisor            仅进程监督 + 崩溃恢复（写固定安全值）
+       └─ hyperpower worker           采样 / 决策 / 唯一常规 sysfs 写者
+            ├─ hyperpower-core        纯决策内核（无 I/O、无时钟、无 sysfs）
             ├─ sysfs 充电节点      先钳位 → 写入 → 回读校验
             └─ UDS                control.sock（0600 root；CLI / WebUI / APP 共用）
 ```

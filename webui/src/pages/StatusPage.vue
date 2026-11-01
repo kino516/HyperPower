@@ -439,7 +439,7 @@ const chargerCellLabel = computed(() => {
           ⚠️ **说明文字去哪了**：删掉了。它们要么与标题重复
           （"实际电流 / 真正在充的电流"），要么在两个电流之间做解释 ——
           而那一句已经写在主卡下方与 README 里。
-          真需要逐项说明时看 `thermo verify` 的输出（那里的描述更完整）。
+          真需要逐项说明时看 `hyperpower verify` 的输出（那里的描述更完整）。
         -->
         <div class="readouts">
           <div v-for="c in readouts" :key="c.label" class="readouts__cell">

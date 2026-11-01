@@ -15,7 +15,7 @@
 #
 #  | 类别 | 走什么 | 由谁调用 |
 #  |---|---|---|
-#  | **本地命令** | 直接起 `thermo` 进程 | `device probe` / `measure` / `version` |
+#  | **本地命令** | 直接起 `hyperpower` 进程 | `device probe` / `measure` / `version` |
 #  | **控制通道** | 经 UDS 问 worker | 其余全部（`api.ts` 里绝大多数） |
 #
 #  ⚠️ 只测本地命令是不够的：WebUI 的主路径是 `ctl *`。
@@ -35,7 +35,7 @@
 #    改 id 时需同步此处的路径（见 tools/full-deploy.sh 的说明）
 BIN=/data/adb/modules/a_hyperpower/bin
 CTL="$BIN/ctl"
-THERMO="$BIN/thermo"
+HP_BIN="$BIN/hyperpower"
 fail=0
 
 # 检查一条命令的 stdout 是否**恰好一行**且以 { 或 [ 开头
@@ -68,11 +68,11 @@ echo "════════ 本地命令（WebUI 用 runBinary 直调）═�
 echo ""
 # ⚠️ 本地命令只有这两个带 --json（WebUI 用 `runBinary()` 调它们）。
 #
-#    别再往这里加 `thermo device show --json` —— **该子命令不支持 --json**
+#    别再往这里加 `hyperpower device show --json` —— **该子命令不支持 --json**
 #    （它输出人类可读文本，见 cli.rs）。校验档案请用下面的 `ctl device show`。
-check "version"                "$THERMO" version
-check "device probe --json"    "$THERMO" device probe --json --quick
-check "measure --json"         "$THERMO" measure --json --duration-ms 500
+check "version"                "$HP_BIN" version
+check "device probe --json"    "$HP_BIN" device probe --json --quick
+check "measure --json"         "$HP_BIN" measure --json --duration-ms 500
 
 echo ""
 echo "════════ 控制通道（WebUI 主路径：ctl *）════════"

@@ -55,22 +55,32 @@ import type {
  * 注意**数据目录仍是 `hyperpower`**，与模块 id 无关 ——
  * 因此改 id 不影响用户的配置 / 档案 / 历史。
  *
- * 防漏改：`native/crates/thermo-cli/src/commands.rs` 有一条测试
+ * 防漏改：`native/crates/hyperpower-cli/src/commands.rs` 有一条测试
  * （`webui路径与module_prop一致`）会读本文件并核对，改漏了会测试失败。
  */
 const MODULE_DIR = "/data/adb/modules/a_hyperpower";
 
-/** 稳定入口（shim → `thermo ctl`） */
+/** 稳定入口（shim → `hyperpower ctl`） */
 const CTL = `${MODULE_DIR}/bin/ctl`;
 
 /** 主二进制（本地命令如 `device probe` 直接调它） */
-const BINARY = `${MODULE_DIR}/bin/thermo`;
+const BINARY = `${MODULE_DIR}/bin/hyperpower`;
 
 /**
  * SOC 兜底区间（%）
  *
  * ⚠️ **只在读不到检测档案时使用**。实际区间应以本机检测值为准
  * （见 [`fetchSocRange`]）—— 不同机型的驱动支持范围不同。
+ *
+ * 🔴 这两个值**必须与后端一致**（2026-11-01 审计 H-06）
+ *
+ * | 真源 | 值 |
+ * |---|---|
+ * | `detect.rs` 的 `SocLimitCapability.min` | 60 |
+ * | `config_store.rs` 的 `limit.soc` 键（**真正的门禁**） | min 60 |
+ * | 本文件的兜底 | 60（仅档案读不到时用） |
+ *
+ * 改任何一处都要同步另外两处，否则会出现「滑块允许但设不上」。
  */
 export const SOC_MIN = 60;
 export const SOC_MAX = 100;
@@ -102,7 +112,7 @@ export const SOC_MAX = 100;
  * 真机后果：`ControlPage.load()` 用 `Promise.all` 并发取 6 项，其中
  * `fetchHardwareMaxTemp()` 与 `fetchSocRange()` 都会走到这里 ——
  * **同一份档案被读 3 次**。而每次 `run()` 都要起一个 root shell
- * 加一个 `thermo` 进程，在手机上不是零成本，页面切换就"卡一下"。
+ * 加一个 `hyperpower` 进程，在手机上不是零成本，页面切换就"卡一下"。
  *
  * 缓存 Promise 后，三个调用者共享**同一个在途请求**，只发一条命令。
  *
@@ -721,7 +731,7 @@ async function execGuarded(
 }
 
 /**
- * 直接调用 `thermo` 二进制（**不**经 `ctl`）
+ * 直接调用 `hyperpower` 二进制（**不**经 `ctl`）
  *
  * # 为什么需要第二条通道
  *
@@ -730,7 +740,7 @@ async function execGuarded(
  * | 类型 | 例子 | 通道 | 为什么 |
  * |---|---|---|---|
  * | **契约命令** | `status` / `limit set` / `get` | `ctl` → UDS → worker | 需要与 worker 的单写者纪律配合 |
- * | **本地命令** | `device probe` / `device show` | 直接跑 `thermo` | 只读或瞬时操作，不碰运行态 |
+ * | **本地命令** | `device probe` / `device show` | 直接跑 `hyperpower` | 只读或瞬时操作，不碰运行态 |
  *
  * 走 `ctl` 发本地命令会得到 `E_TYPE 未知命令`。
  *
@@ -858,6 +868,29 @@ export async function setLimit(soc: number): Promise<void> {
 /** 开启充电上限（沿用当前设定值） */
 export async function limitOn(): Promise<void> {
   await run(["limit", "on"], TIMEOUT_WRITE_MS);
+}
+
+/**
+ * 解除附加功能的熔断（「重试」按钮）
+ *
+ * # 🔴 为什么不能用 `limitOn()` / `setPpsEnabled(true)` 代替
+ * （2026-11-01 审计 H-07）
+ *
+ * 熔断后 `runner` 的 `tick_due` 直接 `continue` 跳过该 slot（依据的是
+ * `tripped` 标志，与 `enabled` 无关）。也就是说：
+ *
+ * | 操作 | 结果 |
+ * |---|---|
+ * | 重写 `enabled = true` | `enabled` 本来就是 true，**`tripped` 仍是 true** |
+ * | `addon reset <id>` | `Pending::AddonRecover` → `slot.recover()` 清 `tripped` ✅ |
+ *
+ * 旧实现两处「重试」走的都是前者 ⇒ 用户点了重试、界面显示已启用、
+ * 功能实际**永久停用**，且没有任何提示。
+ *
+ * @param id 附加功能 id（`soc_limit` / `pps`）
+ */
+export async function addonReset(id: "soc_limit" | "pps"): Promise<void> {
+  await run(["addon", "reset", id], TIMEOUT_WRITE_MS);
 }
 
 /**

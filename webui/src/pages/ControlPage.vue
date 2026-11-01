@@ -778,6 +778,50 @@ const limitEnabledShown = computed(
   () => pendingLimitOn.value ?? limitEnabled.value,
 );
 
+/**
+ * 「重试」：解除附加功能熔断
+ *
+ * 🔴 必须走 `addon reset`，不能用 `limitOn()`（2026-11-01 审计 H-07）
+ *
+ * 熔断状态由 `tripped` 决定，与 `enabled` 无关：重写 `enabled=true`
+ * 不会让 `tick_due` 恢复调度。旧实现正是这样写，结果是
+ * 「点了重试、界面显示已启用、功能永久停用」。
+ */
+async function onRetryLimit(): Promise<void> {
+  if (busy.value) {
+    return;
+  }
+  busy.value = true;
+  try {
+    await api.addonReset("soc_limit");
+    await wait(SETTLE_MS);
+    await loadLimit();
+    void showSnackbar({ message: "已请求恢复充电上限功能", duration: "short" });
+  } catch (e) {
+    fail(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+/** 「重试」：解除 PPS 熔断（同 {@link onRetryLimit}） */
+async function onRetryPps(): Promise<void> {
+  if (busy.value) {
+    return;
+  }
+  busy.value = true;
+  try {
+    await api.addonReset("pps");
+    await wait(SETTLE_MS);
+    await loadPps();
+    void showSnackbar({ message: "已请求恢复 PPS 解锁功能", duration: "short" });
+  } catch (e) {
+    fail(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
 /** 开关：开 = 开始约束，关 = 停止干预（零写入） */
 async function onToggleLimit(v: boolean): Promise<void> {
   if (busy.value) {
@@ -1386,7 +1430,7 @@ async function applySoc(): Promise<void> {
         🔴 这里是**功率（W）**，不是电流（A）
 
         用户反馈（2026-10-14）：「降到多少是电流，控制电流不够直白，
-        改成控制功率瓦数」。理由见 `thermo_core::Config::tighten_power_w`：
+        改成控制功率瓦数」。理由见 `hyperpower_core::Config::tighten_power_w`：
         瓦是用户理解的量（充电器、快充协议都标瓦），而安培需要知道电压
         才能换算成"多快"。
 
@@ -1729,7 +1773,7 @@ async function applySoc(): Promise<void> {
           <MiuixButton
             class="actions__btn"
             type="primary"
-            @click="onToggleLimit(true)"
+            @click="onRetryLimit"
           >
             重试
           </MiuixButton>
@@ -1870,7 +1914,7 @@ async function applySoc(): Promise<void> {
           连续失败已自动停用：{{ ppsInfo.last_error ?? "未知原因" }}
         </MiuixText>
         <div class="actions">
-          <MiuixButton class="actions__btn" type="primary" @click="onTogglePps(true)">
+          <MiuixButton class="actions__btn" type="primary" @click="onRetryPps">
             重试
           </MiuixButton>
         </div>

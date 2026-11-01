@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/thermo-core",
-    "crates/thermo-ipc",
-    "crates/thermo-addons",
-    "crates/thermo-cli",
+    "crates/hyperpower-core",
+    "crates/hyperpower-ipc",
+    "crates/hyperpower-addons",
+    "crates/hyperpower-cli",
 ]
 
 [workspace.package]
 # ⚠️ 每次改动后都要递增（与 module/src/module.prop 的 version/versionCode 同步）
 #    否则用户在 KernelSU 里看不出模块已更新。规则见 docs/08 的发布检查表。
-version = "1.0.10"
+version = "1.0.12"
 edition = "2021"
 # 工具链由 rust-toolchain.toml 钉在 1.99.0。
 # 此处声明 MSRV 为 1.82：这是本项目用到的最新特性的稳定版本
@@ -33,7 +33,7 @@ serde_json = "1"
 # ⚠️ 刻意**关闭默认特性**：clap 的 `color` 特性会拉入 `anstream`/`anstyle-wincon`
 #    → `windows-sys`，而本机 GNU 工具链的 `dlltool` 无法为 `windows-sys`
 #    生成导入库（见 docs/08-交接摘要.md §6.3 坑 2）。
-#    关掉它后，`thermo-cli` 在 Windows 上也能编译与跑测试 ——
+#    关掉它后，`hyperpower-cli` 在 Windows 上也能编译与跑测试 ——
 #    代价仅是帮助信息没有彩色，对功能无影响。
 clap = { version = "4", default-features = false, features = [
     "std",
@@ -45,24 +45,22 @@ clap = { version = "4", default-features = false, features = [
 ] }
 
 # 系统调用 / epoll / timerfd / UDS
-rustix = { version = "1", features = ["fs", "time", "event", "net", "process", "stdio"] }
+#
+# ⚠️ 只保留 `libc`（2026-11-01 审计 M-15）：
+#    `rustix` / `neli` / `signal-hook` / `tempfile` 曾在此声明但**全仓零引用**
+#    （worker 需要的 timerfd/poll/flock/netlink/getsockopt 都直接用 libc，
+#     见 `hyperpower-cli/Cargo.toml` 的说明）。留着它们只会：
+#    ① 拖慢 `cargo deny` 与审计面；② 让读者以为有抽象层而去找不存在的封装。
 libc = "0.2"
-
-# 事件（netlink uevent）
-neli = "0.6"
-
-# 信号
-signal-hook = "0.3"
 
 # 日志
 log = "0.4"
 
-# 原子写
-tempfile = "3"
-
 # 测试
+#
+# ⚠️ `insta` 已删除（零引用）；`assert_cmd` 保留但见 `hyperpower-cli/Cargo.toml`
+#    的说明 —— 它声明了却还没有任何集成测试使用它（2026-11-01 审计 M-15）。
 proptest = "1"
-insta = { version = "1", features = ["json"] }
 assert_cmd = "2"
 
 [profile.release]

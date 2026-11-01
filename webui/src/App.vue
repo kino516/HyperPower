@@ -37,7 +37,7 @@
   |---|---|
   | 1 | 首屏要渲染 4 个页面的**全部** DOM 与 miuix 组件 |
   | 2 | 每页 `onMounted` 各发自己的命令 ⇒ 启动瞬间并发 **6 条** `ctl` |
-  | 3 | 每条 `ctl` 要起一个 root shell **加**一个 `thermo` 进程 |
+  | 3 | 每条 `ctl` 要起一个 root shell **加**一个 `hyperpower` 进程 |
 
   ## ③ 当前：`v-show`（显示）+ `v-if` + `visited`（首次访问才挂载）
 
@@ -255,7 +255,7 @@ const navIndex = ref(0);
  * |---|---|
  * | 1 | 首屏要渲染 4 个页面的**全部** DOM 和 miuix 组件 |
  * | 2 | 每个页面在 `onMounted` 里发自己的命令 ⇒ 启动瞬间并发 **6 条** `ctl` |
- * | 3 | 每条 `ctl` 都要起一个 root shell + 一个 `thermo` 进程 |
+ * | 3 | 每条 `ctl` 都要起一个 root shell + 一个 `hyperpower` 进程 |
  *
  * 改为**首次访问才挂载**后，首屏只渲染状态页、只发 1 条命令。
  *
