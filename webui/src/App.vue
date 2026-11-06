@@ -2,7 +2,7 @@
   应用外壳
 
   ┌─────────────────────────┐
-  │ TopAppBar（标题 + 刷新）   │  ← 吸顶
+  │ TopAppBar（标题）          │  ← 吸顶
   ├─────────────────────────┤
   │                         │
   │  页面容器（每页独立滚动）   │
@@ -72,19 +72,15 @@ import {
   type PropType,
 } from "vue";
 import {
-  MiuixIcon,
-  MiuixIconButton,
   MiuixNavigationBar,
   MiuixSnackbarHost,
   MiuixTopAppBar,
 } from "miuix-vue";
-import { Refresh } from "miuix-vue/icons";
 
 import StatusPage from "./pages/StatusPage.vue";
 import TabIcon from "./components/TabIcon.vue";
 
 import { perfMark } from "./perf";
-import { refresh, sysState } from "./stores/sys";
 
 // ============================================================
 //  异步页面（代码分割）用的占位组件
@@ -409,28 +405,33 @@ onBeforeUnmount(() => {
   observer?.disconnect();
   document.documentElement.style.removeProperty("--m-snackbar-inset-bottom");
 });
-
-/** 手动刷新 */
-function onRefresh(): void {
-  void refresh();
-}
 </script>
 
 <template>
   <div class="app">
-    <!-- 顶栏：吸顶，独立于滚动区 -->
+    <!--
+      顶栏：吸顶，独立于滚动区
+
+      ⚠️ 右侧**刻意不放「刷新」按钮**（2026-11-06 删除）
+
+      它名不副实：`refresh()` 只拉 `status` 一条命令，控制页的
+      `thermal/limit/modes`、日志页的事件、更多页的检测结果都**不会**被它刷新。
+      而状态数据本身每 3 秒由 `stores/sys.ts` 轮询一次，页面隐藏时停、
+      切回前台立即补一次 —— 手动刷新最多只省 3 秒。
+
+      各页真正的数据更新入口：
+
+      | 页面 | 更新方式 |
+      |---|---|
+      | 状态 | 3 秒轮询 + 错误态的「重试」按钮 |
+      | 控制 | 挂载时 load；点「应用」后回读 |
+      | 日志 | 卡片标题右侧的「刷新」 |
+      | 更多 | 本页的检测/刷新按钮 |
+
+      放一个只刷新 1/4 数据的按钮，比没有更容易误导用户。
+    -->
     <div class="app__top">
-      <MiuixTopAppBar :title="pageTitle" class="app__appbar">
-        <template #actions>
-          <MiuixIconButton
-            aria-label="刷新"
-            :class="{ 'is-spinning': sysState.loading }"
-            @click="onRefresh"
-          >
-            <MiuixIcon :icon="Refresh" :size="24" />
-          </MiuixIconButton>
-        </template>
-      </MiuixTopAppBar>
+      <MiuixTopAppBar :title="pageTitle" class="app__appbar" />
     </div>
 
     <!--
@@ -572,16 +573,5 @@ function onRefresh(): void {
   z-index: 2;
   padding-bottom: var(--inset-bottom);
   background: var(--m-color-surface);
-}
-
-/* 刷新按钮转圈 */
-.is-spinning :deep(svg) {
-  animation: spin 0.9s linear infinite;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 </style>

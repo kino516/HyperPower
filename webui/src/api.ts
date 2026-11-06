@@ -711,7 +711,7 @@ async function execGuarded(
             new ApiError(
               "E_TIMEOUT",
               `${what}超过 ${timeoutMs / 1000} 秒未响应 —— ` +
-                `后端可能已卡住。可下拉刷新重试；若持续如此，请到「更多」页查看日志`,
+                `后端可能已卡住。请稍后重试；若持续如此，请到「更多」页查看日志`,
             ),
           );
         }, timeoutMs);

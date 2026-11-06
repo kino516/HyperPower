@@ -98,7 +98,7 @@ window.addEventListener("unhandledrejection", (ev) => {
   const reason = ev.reason as { message?: string } | undefined;
   const msg = reason?.message ?? String(ev.reason);
   recordError(`unhandledrejection: ${msg}`);
-  toastError("有一步操作没能完成。可下拉刷新，或在「更多」页记录诊断数据");
+  toastError("有一步操作没能完成。请稍后重试，或在「更多」页记录诊断数据");
 });
 
 // ── 启动 ──

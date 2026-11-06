@@ -56,7 +56,6 @@ import {
   MiuixButton,
   MiuixCard,
   MiuixDivider,
-  MiuixSlider,
   MiuixSmallTitle,
   MiuixSwitch,
   MiuixText,
@@ -64,6 +63,7 @@ import {
 } from "miuix-vue";
 
 import InfoRow from "../components/InfoRow.vue";
+import SafeSlider from "../components/SafeSlider.vue";
 import * as api from "../api";
 import { f0, f1, thermalPairValid } from "../format";
 import { perfMark } from "../perf";
@@ -1294,7 +1294,7 @@ async function applySoc(): Promise<void> {
             {{ f0(tighten) }}℃
           </MiuixText>
         </div>
-        <MiuixSlider
+        <SafeSlider
           :model-value="tighten"
           :min="TEMP_FLOOR"
           :max="tightMax"
@@ -1334,7 +1334,7 @@ async function applySoc(): Promise<void> {
             {{ f0(relax) }}℃
           </MiuixText>
         </div>
-        <MiuixSlider
+        <SafeSlider
           :model-value="relax"
           :min="TEMP_FLOOR"
           :max="relaxMax"
@@ -1385,7 +1385,7 @@ async function applySoc(): Promise<void> {
             {{ f1(rampSpan) }}℃
           </MiuixText>
         </div>
-        <MiuixSlider
+        <SafeSlider
           :model-value="rampSpan"
           :min="RAMP_MIN_C"
           :max="RAMP_MAX_C"
@@ -1468,7 +1468,7 @@ async function applySoc(): Promise<void> {
           </button>
         </div>
 
-        <MiuixSlider
+        <SafeSlider
           :model-value="power"
           :min="0"
           :max="powerSliderMax"
@@ -1554,7 +1554,7 @@ async function applySoc(): Promise<void> {
       </div>
 
       <div class="slider">
-        <MiuixSlider
+        <SafeSlider
           :model-value="shownW"
           :min="0"
           :max="hwMaxW"
@@ -1657,7 +1657,7 @@ async function applySoc(): Promise<void> {
       </div>
 
       <div class="slider" :class="{ 'is-dim': !limitEnabled }">
-        <MiuixSlider
+        <SafeSlider
           :model-value="socShown"
           :min="socMin"
           :max="socMax"
