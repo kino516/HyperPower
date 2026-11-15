@@ -114,6 +114,66 @@ pub fn reap_finished() {
     *list = alive;
 }
 
+// ============================================================
+//  附加功能的状态持久化（跨重启记账）
+// ============================================================
+
+/// 附加功能 id 是否安全（只允许小写字母 / 数字 / 下划线）
+///
+/// 状态文件名由 id 拼出，因此必须先挡掉路径分隔符与 `..` ——
+/// 虽然当前 id 全是编译期常量，但接口是公开的，不能依赖"调用方很乖"。
+fn safe_state_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// 读取附加功能的持久化状态（JSON 文本）
+///
+/// 读不到 / 内容非法一律返回 `None`，由调用方决定怎么容错 ——
+/// 状态坏了最多丢进度，**绝不能**阻止充电上限工作。
+pub fn load_addon_state(id: &str) -> Option<String> {
+    if !safe_state_id(id) {
+        log::warn!("附加功能状态 id 非法：{id:?}");
+        return None;
+    }
+    std::fs::read_to_string(crate::paths::addon_state_json(id)).ok()
+}
+
+/// 写入附加功能的持久化状态（JSON 文本）
+///
+/// 与配置写入同规则：临时文件 → `fsync` → `rename`，掉电不会留下半截文件。
+pub fn save_addon_state(id: &str, json: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    if !safe_state_id(id) {
+        return Err(format!("附加功能状态 id 非法：{id:?}"));
+    }
+    let path = crate::paths::addon_state_json(id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建状态目录失败：{e}"))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| format!("写入临时文件失败：{e}"))?;
+        f.flush().map_err(|e| format!("刷新临时文件失败：{e}"))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync 临时文件失败：{e}"))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| format!("替换状态文件失败：{e}"))?;
+    // rename 之后同步目录项，掉电时"改名"这一步才不会丢
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            d.sync_all().ok();
+        }
+    }
+    Ok(())
+}
+
 /// 基于真实文件系统的 [`AddonIo`] 实现
 ///
 /// ⚠️ 这是附加功能**唯一**的 I/O 出口 —— 它们自己不碰文件系统，
@@ -192,6 +252,16 @@ impl AddonIo for SysfsIo {
     /// 见 [`spawn_child`] —— 只 `spawn`、不等待，立刻返回。
     fn spawn_detached(&mut self, args: &[&str]) -> Result<(), String> {
         spawn_child(args)
+    }
+
+    /// 读取附加功能状态（数据目录 `state/<id>.json`）
+    fn load_state(&mut self, id: &str) -> Option<String> {
+        load_addon_state(id)
+    }
+
+    /// 写入附加功能状态（原子替换，详见 [`save_addon_state`]）
+    fn save_state(&mut self, id: &str, json: &str) -> Result<(), String> {
+        save_addon_state(id, json)
     }
 }
 

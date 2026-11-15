@@ -166,6 +166,39 @@ ctl limit show         # 看状态：目标值、**驱动实际生效值**、写
 `55 ~ 100`（下限 55 来自真机驱动报错信息
 `Charge control end_threshold should be within [55 100]`）。
 
+### 定期满充（电池校准）
+
+长期把上限压在 80% 左右，电量计（BMS）会逐渐积累误差，偶尔满充一次有助于校准。
+本功能可以设置：满足条件时临时把上限放开到 100% 充满一次，充满后自动恢复设定值。
+
+| 条件 | 配置键 | 默认 |
+|---|---|---|
+| 充入 **N 个完整循环**后满充一次 | `limit.full_after_cycles` | `10`（`0` = 关闭该条件） |
+| 每 **N 天**满充一次 | `limit.full_interval_days` | `7`（`0` = 关闭该条件） |
+| 总开关 | `limit.full_enabled` | `false` |
+
+两个条件**任一满足**即触发；出厂默认关闭（行为与旧版完全一致）。
+
+> ### 🔴 "完整循环"不是"插一次电源"
+>
+> 一次完整循环 = **累计充入 100% 电池电量**：
+>
+> | 场景 | 计数 |
+> |---|---|
+> | 从 60% 充到 80%（一个充电会话） | **0.2 次** |
+> | 从 20% 充到 80% | 0.6 次 |
+> | 一天插拔四五次、每次只充一点 | 按实际充入量累加，**不会**每次算一次 |
+>
+> 所以"充 10 次"通常需要十几天到几十天，具体取决于你每天实际充进去多少电。
+> 进度会跨重启保存（`/data/adb/hyperpower/state/soc_limit.json`），卸载时随数据目录清除。
+
+```bash
+ctl set limit.full_enabled true       # 打开定期满充
+ctl set limit.full_after_cycles 10    # 10 个完整循环满充一次（0 = 关闭）
+ctl set limit.full_interval_days 7    # 7 天满充一次（0 = 关闭）
+ctl limit show                        # detail 里有 full_cycles_done / full_pending / full_next_epoch_s
+```
+
 ### 关闭的语义：不改写驱动
 
 关闭开关**不会**把限制改回 100% —— 手机会继续停在当前上限

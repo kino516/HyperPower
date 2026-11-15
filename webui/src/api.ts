@@ -1192,8 +1192,14 @@ export async function setDebugEnabled(on: boolean): Promise<void> {
 
 /** 演示模式下的可变状态（让开关/滑块在浏览器里能点动） */
 const demo = {
-  limitEnabled: false,
+  // 演示模式默认启用充电上限：否则「定期满充」会显示成
+  // 「总开关关着、满充开关开着」的矛盾状态
+  limitEnabled: true,
   soc: 80,
+  /** 定期满充（演示用）：默认展开，方便在浏览器里看到这块界面 */
+  fullEnabled: true,
+  fullAfterCycles: 10,
+  fullIntervalDays: 7,
   /** 当前生效的模式（演示用） */
   mode: "custom",
   /** 调试模式开关（演示用） */
@@ -1338,6 +1344,22 @@ function mockHistoryList(): unknown {
 
 function mock(parts: string[]): unknown {
   const [head, sub] = parts;
+
+  // 通用配置写入（演示模式：只处理界面会回读的 `limit.full_*`）
+  //
+  // 真实后端走 UDS 落盘；演示模式必须让开关/选项点得动，
+  // 否则用户在浏览器里看到的是一张"点了没反应"的假界面。
+  if (head === "set") {
+    const batch = sub === "--batch" ? (parts[2] ?? "") : "";
+    const pairs = sub === "--batch" ? batch.split(/\s+/) : [`${sub}=${parts[2] ?? ""}`];
+    for (const pair of pairs) {
+      const [k, v] = pair.split("=");
+      if (k === "limit.full_enabled") demo.fullEnabled = v === "true";
+      if (k === "limit.full_after_cycles") demo.fullAfterCycles = Number(v);
+      if (k === "limit.full_interval_days") demo.fullIntervalDays = Number(v);
+    }
+    return { ok: true };
+  }
 
   if (head === "mode") {
     if (sub === "switch") {
@@ -1566,6 +1588,17 @@ function mockLimit(): AddonStatus {
       warn_on_conflict: true,
       conflict_suspected: false,
       write_count: 3,
+      // ── 定期满充（演示数据）──
+      full_enabled: demo.fullEnabled,
+      full_after_cycles: demo.fullAfterCycles,
+      full_interval_days: demo.fullIntervalDays,
+      soc_effective_target: demo.soc,
+      full_pending: false,
+      full_cycles_done: 6,
+      full_cycle_progress_pct: 40,
+      full_last_epoch_s: 0,
+      full_next_epoch_s:
+        Math.floor(Date.now() / 1000) + demo.fullIntervalDays * 86_400 / 2,
       // 与后端 `NOTE_UI_NOT_SYNCED` 同款文案（演示模式要能看出这块提示的样子）
       note_ui_not_synced:
         "系统设置里显示的百分比不会跟着变（那是系统自己的文案）。以本页的「已生效」为准。",

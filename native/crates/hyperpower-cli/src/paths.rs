@@ -165,6 +165,34 @@ pub fn night_json() -> PathBuf {
     data_dir().join("night.json")
 }
 
+/// 附加功能的持久化状态目录
+///
+/// 每个功能一个 JSON 文件（`<id>.json`），存的是**运行状态**而不是用户配置：
+///
+/// | 文件 | 内容 |
+/// |---|---|
+/// | `soc_limit.json` | 定期满充：累计充入电量、上次满充时间、是否满充中 |
+///
+/// # 为什么与 `config.json` 分开
+///
+/// | 放进配置的后果 | 说明 |
+/// |---|---|
+/// | 污染用户意图 | 备份/同步配置时把"已经充了 6.3 个循环"一起带走 |
+/// | 触发变更通知 | 每 15 秒改一次配置，WebUI 会不断刷新 |
+///
+/// 与 [`night_json`] 同理：这是记账，不是配置。
+///
+/// ⚠️ 卸载仍会删除整个数据目录（用户要求"卸载即无残留"），
+///    届时进度一并清除 —— 这是预期行为。
+pub fn addon_state_dir() -> PathBuf {
+    data_dir().join("state")
+}
+
+/// 某个附加功能的状态文件
+pub fn addon_state_json(id: &str) -> PathBuf {
+    addon_state_dir().join(format!("{id}.json"))
+}
+
 /// 日志目录
 pub fn log_dir() -> PathBuf {
     data_dir().join("logs")

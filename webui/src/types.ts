@@ -218,6 +218,29 @@ export interface SocLimitDetail {
   conflict_suspected?: boolean;
   /** 累计写入次数 */
   write_count: number;
+  // ── 定期满充（电池校准，2026-11-15）──
+  /** 是否启用定期满充 */
+  full_enabled: boolean;
+  /** 累计充入多少个**完整循环**后满充一次（0 = 关闭该条件） */
+  full_after_cycles: number;
+  /** 每多少天满充一次（0 = 关闭该条件） */
+  full_interval_days: number;
+  /**
+   * 本拍**实际**写入的上限
+   *
+   * 平时 = `soc_target`；定期满充进行中 = 100（临时放开）。
+   */
+  soc_effective_target: number;
+  /** 是否正在执行满充 */
+  full_pending: boolean;
+  /** 已完成的完整循环数（整数部分） */
+  full_cycles_done: number;
+  /** 当前循环的进度（%） */
+  full_cycle_progress_pct: number;
+  /** 上次满充完成时间（Unix 秒；0 = 从未满充） */
+  full_last_epoch_s: number;
+  /** 周条件下的下次满充时间（Unix 秒；`null` = 未启用该条件） */
+  full_next_epoch_s: number | null;
   /**
    * **系统设置界面显示的百分比不会同步**的说明
    *

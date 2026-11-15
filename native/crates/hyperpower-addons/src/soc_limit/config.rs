@@ -70,6 +70,71 @@ pub const VERIFY_MIN_S: u32 = 5;
 /// 校验间隔上限（秒）
 pub const VERIFY_MAX_S: u32 = 300;
 
+// ============================================================
+//  定期满充（电池校准）
+// ============================================================
+//
+// 用户需求（2026-11-15）：「设置充电上限后，定期充满一次」：
+//   · 可设置「充入 10 个完整循环后满充一次」
+//   · 可设置「每星期满充一次」
+//   · **10 次必须是 10 个完整循环** —— 不能插一次电源就计一次
+//
+// 「完整循环」采用**累计充入电量**口径：
+//
+// ```text
+// 一个完整循环 = 累计充入 100% 电池电量
+// 20% → 80% 只算 0.6 个循环（充入 60%）
+// ```
+//
+// 为什么不用「插拔一次」：用户一天可能插拔四五次，插拔 10 次
+// 远不到 10 个完整循环；那样「10 次」会在两三天内就到了，
+// 满充过于频繁，反而背离"保护电池"的初衷。
+//
+// 为什么不用驱动自带的 `cycle_count`：各机型节点名与更新粒度不同
+// （有的按整百电量才 +1），属于机型数据，违反 R3「不写死机型数据」。
+// 用 SOC 增量累计不需要任何机型节点。
+
+/// 满充目标电量（%）：解除上限、充到满
+///
+/// 取物理上限 100。若本机检测出的上限区间上界更低，实际写入会用
+/// 「区间上界」（见 `SocLimit::full_target`）—— 驱动不支持 100 时
+/// 强行写只会被拒绝。
+pub const FULL_SOC: u8 = 100;
+
+/// 一个完整循环的充入电量（%）
+pub const CYCLE_PERCENT: u32 = 100;
+
+/// 累计充入电量的封顶（%）—— 200 个完整循环
+///
+/// 只是防溢出的物理护栏，远大于任何有意义的阈值。
+pub const CYCLE_CAP_PCT: u32 = 20_000;
+
+/// 一天有多少秒（周满充的换算）
+pub const DAY_S: i64 = 86_400;
+
+/// `full_after_cycles` 的取值范围（0 = 关闭该条件）
+pub const FULL_CYCLES_MIN: u32 = 0;
+/// `full_after_cycles` 上限
+pub const FULL_CYCLES_MAX: u32 = 999;
+
+/// `full_interval_days` 的取值范围（0 = 关闭该条件）
+pub const FULL_DAYS_MIN: u32 = 0;
+/// `full_interval_days` 上限（一年）
+pub const FULL_DAYS_MAX: u32 = 365;
+
+/// 状态持久化的标识（宿主用它定位状态文件）
+///
+/// 与配置分区名 [`SECTION`] 相同，便于一眼对应；文件路径由宿主决定，
+/// 附加功能本身**不碰文件系统**（R4）。
+pub const STATE_ID: &str = SECTION;
+
+/// 状态落盘的最小间隔（秒）
+///
+/// 充电中每拍（15 秒）SOC 都会涨，若每拍都写状态文件，一次两小时的
+/// 充电就是 480 次小文件写入。节流到每分钟一次足够 —— 即使进程被杀，
+/// 最多丢 1 分钟的充入量（< 2% 电量），对 10 次循环的计数没有影响。
+pub const STATE_SAVE_MIN_GAP_S: i64 = 60;
+
 /// 充电上限功能的配置
 ///
 /// 字段缺失时一律取 [`Default`]（升级/降级不因缺键而拒绝启动）。
@@ -104,6 +169,24 @@ pub struct SocLimitConfig {
     ///    这里不要再写字段级 `default` —— 那会覆盖成 `false`，
     ///    于是"老配置缺这个键"变成"关闭提示"，与 `Default` 不一致。
     pub warn_on_conflict: bool,
+    /// 是否启用**定期满充**（电池校准）
+    ///
+    /// 出厂默认 `false`：不启用时行为与旧版完全一致（零额外写入）。
+    ///
+    /// 开启后，满足 [`Self::full_after_cycles`] 或
+    /// [`Self::full_interval_days`] 任一条件时，临时把上限放到 100%
+    /// 充满一次；充满后恢复原上限并把循环计数清零。
+    pub full_enabled: bool,
+    /// 充入累计多少个**完整循环**后满充一次
+    ///
+    /// `0` = 关闭该条件。完整循环按「累计充入 100% 电量」计，
+    /// **不是插拔次数**（见模块文档）。
+    pub full_after_cycles: u32,
+    /// 每多少天满充一次
+    ///
+    /// `0` = 关闭该条件。计时起点是「上次满充完成」；
+    /// 从未满充过时用「功能启用时刻」，因此首次满充在启用后满 N 天。
+    pub full_interval_days: u32,
 }
 
 impl Default for SocLimitConfig {
@@ -114,6 +197,11 @@ impl Default for SocLimitConfig {
             verify_s: 15,
             keep_on_restore: true,
             warn_on_conflict: true,
+            // 定期满充默认关闭：出厂行为与旧版完全一致
+            full_enabled: false,
+            // 用户需求里的两个默认值：10 个完整循环 / 7 天
+            full_after_cycles: 10,
+            full_interval_days: 7,
         }
     }
 }
@@ -173,6 +261,19 @@ impl SocLimitConfig {
                 self.verify_s
             ));
         }
+        // 满充条件：0 = 关闭该条件；两个都 0 时即使总开关打开也永不触发
+        if !(FULL_CYCLES_MIN..=FULL_CYCLES_MAX).contains(&self.full_after_cycles) {
+            return Err(format!(
+                "满充循环数 {} 超出支持范围（{FULL_CYCLES_MIN}~{FULL_CYCLES_MAX}）",
+                self.full_after_cycles
+            ));
+        }
+        if !(FULL_DAYS_MIN..=FULL_DAYS_MAX).contains(&self.full_interval_days) {
+            return Err(format!(
+                "满充间隔 {} 天超出支持范围（{FULL_DAYS_MIN}~{FULL_DAYS_MAX} 天）",
+                self.full_interval_days
+            ));
+        }
         Ok(())
     }
 
@@ -191,3 +292,51 @@ impl SocLimitConfig {
 /// 不做事不代表不用醒来 —— 用户可能随时改配置（或经 UDS 通知），
 /// 放慢到 60 秒看一眼即可，开销可忽略。
 pub const IDLE_INTERVAL_S: u32 = 60;
+
+/// 定期满充的**运行状态**（跨重启持久化）
+///
+/// # 为什么与配置分开
+///
+/// 这里记的是「已经充入了多少电量、上次满充在什么时候」—— 是**记账**，
+/// 不是用户意图。写进 `config.json` 会有两个问题：
+///
+/// | 问题 | 后果 |
+/// |---|---|
+/// | 污染用户配置 | 备份/同步配置时把运行进度一起带走 |
+/// | 干扰配置变更通知 | 每 15 秒改一次配置，WebUI 会不断弹"配置已变" |
+///
+/// ⇒ 单独落一个状态文件（路径由宿主决定，见 [`STATE_ID`]）。
+///
+/// 文件损坏 / 缺失时一律退回 [`Default`]：最多从头计数，
+/// 绝不能让坏状态阻止充电上限正常工作。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FullChargeState {
+    /// 累计充入电量（%）
+    ///
+    /// 每 100 = 1 个完整循环。按 SOC 正增量累计：
+    /// 20% → 80% 记 60，而不是记 1 次。
+    pub charged_pct: u32,
+    /// 上次满充完成时间（Unix 秒）；`0` = 从未满充
+    pub last_full_epoch_s: i64,
+    /// 上一拍读到的 SOC（跨拍/跨会话累计的基准）
+    pub last_soc: Option<u8>,
+    /// 是否正在执行满充（上限临时放到 100%）
+    pub pending: bool,
+    /// 功能启用时刻（Unix 秒）—— 周计时在"从未满充"时的起点
+    pub enabled_since_s: i64,
+    /// 上次落盘时间（Unix 秒，仅用于节流）
+    pub saved_at_s: i64,
+}
+
+impl FullChargeState {
+    /// 已完成的**完整循环**数（整数部分）
+    pub fn cycles_done(&self) -> u32 {
+        self.charged_pct / CYCLE_PERCENT
+    }
+
+    /// 当前循环的进度（%）
+    pub fn cycle_progress_pct(&self) -> u32 {
+        self.charged_pct % CYCLE_PERCENT
+    }
+}

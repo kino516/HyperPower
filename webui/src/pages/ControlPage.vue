@@ -203,6 +203,8 @@ const socRange = ref<[number, number]>([api.SOC_MIN, api.SOC_MAX]);
 const pendingSoc = ref<number | null>(null);
 /** 刚拨动、还没被后端确认的开关状态：让开关**立刻**跟手 */
 const pendingLimitOn = ref<boolean | null>(null);
+/** 定期满充开关的乐观值（同 `pendingLimitOn`） */
+const pendingFullOn = ref<boolean | null>(null);
 
 // ── 卡片 5：PPS 解锁 ──
 const ppsInfo = ref<AddonStatus | null>(null);
@@ -765,6 +767,55 @@ const socKeyPoints = computed(() =>
   SOC_KEY_POINTS.filter((v) => v >= socMin.value && v <= socMax.value),
 );
 
+// ── 定期满充（电池校准，2026-11-15）──
+
+/**
+ * 完整循环的可选项（0 = 关闭该条件）
+ *
+ * 用户需求的原话是「充电 10 次后满充一次」，这里给几个常用档位；
+ * 「完整循环」按**累计充入电量**计，不是插拔次数（见下方说明文案）。
+ */
+const FULL_CYCLE_OPTIONS = [0, 5, 10, 15, 20, 30];
+
+/** 天数的可选项（0 = 关闭该条件） */
+const FULL_DAY_OPTIONS = [0, 3, 7, 14, 30];
+
+const fullEnabled = computed(() => limitDetail.value?.full_enabled ?? false);
+const fullEnabledShown = computed(
+  () => pendingFullOn.value ?? fullEnabled.value,
+);
+const fullAfterCycles = computed(
+  () => limitDetail.value?.full_after_cycles ?? 10,
+);
+const fullIntervalDays = computed(
+  () => limitDetail.value?.full_interval_days ?? 7,
+);
+
+/** 满充状态文案（只读，来自后端 detail） */
+const fullStatusText = computed(() => {
+  const d = limitDetail.value;
+  if (!d || !d.full_enabled) {
+    return "";
+  }
+  if (d.full_pending) {
+    return "正在满充至 100%（校准中）—— 充满后自动恢复上限";
+  }
+  const parts: string[] = [];
+  if (d.full_after_cycles > 0) {
+    parts.push(
+      `已充入 ${d.full_cycles_done} 个完整循环（当前 ${d.full_cycle_progress_pct}%）`,
+    );
+  }
+  if (d.full_interval_days > 0 && d.full_next_epoch_s !== null) {
+    const left = Math.max(
+      0,
+      Math.ceil((d.full_next_epoch_s * 1000 - Date.now()) / 86_400_000),
+    );
+    parts.push(`距下次满充约 ${left} 天`);
+  }
+  return parts.join("；") || "两个条件都为 0：不会触发满充";
+});
+
 /** 滑块显示值 */
 const socShown = computed(() => pendingSoc.value ?? socTarget.value);
 
@@ -850,6 +901,51 @@ async function onToggleLimit(v: boolean): Promise<void> {
     pendingLimitOn.value = null;
     busy.value = false;
   }
+}
+
+/**
+ * 提交定期满充的一个配置键（`limit.full_*`）
+ *
+ * 与 `onToggleLimit` 同构：写配置 → 等落盘 → 重新读状态。
+ * `setConfig` 是**批量写**，任一键失败整批拒绝。
+ */
+async function patchLimitFull(pairs: [string, string][]): Promise<void> {
+  busy.value = true;
+  try {
+    await api.setConfig(pairs);
+    await wait(SETTLE_MS);
+    await loadLimit();
+  } catch (e) {
+    fail(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+/** 开关：是否启用定期满充 */
+async function onToggleFull(v: boolean): Promise<void> {
+  if (busy.value) {
+    return;
+  }
+  pendingFullOn.value = v;
+  await patchLimitFull([["limit.full_enabled", String(v)]]);
+  pendingFullOn.value = null;
+}
+
+/** 选「充入多少个完整循环后满充一次」（0 = 关闭） */
+async function onPickFullCycles(n: number): Promise<void> {
+  if (busy.value || n === fullAfterCycles.value) {
+    return;
+  }
+  await patchLimitFull([["limit.full_after_cycles", String(n)]]);
+}
+
+/** 选「每多少天满充一次」（0 = 关闭） */
+async function onPickFullDays(n: number): Promise<void> {
+  if (busy.value || n === fullIntervalDays.value) {
+    return;
+  }
+  await patchLimitFull([["limit.full_interval_days", String(n)]]);
 }
 
 /**
@@ -1701,6 +1797,114 @@ async function applySoc(): Promise<void> {
       </MiuixText>
 
       <MiuixDivider class="gap" />
+
+      <!--
+        ── 定期满充（电池校准，2026-11-15 用户需求） ──
+
+        用户原话：「设置充电上限后，定期充满一次」：
+          · 可设置充电 10 次后满充一次
+          · 可设置一个星期满充一次
+          · 10 次必须是 10 次**完整循环**，不能插一次电源就计一次
+
+        ⇒ 完整循环按「累计充入 100% 电量」计（后端 `full_cycles_done`），
+          界面上必须把这句话写清楚，否则用户会以为"插 10 次电"就到数了。
+      -->
+      <div class="row">
+        <div class="row__text">
+          <MiuixText type="body1">定期满充（校准）</MiuixText>
+          <MiuixText
+            type="footnote1"
+            color="var(--m-color-on-surface-secondary)"
+          >
+            平时按上限限制；满足条件时充满一次，帮助电量计校准
+          </MiuixText>
+        </div>
+        <MiuixSwitch
+          :model-value="fullEnabledShown"
+          :disabled="!limitEnabled || busy"
+          @update:model-value="onToggleFull"
+        />
+      </div>
+
+      <template v-if="fullEnabled">
+        <!-- 条件 ①：完整循环数 -->
+        <div class="field">
+          <div class="field__head">
+            <div class="field__text">
+              <MiuixText type="body1">充入完整循环</MiuixText>
+              <MiuixText
+                type="footnote1"
+                color="var(--m-color-on-surface-secondary)"
+              >
+                累计充入 {{ fullAfterCycles }} 个完整循环后满充一次（0 = 关闭）
+              </MiuixText>
+            </div>
+          </div>
+          <div class="chips">
+            <button
+              v-for="n in FULL_CYCLE_OPTIONS"
+              :key="`cyc-${n}`"
+              type="button"
+              class="chip chip--pick"
+              :class="{ 'chip--on': fullAfterCycles === n }"
+              :disabled="loading || busy"
+              @click="onPickFullCycles(n)"
+            >
+              {{ n === 0 ? "关闭" : `${n} 次` }}
+            </button>
+          </div>
+        </div>
+
+        <!-- 条件 ②：天数 -->
+        <div class="field">
+          <div class="field__head">
+            <div class="field__text">
+              <MiuixText type="body1">定时满充</MiuixText>
+              <MiuixText
+                type="footnote1"
+                color="var(--m-color-on-surface-secondary)"
+              >
+                每 {{ fullIntervalDays }} 天满充一次（0 = 关闭）
+              </MiuixText>
+            </div>
+          </div>
+          <div class="chips">
+            <button
+              v-for="n in FULL_DAY_OPTIONS"
+              :key="`day-${n}`"
+              type="button"
+              class="chip chip--pick"
+              :class="{ 'chip--on': fullIntervalDays === n }"
+              :disabled="loading || busy"
+              @click="onPickFullDays(n)"
+            >
+              {{ n === 0 ? "关闭" : `${n} 天` }}
+            </button>
+          </div>
+        </div>
+
+        <!-- 当前进度（只读） -->
+        <div v-if="fullStatusText" class="notice">
+          <MiuixText type="footnote1">
+            {{ fullStatusText }}
+          </MiuixText>
+        </div>
+
+        <!--
+          🔴 这句话必须显眼：用户明确要求「10 次必须是完整循环」。
+          不写清楚，用户会把"插拔 10 次"当成"10 次完整循环"。
+        -->
+        <div class="notice">
+          <MiuixText
+            type="footnote2"
+            color="var(--m-color-on-surface-secondary)"
+          >
+            <b>一次完整循环 = 累计充入 100% 电量</b>：从 60% 充到 80% 只算
+            0.2 次，插一次电源不会算一次。满充期间上限临时放开到 100%，
+            充满后自动恢复设定值并清零循环计数。
+          </MiuixText>
+        </div>
+      </template>
 
       <!-- 说明与状态 -->
       <div class="notice">

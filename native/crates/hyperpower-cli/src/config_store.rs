@@ -388,12 +388,27 @@ pub const KEYS: &[KeySpec] = &[
     spec("daemon.on_demand", KeyKind::Bool),
     spec("daemon.standby_s", KeyKind::Int { min: 5, max: 300 }),
     spec("daemon.hb_timeout_s", KeyKind::Int { min: 30, max: 300 }),
-    // ── §8 充电上限分区（5，**附加功能**）──
+    // ── §8 充电上限分区（8，**附加功能**）──
     spec("limit.enabled", KeyKind::Bool),
     spec("limit.soc", KeyKind::Int { min: 60, max: 100 }),
     spec("limit.verify_s", KeyKind::Int { min: 5, max: 300 }),
     spec("limit.keep_on_restore", KeyKind::Bool),
     spec("limit.warn_on_conflict", KeyKind::Bool),
+    // 定期满充（电池校准，2026-11-15 用户需求）
+    //
+    // | 键 | 含义 |
+    // |---|---|
+    // | `full_after_cycles` | 充入多少个**完整循环**后满充一次（0 = 关闭该条件） |
+    // | `full_interval_days` | 每多少天满充一次（0 = 关闭该条件） |
+    //
+    // 两者任一满足即触发；完整循环按「累计充入 100% 电量」计，
+    // **不是插拔次数**（见 `hyperpower_addons::soc_limit::config` 的说明）。
+    spec("limit.full_enabled", KeyKind::Bool),
+    spec("limit.full_after_cycles", KeyKind::Int { min: 0, max: 999 }),
+    spec(
+        "limit.full_interval_days",
+        KeyKind::Int { min: 0, max: 365 },
+    ),
     // ── §8.5 PPS 解锁分区（6，**附加功能**）──
     //
     // ⚠️ 与 `limit.*` **完全独立**：写坏一个不影响另一个。
@@ -555,7 +570,11 @@ pub fn default_config() -> Value {
             "soc": 80,
             "verify_s": 15,
             "keep_on_restore": true,
-            "warn_on_conflict": true
+            "warn_on_conflict": true,
+            // 定期满充：默认关闭，两个条件分别是「10 个完整循环」与「7 天」
+            "full_enabled": false,
+            "full_after_cycles": 10,
+            "full_interval_days": 7
         },
         "pps": {
             "enabled": false,
@@ -1704,13 +1723,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 键总数为五十五() {
+    fn 键总数为五十八() {
         // 51 = 移除 device.power_limit_w、加入充电历史（+3）、调试模式（+2）
         //      与 PPS 解锁（+6）后的基线。
         //
         // +4（2026-10-26）见 §12：`night.*` —— 夜间模式（模式调度，独立分区）：
         //     `night.enabled` / `night.start` / `night.end` / `night.mode`。
-        assert_eq!(key_count(), 55, "夜间模式（+4）后合计 55 个键");
+        //
+        // +3（2026-11-15）见 §8：定期满充（电池校准）：
+        //     `limit.full_enabled` / `limit.full_after_cycles` / `limit.full_interval_days`。
+        assert_eq!(key_count(), 58, "定期满充（+3）后合计 58 个键");
     }
 
     /// 时间键：接受 `H:MM` 并规范化；非法值拒绝且**不改原值**

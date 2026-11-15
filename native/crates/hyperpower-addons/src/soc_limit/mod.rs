@@ -25,8 +25,8 @@ use serde_json::json;
 
 use crate::addon::{Addon, AddonError, AddonSpec, AddonStatus, ProbeOutcome, TickOutcome};
 use crate::io::AddonIo;
-pub use config::SocLimitConfig;
 use config::IDLE_INTERVAL_S;
+pub use config::{FullChargeState, SocLimitConfig};
 
 /// `smart_chg` 的候选路径（**顺序即优先级**）
 ///
@@ -112,6 +112,27 @@ const RSOC_CANDIDATES: &[&str] = &[
 const FAKE_SOC_CANDIDATES: &[&str] = &[
     "/sys/class/qcom-battery/fake_soc",
     "/sys/class/power_supply/battery/fake_soc",
+];
+
+/// **系统电量**节点候选（%）—— 定期满充的充入量累计用
+///
+/// 优先用驱动真实值（[`RSOC_CANDIDATES`]），读不到时退回系统口径。
+/// 两个都是 0~100 的百分比，`logic::parse_active` 可以直接解析。
+const CAPACITY_CANDIDATES: &[&str] = &[
+    "/sys/class/power_supply/battery/capacity",
+    "/sys/class/power_supply/bms/capacity",
+];
+
+/// **充电状态**节点候选 —— 判断"已经充满"
+///
+/// 满充完成的判据有两路：
+/// 1. 读到的 SOC 达到 100%（**主判据**）
+/// 2. `status` 变成 `Full`（有些机型满电后 `capacity` 停在 99）
+///
+/// 两路都是只读，不写任何节点。
+const STATUS_CANDIDATES: &[&str] = &[
+    "/sys/class/power_supply/battery/status",
+    "/sys/class/power_supply/bms/status",
 ];
 
 /// 控制节点的**写入方言**
@@ -310,6 +331,23 @@ pub struct SocLimit {
     fake_soc_orig: Option<String>,
     /// 上一次写入 `fake_soc` 的值（相同则跳过，减少无谓写入）
     fake_soc_last: Option<u8>,
+    /// **定期满充**的运行状态（首次巡检时从宿主加载）
+    ///
+    /// 与配置分开：这是记账（充了多少、上次何时满充），不是用户意图。
+    /// 见 [`FullChargeState`] 与 [`config::STATE_ID`]。
+    state: FullChargeState,
+    /// 状态是否已从宿主加载（每个进程只加载一次）
+    state_loaded: bool,
+    /// 状态是否有未落盘的改动
+    state_dirty: bool,
+    /// 下一次立即落盘（触发/完成满充等关键变化不等节流）
+    state_force_save: bool,
+    /// 状态落盘失败是否已告警（避免每拍刷日志）
+    state_save_warned: bool,
+    /// 采样节点：系统电量 `capacity`（[`node_rsoc`](Self::node_rsoc) 不存在时用）
+    node_soc: Option<String>,
+    /// 充电状态节点（`Full` 判据）
+    node_status: Option<String>,
 }
 
 impl SocLimit {
@@ -333,6 +371,13 @@ impl SocLimit {
             node_fake_soc: None,
             fake_soc_orig: None,
             fake_soc_last: None,
+            state: FullChargeState::default(),
+            state_loaded: false,
+            state_dirty: false,
+            state_force_save: false,
+            state_save_warned: false,
+            node_soc: None,
+            node_status: None,
         }
     }
 
@@ -484,6 +529,269 @@ impl SocLimit {
                 .and_then(|raw| logic::parse_active(&raw));
         }
     }
+
+    // ============================================================
+    //  定期满充（电池校准）
+    // ============================================================
+
+    /// 定期满充的运行状态（只读）
+    pub fn full_state(&self) -> &FullChargeState {
+        &self.state
+    }
+
+    /// 满充目标：解除上限、尽量充到 100%
+    ///
+    /// 若本机检测出的上限区间上界低于 100（极少见），取区间上界 ——
+    /// 驱动不支持 100 时硬写只会被拒绝，然后连续失败熔断。
+    fn full_target(&self) -> u8 {
+        let (_, max) = self.effective_range();
+        max.clamp(config::SOC_PHYSICAL_MIN, config::FULL_SOC)
+    }
+
+    /// 本拍实际要写入的上限
+    ///
+    /// | 状态 | 目标 |
+    /// |---|---|
+    /// | 定期满充进行中 | [`Self::full_target`]（通常 100%） |
+    /// | 其余 | `config.soc`（用户设定值） |
+    fn effective_target(&self) -> u8 {
+        if self.state.pending {
+            self.full_target()
+        } else {
+            self.config.soc
+        }
+    }
+
+    /// 首次巡检时加载状态（每个进程一次）
+    ///
+    /// 坏文件 / 缺文件一律退回默认值：最多从头计数，
+    /// **绝不能**因为状态坏了而让充电上限失效。
+    fn ensure_state(&mut self, io: &mut dyn AddonIo, now_s: i64) {
+        if self.state_loaded {
+            return;
+        }
+        self.state_loaded = true;
+
+        if let Some(raw) = io.load_state(config::STATE_ID) {
+            match serde_json::from_str::<FullChargeState>(&raw) {
+                Ok(s) => self.state = s,
+                Err(e) => log::warn!("[soc_limit] 满充状态文件损坏，已重置：{e}"),
+            }
+        }
+
+        // 周计时的起点：从未显式记录过就取"现在"
+        if self.state.enabled_since_s <= 0 {
+            self.state.enabled_since_s = now_s;
+            self.state_dirty = true;
+        }
+        // 时钟回拨：记录的上次满充时间在未来 ⇒ 视为从未满充
+        if self.state.last_full_epoch_s > now_s.saturating_add(config::DAY_S) {
+            log::warn!("[soc_limit] 满充时间戳异常（在未来），已重置");
+            self.state.last_full_epoch_s = 0;
+            self.state_dirty = true;
+        }
+        // 上次进程退出时正在满充 ⇒ 继续完成它（不许悄悄吞掉）
+        if self.state.pending {
+            self.state_dirty = true;
+        }
+    }
+
+    /// 读当前电量（%）：优先驱动真实值，其次系统口径
+    ///
+    /// 只读；两个节点都读不到返回 `None`（本拍不累计，不猜）。
+    fn read_soc(&mut self, io: &mut dyn AddonIo) -> Option<u8> {
+        for p in [self.node_rsoc.clone(), self.node_soc.clone()]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(raw) = io.read(&p) {
+                if let Some(v) = logic::parse_active(&raw) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    /// 是否已经充满（只读）
+    ///
+    /// 两路判据：SOC 到 100%，或驱动状态变成 `Full`。
+    fn is_full(&mut self, io: &mut dyn AddonIo, soc: u8) -> bool {
+        if soc >= config::FULL_SOC {
+            return true;
+        }
+        let Some(p) = self.node_status.clone() else {
+            return false;
+        };
+        io.read(&p).map(|s| s.trim() == "Full").unwrap_or(false)
+    }
+
+    /// 累计充入电量 / 完成满充 / 触发满充（**每拍一次**）
+    ///
+    /// # 完整循环怎么算（用户明确要求）
+    ///
+    /// 用户原话（2026-11-15）：「充电 10 次必须是 10 次完整循环，
+    /// 不能插一次电源就计一次」。
+    ///
+    /// ⇒ 按 **SOC 正增量**累计：只在"充入"时增加，拔电/使用时下降不扣减。
+    ///
+    /// | 场景 | 计数 |
+    /// |---|---|
+    /// | 20% → 80%（一个充电会话） | **+60%**（0.6 个循环） |
+    /// | 80% 拔电用一天到 30% | 不变 |
+    /// | 第二天 30% → 80% | +50% |
+    /// | 两次合计 | 110% ⇒ **1 个完整循环 + 余 10%** |
+    ///
+    /// 只有累计到 10 × 100% 才触发满充，因此"一天插拔四五次"
+    /// 绝不会被误计成十次。
+    fn observe_charge(&mut self, io: &mut dyn AddonIo, now_s: i64) {
+        let Some(soc) = self.read_soc(io) else {
+            return;
+        };
+
+        // ── 满充进行中：只等"充满"，不再累计循环 ──
+        //
+        // 满充本身充入的电量不占下一个周期额度：那是校准，不是日常循环。
+        if self.state.pending {
+            if self.is_full(io, soc) {
+                self.finish_full(now_s);
+            } else {
+                self.state.last_soc = Some(soc);
+            }
+            return;
+        }
+
+        // ── 正常累计：只认正增量 ──
+        if let Some(last) = self.state.last_soc {
+            if soc > last {
+                self.state.charged_pct = self
+                    .state
+                    .charged_pct
+                    .saturating_add(u32::from(soc - last))
+                    .min(config::CYCLE_CAP_PCT);
+                self.state_dirty = true;
+            }
+        }
+        self.state.last_soc = Some(soc);
+
+        // ── 条件满足 ⇒ 本拍起临时放开上限 ──
+        if self.should_start_full(now_s) {
+            self.state.pending = true;
+            self.state_dirty = true;
+            self.state_force_save = true;
+            let target = self.full_target();
+            log::info!(
+                "[soc_limit] 定期满充触发（已充入 {} 个完整循环，上次满充 {}）：上限临时放开到 {}%",
+                self.state.cycles_done(),
+                self.last_full_desc(),
+                target
+            );
+        }
+    }
+
+    /// 「上次满充」的人话描述（仅日志用）
+    fn last_full_desc(&self) -> String {
+        if self.state.last_full_epoch_s > 0 {
+            format!("于 {}", self.state.last_full_epoch_s)
+        } else {
+            "从未".to_string()
+        }
+    }
+
+    /// 满充完成：复位计数、记下时间
+    ///
+    /// ⚠️ 下一拍起 `effective_target()` 自动回到用户设定值，
+    ///    从而把上限**恢复**回去（不需要单独一次"释放"）。
+    fn finish_full(&mut self, now_s: i64) {
+        let cycles = self.state.cycles_done();
+        self.state.pending = false;
+        self.state.last_full_epoch_s = now_s;
+        self.state.enabled_since_s = now_s;
+        self.state.charged_pct = 0;
+        // 从 100% 往下用掉再充，才算新周期的充入
+        self.state.last_soc = Some(config::FULL_SOC);
+        self.state_dirty = true;
+        self.state_force_save = true;
+        log::info!("[soc_limit] 定期满充完成（累计 {cycles} 个完整循环），已恢复充电上限");
+    }
+
+    /// 是否应当开始一次满充
+    fn should_start_full(&self, now_s: i64) -> bool {
+        if !self.config.full_enabled || self.state.pending {
+            return false;
+        }
+        // 用户本来就不限上限 ⇒ 不需要"放开"
+        if self.config.soc >= self.full_target() {
+            return false;
+        }
+
+        let by_cycles = self.config.full_after_cycles > 0
+            && self.state.cycles_done() >= self.config.full_after_cycles;
+
+        let by_days = self.config.full_interval_days > 0 && {
+            let base = if self.state.last_full_epoch_s > 0 {
+                self.state.last_full_epoch_s
+            } else {
+                self.state.enabled_since_s
+            };
+            base > 0
+                && now_s.saturating_sub(base)
+                    >= i64::from(self.config.full_interval_days) * config::DAY_S
+        };
+
+        by_cycles || by_days
+    }
+
+    /// 周条件下的"下次满充时间"（Unix 秒）；未启用该条件时为 `None`
+    fn full_next_epoch_s(&self) -> Option<i64> {
+        if !self.config.full_enabled || self.config.full_interval_days == 0 {
+            return None;
+        }
+        let base = if self.state.last_full_epoch_s > 0 {
+            self.state.last_full_epoch_s
+        } else {
+            self.state.enabled_since_s
+        };
+        if base <= 0 {
+            return None;
+        }
+        Some(base + i64::from(self.config.full_interval_days) * config::DAY_S)
+    }
+
+    /// 状态落盘（节流；关键变化立即写）
+    ///
+    /// ⚠️ 落盘失败**不是**功能错误：最多丢一点进度，绝不能让
+    ///    充电上限因此熔断。只记一条 warn（不刷屏）。
+    fn persist_state(&mut self, io: &mut dyn AddonIo, now_s: i64) {
+        if !self.config.enabled || !self.state_loaded || !self.state_dirty {
+            return;
+        }
+        let due = now_s.saturating_sub(self.state.saved_at_s) >= config::STATE_SAVE_MIN_GAP_S;
+        if !due && !self.state_force_save {
+            return;
+        }
+        let json = match serde_json::to_string(&self.state) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("[soc_limit] 满充状态序列化失败：{e}");
+                return;
+            }
+        };
+        match io.save_state(config::STATE_ID, &json) {
+            Ok(()) => {
+                self.state.saved_at_s = now_s;
+                self.state_dirty = false;
+                self.state_force_save = false;
+                self.state_save_warned = false;
+            }
+            Err(e) => {
+                if !self.state_save_warned {
+                    log::warn!("[soc_limit] 满充状态落盘失败（不影响充电上限）：{e}");
+                    self.state_save_warned = true;
+                }
+            }
+        }
+    }
 }
 
 impl Addon for SocLimit {
@@ -613,6 +921,21 @@ impl Addon for SocLimit {
                     .map(|s| s.trim().to_string());
                 self.fake_soc_last = None;
 
+                // ── 定期满充要用的两个**只读**节点（探测阶段不写）──
+                //
+                // 都只是采样：`capacity` 用于累计充入电量，`status` 用于
+                // 判断"已充满"。读不到也不影响充电上限本身 —— 满充功能
+                // 会退化为"只能靠 SOC 判据"，最坏情况是满充完成后多等
+                // 一次巡检才恢复上限。
+                self.node_soc = CAPACITY_CANDIDATES
+                    .iter()
+                    .find(|p| io.exists(p))
+                    .map(|p| (*p).to_string());
+                self.node_status = STATUS_CANDIDATES
+                    .iter()
+                    .find(|p| io.exists(p))
+                    .map(|p| (*p).to_string());
+
                 let outcome = ProbeOutcome::Supported {
                     detail: match &self.node_enable {
                         Some(e) => format!("命中 {cand}（使能 {e}）"),
@@ -628,6 +951,8 @@ impl Addon for SocLimit {
         self.node_read = None;
         self.node_enable = None;
         self.enable_engaged = false;
+        self.node_soc = None;
+        self.node_status = None;
         // ⚠️ 找不到节点时，**先怀疑系统开关、再怀疑机型**
         //
         // # 为什么把"电池保护没开"放在第一位
@@ -665,7 +990,10 @@ impl Addon for SocLimit {
         outcome
     }
 
-    fn tick(&mut self, io: &mut dyn AddonIo, _now_s: i64) -> TickOutcome {
+    fn tick(&mut self, io: &mut dyn AddonIo, now_s: i64) -> TickOutcome {
+        // 上一拍累计的进度在这里节流落盘（触发/完成当拍会再写一次，见 ②）
+        self.persist_state(io, now_s);
+
         let interval = self.config.interval_s();
 
         // ① 未启用 → 停止干预
@@ -713,6 +1041,12 @@ impl Addon for SocLimit {
         // ①-0 把系统显示电量校正成驱动真实值（用户要求，见方法文档）
         self.sync_display_to_driver(io);
 
+        // ①-0b 定期满充：加载跨重启状态（每个进程只加载一次）
+        //
+        // ⚠️ 必须在下面的"是否插电"判断之前：拔电时也要能读到
+        //    `pending`（界面显示"正在满充"），只是不累计。
+        self.ensure_state(io, now_s);
+
         // ①-1 🔴 **从节点回读使能位真实状态**（2026-10-20 真机反馈）
         //
         // # 为什么不能只信内存标记
@@ -734,6 +1068,16 @@ impl Addon for SocLimit {
                 self.enable_engaged = v.trim() != "0";
             }
         }
+
+        // ①-2 🔋 定期满充的采样 / 触发 / 完成（每拍一次，含拔电时）
+        //
+        // 只认 SOC **正增量**：拔电后使用导致下降不会扣减已充入的电量，
+        // 也不会把"插一次电源"误记成一次充电（用户明确要求）。
+        // 拔电时仍要做完成判断 —— 用户常常充满就拔，不能因为拔得快
+        // 就永远停在满充模式。
+        self.observe_charge(io, now_s);
+        // 触发/完成满充是状态机关键点：当拍立即落盘，不等 60 秒节流
+        self.persist_state(io, now_s);
 
         // ② ⚠️ **插着充电器才巡检**        //
         // # 为什么要加这个判据
@@ -824,12 +1168,15 @@ impl Addon for SocLimit {
 
         self.last_seen = actual;
 
-        // ⑤-1 写入值 = **用户设定值，原样写**
+        // ⑤-1 写入值：平时 = **用户设定值，原样写**
         //
         // 因为 `fake_soc` 已经把系统显示校正到驱动口径（见 ①-0），
         // 用户设 90、驱动按 `rsoc=90` 停、图标那时也显示 90 ——
         // 三者天然一致，不需要任何换算或闭环。
-        let target = self.config.soc;
+        //
+        // 🔋 定期满充进行中 ⇒ 临时把上限放到 100%（见 `effective_target`）：
+        //    充满后 `finish_full` 复位 `pending`，下一拍自动写回用户设定值。
+        let target = self.effective_target();
         self.last_target = Some(target);
 
         // ⑥ 已一致 → 不写（这是常态：绝大多数拍什么都不做）
@@ -916,7 +1263,7 @@ impl Addon for SocLimit {
                 interval,
             );
         }
-        self.last_written = Some(self.config.soc);
+        self.last_written = Some(target);
         self.write_count = self.write_count.saturating_add(1);
 
         // ⑧ 回读校验（读 soc_limit）：写得下去 ≠ 生效
@@ -925,15 +1272,14 @@ impl Addon for SocLimit {
             .ok()
             .and_then(|raw| logic::parse_active(&raw));
         self.last_seen = verify;
-        if logic::needs_rewrite(self.config.soc, verify) {
+        if logic::needs_rewrite(target, verify) {
             self.verify_fail_streak = self.verify_fail_streak.saturating_add(1);
             let seen = verify.map_or_else(|| "读不到".to_string(), |v| format!("{v}%"));
             return TickOutcome {
                 wrote: true,
                 changed: true,
                 error: Some(AddonError::bad_cond(format!(
-                    "写入后回读不符：期望 {}%，实得 {seen}{}",
-                    self.config.soc,
+                    "写入后回读不符：期望 {target}%，实得 {seen}{}",
                     self.conflict_hint()
                 ))),
                 next_interval_s: interval,
@@ -993,8 +1339,9 @@ impl Addon for SocLimit {
         // 与目标不符的值 —— 这**不是失败**，插电后自会生效。
         // 因此这里只如实报告"实际读到多少"，不在后端做"是否生效"的判决。
         let active = self.last_seen;
-        // 写入值现在恒等于 `config.soc`（不做换算），所以直接用目标比较
-        let matches_target = active == Some(self.config.soc);
+        // 本拍实际目标：平时 = `config.soc`；定期满充中 = 100%
+        let target = self.effective_target();
+        let matches_target = active == Some(target);
 
         // 🔴 **"生效中"显示的是用户设定值**（2026-10-20 用户明确要求）
         //
@@ -1013,8 +1360,12 @@ impl Addon for SocLimit {
         //
         // ⚠️ 只在**已启用**时显示：关掉功能后没有"生效中的上限"，
         //    显示 `null` 才诚实（界面显示「—」）。
+        //
+        // 🔋 定期满充进行中显示的是**临时放开后的目标**（通常 100%）：
+        //    那一刻驱动里确实是 100，显示用户设定值反而会让界面与
+        //    「正在满充」的提示自相矛盾。
         let active_shown = if self.config.enabled {
-            Some(self.config.soc)
+            Some(target)
         } else {
             None
         };
@@ -1069,6 +1420,22 @@ impl Addon for SocLimit {
                 "warn_on_conflict": self.config.warn_on_conflict,
                 // 当前是否已构成"疑似写入方冲突"（界面可据此显示提示）
                 "conflict_suspected": self.verify_fail_streak >= 2,
+                // ── 定期满充（电池校准）──
+                //
+                // ⚠️ 只追加、不改既有字段（R8：契约只增不改）。
+                //    `soc_effective_target` 是本拍**实际**写入的目标，
+                //    与用户设定值 `soc_target` 在满充期间不同。
+                "full_enabled": self.config.full_enabled,
+                "full_after_cycles": self.config.full_after_cycles,
+                "full_interval_days": self.config.full_interval_days,
+                "soc_effective_target": target,
+                "full_pending": self.state.pending,
+                // 累计充入的**完整循环**数（整数）与当前循环进度（%）
+                "full_cycles_done": self.state.cycles_done(),
+                "full_cycle_progress_pct": self.state.cycle_progress_pct(),
+                "full_last_epoch_s": self.state.last_full_epoch_s,
+                // 周条件下的下次满充时间（Unix 秒）；未启用该条件时为 null
+                "full_next_epoch_s": self.full_next_epoch_s(),
                 "node_ctrl": self.node_ctrl,
                 "node_read": self.node_read,
                 "last_written": self.last_written,

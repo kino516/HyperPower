@@ -495,7 +495,15 @@ impl Engine {
             return false;
         }
         let d = &status.detail;
-        let Some(target) = d.get("soc_target").and_then(Value::as_u64) else {
+        // 🔋 满充进行中实际写的是 100%，不能用用户设定值判断"已停充"
+        //
+        // `soc_effective_target` 是本次新增的字段（满充时 = 100%）；
+        // 老版本后端没有它，回退到 `soc_target` 保持兼容。
+        let Some(target) = d
+            .get("soc_effective_target")
+            .or_else(|| d.get("soc_target"))
+            .and_then(Value::as_u64)
+        else {
             return false;
         };
         let in_effect = d

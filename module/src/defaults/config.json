@@ -48,7 +48,10 @@
     "soc": 80,
     "verify_s": 15,
     "keep_on_restore": true,
-    "warn_on_conflict": true
+    "warn_on_conflict": true,
+    "full_enabled": false,
+    "full_after_cycles": 10,
+    "full_interval_days": 7
   },
   "pps": {
     "enabled": false,

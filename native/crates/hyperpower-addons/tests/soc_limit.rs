@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use hyperpower_addons::addon::{Addon, ProbeOutcome};
 use hyperpower_addons::io::AddonIo;
 use hyperpower_addons::runner::{AddonRunner, AddonSlot, TRIP_AFTER_FAILURES};
-use hyperpower_addons::soc_limit::{logic, SocLimit, SocLimitConfig};
+use hyperpower_addons::soc_limit::{logic, FullChargeState, SocLimit, SocLimitConfig};
 
 // ============================================================
 //  假的节点树
@@ -47,6 +47,12 @@ const RSOC: &str = "/sys/class/qcom-battery/fg1_rsoc";
 /// 系统电量覆盖节点（可写，用来把电池图标校正成驱动真实值）
 const FAKE_SOC: &str = "/sys/class/qcom-battery/fake_soc";
 
+/// 充电状态节点（满充完成判据之一）
+const STATUS: &str = "/sys/class/power_supply/battery/status";
+
+/// 定期满充的状态文件 id（与后端 `config::STATE_ID` 一致）
+const STATE_ID: &str = hyperpower_addons::soc_limit::config::STATE_ID;
+
 #[derive(Debug, Default)]
 struct FakeIo {
     files: HashMap<String, String>,
@@ -60,6 +66,11 @@ struct FakeIo {
     /// 默认 `true` —— 绝大多数测试关心的是"有电时怎么写"，
     /// 只有专门测省电逻辑的用例才需要改成 `false`。
     plugged: bool,
+    /// 附加功能持久化状态（id → JSON）—— 模拟宿主的状态文件
+    ///
+    /// 用内存表而不是临时文件：测试不碰真实文件系统（R4 的测试纪律），
+    /// 也能直接注入"重启前保存的状态"来验证跨重启逻辑。
+    states: HashMap<String, String>,
 }
 
 impl FakeIo {
@@ -74,6 +85,7 @@ impl FakeIo {
             write_ignored: false,
             write_log: Vec::new(),
             plugged: true,
+            states: HashMap::new(),
         }
     }
 
@@ -90,6 +102,7 @@ impl FakeIo {
             write_ignored: false,
             write_log: Vec::new(),
             plugged: true,
+            states: HashMap::new(),
         }
     }
 
@@ -112,6 +125,7 @@ impl FakeIo {
             write_ignored: false,
             write_log: Vec::new(),
             plugged: true,
+            states: HashMap::new(),
         }
     }
 
@@ -156,6 +170,15 @@ impl AddonIo for FakeIo {
 
     fn is_plugged(&mut self) -> bool {
         self.plugged
+    }
+
+    fn load_state(&mut self, id: &str) -> Option<String> {
+        self.states.get(id).cloned()
+    }
+
+    fn save_state(&mut self, id: &str, json: &str) -> Result<(), String> {
+        self.states.insert(id.to_string(), json.to_string());
+        Ok(())
     }
 
     fn read(&mut self, path: &str) -> Result<String, String> {
@@ -260,6 +283,31 @@ fn probed(config: SocLimitConfig, io: &mut FakeIo) -> SocLimit {
     let outcome = a.probe(io);
     assert!(outcome.is_supported(), "该假节点树应当被判定为支持");
     a
+}
+
+/// 「已启用充电上限 + 开启定期满充」的配置（10 个完整循环 / 7 天）
+fn full_config(soc: u8) -> SocLimitConfig {
+    SocLimitConfig {
+        enabled: true,
+        soc,
+        full_enabled: true,
+        full_after_cycles: 10,
+        full_interval_days: 7,
+        ..SocLimitConfig::default()
+    }
+}
+
+/// 给假节点树补上定期满充要用的采样节点
+fn with_soc_nodes(mut io: FakeIo, capacity: u8) -> FakeIo {
+    io.files.insert(CAPACITY.to_string(), capacity.to_string());
+    io.files.insert(STATUS.to_string(), "Charging".to_string());
+    io
+}
+
+/// 注入一份「上次进程保存的状态」（模拟重启后读到的状态文件）
+fn seed_state(io: &mut FakeIo, state: &FullChargeState) {
+    let json = serde_json::to_string(state).expect("状态应可序列化");
+    io.states.insert(STATE_ID.to_string(), json);
 }
 
 // ============================================================
@@ -1563,5 +1611,270 @@ fn 使能位为零时即使阈值一致也要重写并开启() {
     assert_eq!(
         en, "1",
         "阈值虽然一致，但 en=0 ⇒ 必须重新开启使能位（实际 {en}）"
+    );
+}
+
+// ============================================================
+//  ⑨ 定期满充（电池校准）
+// ============================================================
+//
+// 用户需求（2026-11-15）：
+//   1. 可设置「充电 10 次后满充一次」
+//   2. 可设置「一个星期满充一次」
+//   3. **10 次必须是 10 个完整循环** —— 不能插一次电源就计一次
+//
+// 下面第 1 组测试专门守第 3 条：插拔 10 次只算 2 个循环，绝不触发满充。
+
+/// 完整循环按**充入电量**累计：插拔 10 次（每次 60→80）只算 2 个循环
+#[test]
+fn 完整循环按充入电量累计而不是插拔次数() {
+    let mut io = with_soc_nodes(FakeIo::hyperos(), 60);
+    let mut addon = probed(full_config(80), &mut io);
+    let mut now = 1_000_000;
+
+    // 插拔 10 次，每次只充入 20%（60% → 80%）
+    for _ in 0..10 {
+        // 拔电用掉电（60%）→ 插上充到上限（80%）→ 再拔掉
+        io.files.insert(CAPACITY.to_string(), "60".to_string());
+        io.plugged = true;
+        let _ = addon.tick(&mut io, now);
+        now += 15;
+
+        io.files.insert(CAPACITY.to_string(), "80".to_string());
+        let _ = addon.tick(&mut io, now);
+        now += 15;
+
+        io.plugged = false;
+        let _ = addon.tick(&mut io, now);
+        now += 15;
+    }
+
+    let st = addon.full_state();
+    assert_eq!(
+        st.charged_pct, 200,
+        "10 次插拔 × 每次充入 20% = 2 个完整循环（实际 {}%）",
+        st.charged_pct
+    );
+    assert_eq!(st.cycles_done(), 2);
+    assert!(
+        !st.pending,
+        "2 个循环远不到 10 个 —— 插拔次数不能当成循环次数"
+    );
+    assert!(
+        !io.write_log.iter().any(|(_, v)| v == "0x640011"),
+        "条件未满足时绝不能写 100%"
+    );
+}
+
+/// 满 10 个完整循环 ⇒ 触发满充，上限临时放开到 100%
+#[test]
+fn 满十个完整循环后触发满充并写入百分百() {
+    let mut io = with_soc_nodes(FakeIo::hyperos(), 79);
+    seed_state(
+        &mut io,
+        &FullChargeState {
+            charged_pct: 999,
+            last_soc: Some(79),
+            enabled_since_s: 1_000_000,
+            ..FullChargeState::default()
+        },
+    );
+    let mut addon = probed(full_config(80), &mut io);
+
+    // 79 → 80：+1% ⇒ 累计 1000% ⇒ 第 10 个完整循环
+    io.files.insert(CAPACITY.to_string(), "80".to_string());
+    let out = addon.tick(&mut io, 2_000_000);
+    assert!(out.is_ok(), "触发满充不应报错：{out:?}");
+
+    let st = addon.full_state();
+    assert_eq!(st.charged_pct, 1000);
+    assert!(st.pending, "满 10 个完整循环必须进入满充");
+
+    // 写入的应当是 100% 的控制字（0x640011），而不是 80% 的 0x500011
+    assert!(
+        io.write_log
+            .iter()
+            .any(|(p, v)| p == CTRL && v == "0x640011"),
+        "满充必须把上限临时放开到 100%，写入记录：{:?}",
+        io.write_log
+    );
+}
+
+/// 充满后：退出满充、清零循环、把上限写回用户设定值
+#[test]
+fn 充满后恢复用户上限并清零循环() {
+    let mut io = with_soc_nodes(FakeIo::hyperos(), 99);
+    // 满充已经生效：驱动里阈值是 100
+    io.files.insert(READ.to_string(), "100".to_string());
+    seed_state(
+        &mut io,
+        &FullChargeState {
+            charged_pct: 1000,
+            pending: true,
+            last_soc: Some(99),
+            enabled_since_s: 1_000_000,
+            ..FullChargeState::default()
+        },
+    );
+    let mut addon = probed(full_config(80), &mut io);
+
+    // 读到 100% ⇒ 满充完成
+    io.files.insert(CAPACITY.to_string(), "100".to_string());
+    io.files.insert(STATUS.to_string(), "Full".to_string());
+    let out = addon.tick(&mut io, 2_000_000);
+    assert!(out.is_ok(), "完成满充不应报错：{out:?}");
+
+    let st = addon.full_state();
+    assert!(!st.pending, "充满后必须退出满充");
+    assert_eq!(st.charged_pct, 0, "满充后循环计数清零");
+    assert_eq!(st.last_full_epoch_s, 2_000_000, "必须记下满充完成时间");
+    assert_eq!(
+        addon.status().detail["soc_effective_target"],
+        80,
+        "充满后本拍应恢复用户设定值"
+    );
+    // 本拍把上限写回 80（实际生效值从 100 变回 80）
+    assert!(
+        io.write_log
+            .iter()
+            .any(|(p, v)| p == CTRL && v == "0x500011"),
+        "满充完成后必须把上限写回 80%，写入记录：{:?}",
+        io.write_log
+    );
+}
+
+/// 满 7 天（循环数远未到）同样触发满充
+#[test]
+fn 满七天后触发满充() {
+    let now = 2_000_000;
+    let mut io = with_soc_nodes(FakeIo::hyperos(), 79);
+    seed_state(
+        &mut io,
+        &FullChargeState {
+            charged_pct: 0,
+            last_soc: Some(79),
+            last_full_epoch_s: now - 7 * 86_400,
+            enabled_since_s: now - 10 * 86_400,
+            ..FullChargeState::default()
+        },
+    );
+    let mut addon = probed(full_config(80), &mut io);
+    let _ = addon.tick(&mut io, now);
+
+    assert!(
+        addon.full_state().pending,
+        "距上次满充已满 7 天，必须触发满充"
+    );
+    assert!(
+        io.write_log
+            .iter()
+            .any(|(p, v)| p == CTRL && v == "0x640011"),
+        "周满充必须写 100%，写入记录：{:?}",
+        io.write_log
+    );
+}
+
+/// 循环数和天数**都没到**时保持限制（不能提前满充）
+#[test]
+fn 未到循环数也未到天数时保持限制() {
+    let now = 2_000_000;
+    let mut io = with_soc_nodes(FakeIo::hyperos(), 79);
+    seed_state(
+        &mut io,
+        &FullChargeState {
+            charged_pct: 500,
+            last_soc: Some(79),
+            last_full_epoch_s: now - 3 * 86_400,
+            enabled_since_s: now - 10 * 86_400,
+            ..FullChargeState::default()
+        },
+    );
+    let mut addon = probed(full_config(80), &mut io);
+    let _ = addon.tick(&mut io, now);
+
+    assert!(
+        !addon.full_state().pending,
+        "5 个循环 / 3 天都不满足条件，不能触发"
+    );
+    assert!(!io.write_log.iter().any(|(_, v)| v == "0x640011"));
+}
+
+/// 未启用「定期满充」时，即使循环数巨大也绝不写 100%
+#[test]
+fn 未启用定期满充时绝不写百分百() {
+    let mut io = with_soc_nodes(FakeIo::hyperos(), 79);
+    seed_state(
+        &mut io,
+        &FullChargeState {
+            charged_pct: 5_000,
+            last_full_epoch_s: 1,
+            ..FullChargeState::default()
+        },
+    );
+    let mut cfg = enabled_config(80);
+    cfg.full_enabled = false;
+    let mut addon = probed(cfg, &mut io);
+    let _ = addon.tick(&mut io, 2_000_000);
+
+    assert!(!addon.full_state().pending);
+    assert!(
+        !io.write_log.iter().any(|(_, v)| v == "0x640011"),
+        "未启用该功能时行为必须与旧版一致（绝不写 100%）"
+    );
+}
+
+/// 目标本来就是 100%（不限制）时不需要"满充"
+#[test]
+fn 目标为百分百时不触发满充() {
+    let mut io = with_soc_nodes(FakeIo::hyperos(), 79);
+    seed_state(
+        &mut io,
+        &FullChargeState {
+            charged_pct: 5_000,
+            last_full_epoch_s: 1,
+            ..FullChargeState::default()
+        },
+    );
+    let mut addon = probed(full_config(100), &mut io);
+    let _ = addon.tick(&mut io, 2_000_000);
+    assert!(
+        !addon.full_state().pending,
+        "用户本来就不限上限，无需临时放开"
+    );
+}
+
+/// 状态文件损坏 ⇒ 从头计数，绝不崩溃、绝不影响充电上限
+#[test]
+fn 状态文件损坏时从头计数且不崩溃() {
+    let mut io = with_soc_nodes(FakeIo::hyperos(), 79);
+    io.states
+        .insert(STATE_ID.to_string(), "{不是 JSON".to_string());
+    let mut addon = probed(full_config(80), &mut io);
+    let out = addon.tick(&mut io, 1_000_000);
+
+    assert!(out.is_ok(), "坏状态不能变成功能错误");
+    assert_eq!(addon.full_state().charged_pct, 0);
+    assert!(!addon.full_state().pending);
+}
+
+/// 充入进度跨进程重启保持（状态文件恢复）
+#[test]
+fn 充入进度跨重启保持() {
+    let mut io = with_soc_nodes(FakeIo::hyperos(), 60);
+    let mut addon = probed(full_config(80), &mut io);
+
+    let _ = addon.tick(&mut io, 1_000_000); // 记录基准 60%
+    io.files.insert(CAPACITY.to_string(), "80".to_string());
+    // 时间推进到节流点之后 ⇒ 状态落盘
+    let _ = addon.tick(&mut io, 1_000_100);
+    assert_eq!(addon.full_state().charged_pct, 20);
+
+    // 模拟 worker 重启：新建实例（状态文件仍在）
+    let mut restarted = probed(full_config(80), &mut io);
+    let _ = restarted.tick(&mut io, 1_000_200);
+    assert_eq!(
+        restarted.full_state().charged_pct,
+        20,
+        "重启后必须从状态文件恢复已充入的电量"
     );
 }

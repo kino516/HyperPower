@@ -274,6 +274,27 @@ impl AddonIo for WatchedIo {
     fn spawn_detached(&mut self, args: &[&str]) -> Result<(), String> {
         crate::addon_host::spawn_child(args)
     }
+
+    /// 附加功能状态：**不走 watchdog 队列**
+    ///
+    /// # 为什么不入队
+    ///
+    /// watchdog 存在的意义是"sysfs 写可能把线程卡进内核 `D` 状态"。
+    /// 状态文件是数据目录下的普通小文件（< 1 KB，ext4/f2fs），
+    /// 不会把线程挂死在内核里；直接读写只有几十微秒。
+    ///
+    /// 反过来说，塞进队列反而有害：队列是**同步等回复**的（3 秒超时），
+    /// 而状态落盘是 60 秒才一次的后台记账，没必要占用那条串行通道，
+    /// 更不该让一次落盘排队去和节点写入抢位置。
+    ///
+    /// 失败会如实返回 —— 调用方（充电上限）只记日志，不影响限流。
+    fn load_state(&mut self, id: &str) -> Option<String> {
+        crate::addon_host::load_addon_state(id)
+    }
+
+    fn save_state(&mut self, id: &str, json: &str) -> Result<(), String> {
+        crate::addon_host::save_addon_state(id, json)
+    }
 }
 
 #[cfg(test)]
