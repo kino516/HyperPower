@@ -133,6 +133,11 @@ impl Drop for Client {
 pub struct ControlServer {
     listener: UnixListener,
     path: PathBuf,
+    /// 绑定成功时 socket 文件的 `(dev, ino)`
+    ///
+    /// 用于 [`ControlServer::path_is_live`] 判断文件是否被删 / 被替换。
+    /// `None` = 绑定时取不到（理论上不会发生），此时不做判断。
+    inode: Option<(u64, u64)>,
     clients: Vec<Client>,
     /// 因背压被断开 / 鉴权失败的次数（供诊断）
     dropped: u64,
@@ -187,9 +192,22 @@ impl ControlServer {
         set_socket_perms(&path)?;
 
         log::info!("控制通道已就绪: {}", path.display());
+
+        // 记下「路径 → inode」，供后续检测文件被删 / 被替换（见 `path_is_live`）。
+        //
+        // ⚠️ 必须用 `metadata(path)` 而不是 `fstat(listener)`：Linux 上两者
+        //    的 `st_dev` 口径不同（socket 走 sockfs，路径走真实文件系统），
+        //    直接比较会**刚绑定完就判假** —— 2026-11-18 就是这样让自愈逻辑
+        //    每拍都重建一次 socket（CI 的两个 `path_is_live` 测试抓到）。
+        let inode = std::fs::metadata(&path).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino())
+        });
+
         Ok(Self {
             listener,
             path,
+            inode,
             clients: Vec::new(),
             dropped: 0,
             denied: 0,
@@ -232,26 +250,23 @@ impl ControlServer {
     /// 结果只能重启手机。这里比较「路径 inode」与「监听 fd inode」：
     /// 不一致（被删 / 被别的进程替换）就返回 `false`，由主循环重建。
     ///
-    /// 用 `fstat` 而不是"绑定时记下 inode"：前者是**权威**的（直接问内核
-    /// 这个 fd 绑的是哪个 inode），不存在"记录时就已经是别人的"这种窗口。
+    /// 比对的是「绑定时记下的 `(dev, ino)`」与「当前路径的 `(dev, ino)`」。
+    ///
+    /// ⚠️ **不要**改成 `fstat(listener_fd)`：Linux 上 socket fd 的 `st_dev`
+    ///    与文件系统路径的 `st_dev` 口径不同，比出来永远不等 ⇒ 刚绑定完就判假，
+    ///    自愈逻辑会每拍重建一次 socket（2026-11-18 被 CI 的两个测试抓到）。
     #[cfg(unix)]
     pub fn path_is_live(&self) -> bool {
         use std::os::unix::fs::MetadataExt;
-        use std::os::unix::io::AsRawFd;
 
-        let Ok(meta) = std::fs::metadata(&self.path) else {
-            return false; // 文件没了 ⇒ 肯定不可达
+        // 绑定时就没取到 inode（理论上不会发生）：不做判断，避免误重建
+        let Some((dev, ino)) = self.inode else {
+            return true;
         };
-        // SAFETY: `fstat` 只读；`libc::stat` 是 POD，由内核完整回填；
-        //         fd 借用自仍然存活的 `self.listener`。
-        let (dev, ino) = unsafe {
-            let mut st: libc::stat = std::mem::zeroed();
-            if libc::fstat(self.listener.as_raw_fd(), &mut st) != 0 {
-                return false;
-            }
-            (st.st_dev as u64, st.st_ino as u64)
-        };
-        meta.dev() == dev && meta.ino() == ino
+        match std::fs::metadata(&self.path) {
+            Ok(m) => m.dev() == dev && m.ino() == ino,
+            Err(_) => false, // 文件没了 ⇒ 肯定不可达
+        }
     }
 
     /// 当前已连接的客户端数
