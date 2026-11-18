@@ -62,6 +62,7 @@
   - [内部设计文档](#内部设计文档)
 - [设备验证基线](#设备验证基线)
 - [版本历史](#版本历史)
+- [贡献](#贡献)
 - [许可](#许可)
 
 ---
@@ -691,6 +692,30 @@ cargo xtask install --via ksud
 | 1.0.0 | 首个正式版 |
 
 > 完整变更见 [Releases](https://github.com/kino516/HyperPower/releases)。
+
+---
+
+## 贡献
+
+欢迎提交机型适配与缺陷修复。仓库里有两份给接手者的文档：
+
+| 文档 | 用途 |
+|---|---|
+| [AGENTS.md](AGENTS.md) | 面向贡献者与 AI 代理的操作手册：仓库地图、R1–R18 安全红线、构建与诊断命令 |
+| [PROMPTS.md](PROMPTS.md) | 可直接复制给 AI 代理的提示词：**机型适配**与 **BUG 修复**两套完整流程 |
+
+提交前至少跑通本机门槛：
+
+```bash
+cd native
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+机型适配请附 `hyperpower probe` 的原始输出（能用 `hyperpower device export --share`
+导出档案更好）。没在真机上验证过的项请标注「未验证」，不要写成已验证 —— 这个仓库
+宁可少一条结论，也不要多一条猜测。
 
 ---
 
