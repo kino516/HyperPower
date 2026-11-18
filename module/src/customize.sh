@@ -74,6 +74,18 @@ for _pat in "/bin/thermo supervisor" "/bin/thermo worker" \
             "/bin/hyperpower supervisor" "/bin/hyperpower worker"; do
   pkill -9 -f "$_pat" 2>/dev/null || true
 done
+sleep 1
+
+# 再确认一次：仍有旧进程说明它杀不掉（常见于 D 状态）。
+# 此时继续安装会导致新旧两个 worker 同时写 sysfs，必须让用户先重启。
+_left=""
+for _pat in "/bin/thermo supervisor" "/bin/thermo worker" \
+            "/bin/hyperpower supervisor" "/bin/hyperpower worker"; do
+  _left="$_left $(pgrep -f "$_pat" 2>/dev/null)"
+done
+if [ -n "$(echo $_left | tr -d ' ')" ]; then
+  abort "! 仍有旧进程未退出（PID:$(echo $_left)）。请先重启手机，再重新安装模块。"
+fi
 
 # ---------- 3. 完整性校验 ----------
 # 只校验分发的文件（`checksum.sha256` 自己不在清单内）
@@ -132,12 +144,20 @@ if [ -f "$DATADIR/config.json" ]; then
   ui_print "  检测到已有配置，保留（升级不覆盖）"
 else
   ui_print "  首次安装，写入默认配置"
-  cp -f "$MODPATH/defaults/config.json"  "$DATADIR/config.json"  2>/dev/null
-  cp -f "$MODPATH/defaults/presets.json" "$DATADIR/presets.json" 2>/dev/null
+  cp -f "$MODPATH/defaults/config.json" "$DATADIR/config.json" 2>/dev/null \
+    || abort "! 写入默认配置失败，请检查 /data 剩余空间"
+fi
+
+# presets 与 config 分开检查：升级时 config 存在但 presets 可能缺失/损坏
+if [ ! -f "$DATADIR/presets.json" ]; then
+  ui_print "  写入默认预设"
+  cp -f "$MODPATH/defaults/presets.json" "$DATADIR/presets.json" 2>/dev/null \
+    || abort "! 写入默认预设失败，请检查 /data 剩余空间"
 fi
 
 # 清理上次运行残留
 rm -f "$DATADIR/worker.pid" 2>/dev/null
+rm -f "$DATADIR/supervisor.pid" 2>/dev/null
 rm -f "$DATADIR/ipc/control.sock" 2>/dev/null
 
 # ---------- 6. 自带 APP 说明 ----------

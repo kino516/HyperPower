@@ -16,8 +16,9 @@ verify_module() {
   _ok=0
   while IFS= read -r _line; do
     [ -z "$_line" ] && continue
-    _hash=$(echo "$_line" | awk '{print $1}')
-    _path=$(echo "$_line" | awk '{print $2}')
+    _hash=${_line%% *}
+    _path=${_line#* }
+    _path=${_path# }
     [ -z "$_hash" ] || [ -z "$_path" ] && continue
 
     _file="$_root/$_path"
@@ -27,7 +28,8 @@ verify_module() {
       continue
     fi
 
-    _actual=$(sha256sum "$_file" 2>/dev/null | awk '{print $1}')
+    _actual=$(sha256sum "$_file" 2>/dev/null)
+    _actual=${_actual%% *}
     if [ "$_actual" = "$_hash" ]; then
       _ok=$((_ok + 1))
     else

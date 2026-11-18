@@ -423,7 +423,7 @@ export async function exportDiagnosticLog(): Promise<string> {
     `  echo "页大小  : $(getconf PAGE_SIZE 2>/dev/null) 字节"`,
     `  echo`,
     `  echo "----- 进程 -----"`,
-    `  ps -A -o PID,ETIME,ARGS 2>/dev/null | grep '[t]hermo' || echo "(未发现 HyperPower 后台进程)"`,
+    `  ps -A -o PID,ETIME,ARGS 2>/dev/null | grep -E '[t]hermo|[h]yperpower' || echo "(未发现 HyperPower 后台进程)"`,
     `  echo`,
     `  echo "----- 当前状态 -----"`,
     `  ${MOD}/bin/ctl status 2>&1 || echo "(ctl status 失败)"`,
