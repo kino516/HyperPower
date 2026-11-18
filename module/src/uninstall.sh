@@ -63,40 +63,69 @@ slog() {
 
 slog "===== 卸载开始 ====="
 
+_restore_failed=0
+
 # ============================================================
 #  1. 停止进程
 # ============================================================
 
+# 1.1 pidfile 只作为候选：先校验 cmdline，避免 PID 复用误杀无关进程
 if [ -f "$DATADIR/worker.pid" ]; then
   _pid=$(tr -d ' \r\n' < "$DATADIR/worker.pid" 2>/dev/null)
-  if [ -n "$_pid" ] && [ -d "/proc/$_pid" ]; then
-    kill "$_pid" 2>/dev/null
-    sleep 1
-    [ -d "/proc/$_pid" ] && kill -9 "$_pid" 2>/dev/null
-    slog "已停止 worker（pid=$_pid）"
+  if [ -n "$_pid" ] && [ -r "/proc/$_pid/cmdline" ]; then
+    _cmd=$(tr '\000' ' ' < "/proc/$_pid/cmdline" 2>/dev/null)
+    case "$_cmd" in
+      *"bin/hyperpower worker"*|*"bin/thermo worker"*)
+        kill "$_pid" 2>/dev/null
+        ;;
+      *)
+        slog "⚠️ worker.pid 指向的进程不是 HyperPower worker（pid=$_pid），跳过"
+        ;;
+    esac
   fi
-  rm -f "$DATADIR/worker.pid" 2>/dev/null
 fi
 
-# supervisor：按"二进制路径 + 子命令"匹配，避免误杀同名进程
-#
-# ⚠️ 必须同时认旧名 `bin/thermo`（2026-11-01 改名前的二进制）。
-#    从旧版本直接卸载时，跑着的是 thermo supervisor/worker，
-#    只认新名会漏杀 ⇒ 卸载后进程继续写 sysfs，上限残留。
+# 1.2 先 TERM worker，再 TERM supervisor，给 worker 时间交回官方控制。
+#     必须同时认旧名 `bin/thermo`（2026-11-01 改名前的二进制）。
 for _bin in "$MODDIR/bin/hyperpower" "$MODDIR/bin/thermo"; do
-  _pids=$(pgrep -f "$_bin supervisor" 2>/dev/null)
-  for _p in $_pids; do
+  for _p in $(pgrep -f "$_bin worker" 2>/dev/null); do
     kill "$_p" 2>/dev/null
-    slog "已停止 supervisor（pid=$_p）"
   done
-  _pids=$(pgrep -f "$_bin worker" 2>/dev/null)
-  for _p in $_pids; do
+done
+for _bin in "$MODDIR/bin/hyperpower" "$MODDIR/bin/thermo"; do
+  for _p in $(pgrep -f "$_bin supervisor" 2>/dev/null); do
     kill "$_p" 2>/dev/null
-    slog "已停止 worker（pid=$_p）"
   done
 done
 
 sleep 1
+
+# 1.3 重新扫描并 KILL（不依赖第一次的 PID 列表，防止 supervisor 在 1 秒内
+#     又拉起一个新 worker）
+_survivors=""
+for _bin in "$MODDIR/bin/hyperpower" "$MODDIR/bin/thermo"; do
+  _survivors="$_survivors $(pgrep -f "$_bin worker" 2>/dev/null)"
+  _survivors="$_survivors $(pgrep -f "$_bin supervisor" 2>/dev/null)"
+done
+for _p in $_survivors; do
+  kill -9 "$_p" 2>/dev/null
+done
+
+sleep 1
+
+# 1.4 再确认一次：仍有进程就停止卸载流程，避免它在还原后把节点写回去
+_still=""
+for _bin in "$MODDIR/bin/hyperpower" "$MODDIR/bin/thermo"; do
+  _still="$_still $(pgrep -f "$_bin worker" 2>/dev/null)"
+  _still="$_still $(pgrep -f "$_bin supervisor" 2>/dev/null)"
+done
+if [ -n "$(echo $_still | tr -d ' ')" ]; then
+  slog "⚠️ 仍有 HyperPower 进程未退出（PID:$(echo $_still)）"
+  slog "   → 已跳过节点还原和数据目录删除；请重启手机后再卸载，避免节点被残留进程写回"
+  exit 1
+fi
+slog "已停止 supervisor / worker（并确认无存活进程）"
+rm -f "$DATADIR/worker.pid" "$DATADIR/supervisor.pid" 2>/dev/null
 
 # ============================================================
 #  2. 路径探测（候选表 —— 与 sysfs.rs 同源，顺序即优先级）
@@ -191,6 +220,7 @@ write_node() {
     return 0
   fi
 
+  _restore_failed=1
   slog "⚠️ 写入失败：$_label → $_node"
   return 1
 }
@@ -209,6 +239,7 @@ verify_node() {
   if [ "$_got" = "$_expect" ]; then
     slog "✓ $_label 回读一致（$_got）"
   else
+    _restore_failed=1
     slog "⚠️ $_label 回读为 '$_got'，期望 '$_expect'"
   fi
 }
@@ -398,6 +429,11 @@ rm -f "$DATADIR/worker.pid" "$DATADIR/supervisor.pid" 2>/dev/null
 # ============================================================
 
 _del_ok=1
+
+if [ "$_restore_failed" = "1" ]; then
+  slog "⚠️ 存在可写节点还原失败（详见上方告警）—— 暂不删除数据目录，保留日志供排查"
+  _del_ok=0
+fi
 
 if [ -n "$CTRL_DIR" ]; then
   # ⚠️ 必须同时判 `-n`（2026-11-01 审计 H-04）

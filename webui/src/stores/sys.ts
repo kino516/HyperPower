@@ -85,6 +85,8 @@ export const charging = computed<boolean>(() => {
 // 也就是说：一条纯耗电的死命令，外加每次都给 `state.events` 赋新数组
 // 触发的无谓响应式更新。删掉后每 15 秒少一个 root shell。
 
+let refreshing = false;
+
 /**
  * 拉取一次状态
  *
@@ -107,6 +109,8 @@ export const charging = computed<boolean>(() => {
  * @param silent 不触碰 `loading`（后台轮询用）
  */
 export async function refresh(silent = false): Promise<void> {
+  if (silent && refreshing) return;
+  refreshing = true;
   if (!silent) {
     state.loading = true;
   }
@@ -124,6 +128,7 @@ export async function refresh(silent = false): Promise<void> {
       },
     );
   } finally {
+    refreshing = false;
     if (!silent) {
       state.loading = false;
     }
