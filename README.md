@@ -288,7 +288,9 @@ ctl limit show         # 看状态：目标值、驱动实际生效值、写入�
 ctl set limit.full_enabled true       # 打开定期满充
 ctl set limit.full_after_cycles 10    # 10 个完整循环满充一次（0 = 关闭）
 ctl set limit.full_interval_days 7    # 7 天满充一次（0 = 关闭）
+ctl set limit.sync_display false      # 关闭「系统显示 ↔ SOC 电量」同步（默认开）
 ctl limit show                        # detail 里有 full_cycles_done / full_pending / full_next_epoch_s
+                                      # 以及 sync_display / sync_available / sync_engaged
 ```
 
 ### 关闭的语义
@@ -312,25 +314,42 @@ ctl limit show                        # detail 里有 full_cycles_done / full_pe
 **判断是否生效，以本模块显示的「已生效」为准** —— 它读的是驱动报告的生效值，
 那才是真实状态。
 
-### 电量显示可能虚高
+### 电量显示可能虚高（两个「电量」不是同一个数）
 
 某些机型上，**电池图标显示的电量和驱动内部用的电量不一致**，而且差得不少：
 
 | 来源 | 节点 | 实测值（K70 Pro） |
 |---|---|---|
-| 电池图标 | `battery/capacity` | **90 ~ 99%** |
-| 驱动真实 | `qcom-battery/fg1_rsoc` | **78 ~ 81%** |
+| 电池图标（系统显示） | `battery/capacity` | **90 ~ 99%** |
+| 驱动真实（**SOC 电量**） | `qcom-battery/fg1_rsoc` | **78 ~ 81%** |
 
 而 `charge_control_end_threshold` 是按**驱动真实值**比较的 —— 于是设 95% 时，
 驱动会一直充到 `rsoc=95` 才停，那时图标早就 100% 了。
 
-**模块的处理**：把图标校正成驱动真实值（写 `qcom-battery/fake_soc`），两边永远同一口径：
+**在哪看这两个数**：
+
+| 位置 | 显示 |
+|---|---|
+| 状态页「详细读数」 | **SOC 电量**一格（与进度条的「电量」并列） |
+| 控制页「充电上限」 | 「系统显示 x% · SOC 电量 y%」+ **电量显示同步**开关 |
+| 命令行 | `ctl status` 的 `battery.soc`（系统显示）/ `battery.soc_driver`（SOC 电量） |
+
+> [!NOTE]
+> 「SOC 电量」来自电量计节点（`fg1_rsoc` / `rsoc`）。本机没有该节点时显示「—」，
+> 不会显示 0%（那是两回事）。
+
+**模块的处理（默认开启，可关）**：把图标校正成驱动真实值（写 `qcom-battery/fake_soc`），
+两边永远同一口径：
 
 ```text
 设 90%  →  写入驱动 90  →  图标显示 90 时停止
 ```
 
-关闭功能时会**自动恢复** `fake_soc` 的原始值。
+控制页的「电量显示同步」开关对应配置键 `limit.sync_display`（默认 `true`）。
+关闭后模块会**写回 `fake_soc` 的原始值**（不是"停止写入就不管"），图标恢复系统自己的
+算法（含校准与平滑）—— 此时两个数可能重新出现偏差，这是你选择的取舍。
+
+关闭充电上限功能时会**自动恢复** `fake_soc` 的原始值。
 
 > [!WARNING]
 > 如果你**直接卸载模块**（不先关闭功能），`fake_soc` 可能残留，图标会停在最后一次

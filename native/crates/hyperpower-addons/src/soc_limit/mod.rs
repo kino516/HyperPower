@@ -14,6 +14,7 @@
 //! |---|---|
 //! | 写节点 | `smart_chg`（控制字） |
 //! | 读节点 | 同目录 `soc_limit`（生效值） |
+//! | 额外写 | 电量显示 `fake_soc`（仅当 `limit.sync_display` 开启，默认开） |
 //! | **不碰** | 档位 / 电流 / 温度阈值 / 任何温控节点 |
 //! | 周期 | 启用时 15 秒；未启用时 60 秒（只为响应配置变更） |
 //! | 失败后果 | 最多"没限制住"，不会伤害设备 |
@@ -331,6 +332,16 @@ pub struct SocLimit {
     fake_soc_orig: Option<String>,
     /// 上一次写入 `fake_soc` 的值（相同则跳过，减少无谓写入）
     fake_soc_last: Option<u8>,
+    /// 上一次写 `fake_soc` **失败了**（同步开着但改不动显示）
+    ///
+    /// # 为什么必须有这个标记
+    ///
+    /// 同步是**用户可见开关**：打开后图标没变，用户只会认为"功能坏了"。
+    /// 写失败的真实原因（缺少 SELinux 放行 / 节点只读 / 被占用）必须能
+    /// 传到界面上，而不是被 `is_ok()` 静默吞掉（R17「不静默」）。
+    ///
+    /// ⚠️ 只在**状态翻转**时打日志，否则每拍一次 warn 会刷屏。
+    sync_error: bool,
     /// **定期满充**的运行状态（首次巡检时从宿主加载）
     ///
     /// 与配置分开：这是记账（充了多少、上次何时满充），不是用户意图。
@@ -371,6 +382,7 @@ impl SocLimit {
             node_fake_soc: None,
             fake_soc_orig: None,
             fake_soc_last: None,
+            sync_error: false,
             state: FullChargeState::default(),
             state_loaded: false,
             state_dirty: false,
@@ -419,9 +431,16 @@ impl SocLimit {
     ///
     /// 于是"设 95 → 驱动 95 → 显示 95"三者统一。
     ///
+    /// # 2026-11-18：变成**可开关**的
+    ///
+    /// 用户要求「加入 SOC 电量显示与同步功能」 ⇒ 同步不再是无条件的：
+    /// 由 `config.json` 的 `limit.sync_display` 控制（出厂默认 `true`，
+    /// 与既有行为一致）。关闭时走 [`Self::restore_display`] 恢复原值，
+    /// 不是简单跳过 —— 否则图标会停在最后一次同步的过期值上。
+    ///
     /// # 安全约束
     ///
-    /// - 只在**已启用且充电中**才写，禁用时恢复原值
+    /// - 只在**已启用且 `limit.sync_display` 开启**时才写，关闭时恢复原值
     /// - 值没变就跳过，避免每拍无谓写入
     /// - 读不到 `rsoc` 时**不动** `fake_soc`（宁可显示不准，也不要写错）
     fn sync_display_to_driver(&mut self, io: &mut dyn AddonIo) {
@@ -441,8 +460,22 @@ impl SocLimit {
         if self.fake_soc_last == Some(rsoc) {
             return;
         }
-        if io.write(&fake_path, &rsoc.to_string()).is_ok() {
-            self.fake_soc_last = Some(rsoc);
+        match io.write(&fake_path, &rsoc.to_string()) {
+            Ok(()) => {
+                self.fake_soc_last = Some(rsoc);
+                self.sync_error = false;
+            }
+            Err(e) => {
+                // ⚠️ 只在状态翻转时告警 —— 充电中每拍都会重试，
+                //    每拍一条 warn 会把日志刷满（也掩盖真正的问题）。
+                if !self.sync_error {
+                    log::warn!(
+                        "[soc_limit] 写入电量显示节点 {fake_path} 失败：{e}\
+                         （电量同步暂不生效；检查 SELinux 放行与节点权限）"
+                    );
+                    self.sync_error = true;
+                }
+            }
         }
     }
 
@@ -461,6 +494,7 @@ impl SocLimit {
         }
         if io.write(&fake_path, &orig).is_ok() {
             self.fake_soc_last = None;
+            self.sync_error = false;
             log::info!("[soc_limit] 已恢复系统电量显示（fake_soc={orig}）");
         }
     }
@@ -920,6 +954,7 @@ impl Addon for SocLimit {
                     .and_then(|p| io.read(p).ok())
                     .map(|s| s.trim().to_string());
                 self.fake_soc_last = None;
+                self.sync_error = false;
 
                 // ── 定期满充要用的两个**只读**节点（探测阶段不写）──
                 //
@@ -1038,8 +1073,21 @@ impl Addon for SocLimit {
             };
         }
 
-        // ①-0 把系统显示电量校正成驱动真实值（用户要求，见方法文档）
-        self.sync_display_to_driver(io);
+        // ①-0 电量显示同步（用户要求，见 `sync_display_to_driver` 的文档）
+        //
+        // | 配置 `limit.sync_display` | 行为 |
+        // |---|---|
+        // | `true`（默认） | 每拍把 `fake_soc` 写成当前 `rsoc`，图标与驱动同口径 |
+        // | `false` | **恢复原值**并停止改写 |
+        //
+        // ⚠️ 关闭时必须 `restore_display`，不能只是"不写" ——
+        //    否则图标会停在**上一次同步的结果**上（一个过期的假值），
+        //    与系统自己的算法脱节。这与"关闭功能"走的是同一条恢复路径。
+        if self.config.sync_display {
+            self.sync_display_to_driver(io);
+        } else {
+            self.restore_display(io);
+        }
 
         // ①-0b 定期满充：加载跨重启状态（每个进程只加载一次）
         //
@@ -1420,6 +1468,23 @@ impl Addon for SocLimit {
                 "warn_on_conflict": self.config.warn_on_conflict,
                 // 当前是否已构成"疑似写入方冲突"（界面可据此显示提示）
                 "conflict_suspected": self.verify_fail_streak >= 2,
+                // ── 电量显示同步（2026-11-18）──
+                //
+                // ⚠️ 只追加、不改既有字段（R8：契约只增不改）。
+                //
+                // 界面据此渲染「系统显示 ↔ SOC 电量」那一行与同步开关：
+                // `sync_available=false` 时开关置灰并说明原因（本机没有
+                // 可写的显示节点），而不是让用户点了没反应。
+                "sync_display": self.config.sync_display,
+                "sync_available": self.node_rsoc.is_some() && self.node_fake_soc.is_some(),
+                // 是否**正在**改写系统显示（写过且未恢复）
+                "sync_engaged": self.fake_soc_last.is_some(),
+                // 同步开着但**写不进去**（SELinux / 只读 / 被占用）
+                // ⇒ 界面必须据此提示"开了但没生效"，不能静默
+                "sync_error": self.sync_error,
+                // 两条节点路径（诊断用：一眼看出本机命中了哪个节点）
+                "node_rsoc": self.node_rsoc,
+                "node_fake_soc": self.node_fake_soc,
                 // ── 定期满充（电池校准）──
                 //
                 // ⚠️ 只追加、不改既有字段（R8：契约只增不改）。

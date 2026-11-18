@@ -18,7 +18,12 @@ mkdir -p "$DATADIR/logs" "$DATADIR/ipc" 2>/dev/null
 chmod 700 "$DATADIR" 2>/dev/null
 
 # 旧 worker 还活着（软重启）—— socket 仍在使用，保留
-if [ -x "$BIN" ] && pgrep -f "^$BIN worker" >/dev/null 2>&1; then
+#
+# ⚠️ 这里**不要**加 `[ -x "$BIN" ]` 之类的前置条件：
+#    `pgrep -f` 只匹配 cmdline，不需要文件可执行；而可执行位恰恰可能在重启后
+#    丢失（service.sh 里有专门的权限自愈），那时加上这个守卫就等于
+#    **在最需要保护的时刻失效** —— 又回到「删掉活着的 socket」那条老路。
+if pgrep -f "^$BIN worker" >/dev/null 2>&1; then
   exit 0
 fi
 

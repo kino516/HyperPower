@@ -18,6 +18,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ---------- 开机 / 安装 / 卸载脚本 ----------
+      #
+      # 这几个脚本决定模块能不能起来、能不能卸干净，但历史上**一道门禁都没有**
+      # （2026-11-18 的软重启失效 bug 就出在 service.sh / post-fs-data.sh 里，
+      # 而当时 CI 全绿）。这里只做**语法**检查，不执行、无副作用，成本 < 1 s。
+      #
+      # ⚠️ 设备上跑的是 busybox sh（ash），所以脚本必须保持 POSIX；
+      #    ubuntu 的 /bin/sh 是 dash，正好能挡住 `[[ ]]` / 数组这类 bash 扩展。
+      - name: Shell syntax check
+        run: |
+          set -e
+          for f in module/src/*.sh; do
+            sh -n "$f"
+            echo "✓ $f"
+          done
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:

@@ -8,11 +8,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use hyperpower_core::config::{ABS_MAX_TEMP_C, CURR_MAX_UA, GEAR_MAX};
+use hyperpower_core::decision::{LOW_BATTERY_SOC_ZERO_WRITE, LOW_BATTERY_VOLT_ZERO_WRITE_UV};
 use hyperpower_core::profile::{
     Capabilities, CurrentCapability, GearCapability, PowerCapability, ThermalCapability,
 };
-use hyperpower_core::{decide, decide_with, ChargingStatus, Config, Sample, State};
+use hyperpower_core::{decide, decide_with, ChargingStatus, Config, Decision, Sample, State};
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 
 /// 造一份**真实形状**的能力档案（档位上限 15，与 K90PM 实测一致）
 ///
@@ -110,14 +112,66 @@ fn arb_state() -> impl Strategy<Value = State> {
         )
 }
 
+/// 全局不变量：**要写就在档案边界内，不写就原样回显**
+///
+/// # 为什么要分成两类（2026-11-18 修）
+///
+/// `Decision.gear` / `curr_ua` 的语义是「**要写进节点的目标值**」。但决策里
+/// 有 4 条**零写入**门禁（见 `decision.rs`），它们**故意原样回显** `state`：
+///
+/// | 门禁 | 触发条件 | `should_write` |
+/// |---|---|---|
+/// | 门禁 0 未检测 | `Bounds.detected == false` | `false` |
+/// | 低电量 / 低电压 | `soc <= 3` 或 `voltage < 3.3 V` | `false` |
+/// | 只观测 | `observe_only` / 只读执行器 | `false` |
+/// | 延迟门禁 | 温度进收紧区但未确认 `delay_s` 拍 | `false` |
+///
+/// 回显而**不是**伪造一个"看起来更安全"的值，是刻意的（R17 不猜）：
+/// 没写就是没写，不能编一个目标值出来。
+///
+/// 所以「档位不超上限」这类命题**只对 `should_write == true` 成立**；
+/// 对零写入的决策，正确的断言是「回显必须与输入一致」。
+///
+/// 背景：v1.0.12 加入低电量门禁后，原先**无条件**断言 `Decision` 字段的
+/// 4 条命题在 CI 上全红，而本机 Windows 不编译 proptest（`cfg(not(windows))`），
+/// 于是藏了 18 天。本函数把两类语义都锁住，覆盖面只增不减。
+fn assert_invariant(d: &Decision, st: &State, caps: &Capabilities) -> Result<(), TestCaseError> {
+    if d.should_write {
+        prop_assert!(d.curr_ua >= 0, "电流不得为负: {}", d.curr_ua);
+        prop_assert!(
+            d.curr_ua <= caps.current.max_ua,
+            "电流超档案上限: curr={} max={}",
+            d.curr_ua,
+            caps.current.max_ua
+        );
+        prop_assert!(
+            d.gear <= caps.gear.max,
+            "档位超档案上限: gear={} max={}",
+            d.gear,
+            caps.gear.max
+        );
+    } else {
+        // 零写入 ⇒ 一个节点都不写，唯一有意义的断言是「没有伪造目标值」
+        prop_assert_eq!(d.gear, st.gear, "零写入必须原样回显档位");
+        prop_assert_eq!(d.curr_ua, st.curr_ua, "零写入必须原样回显电流");
+        prop_assert!(!d.release, "零写入不得交回官方");
+    }
+    Ok(())
+}
+
 proptest! {
     /// 命题 1：任意输入下，输出电流不超过安全上限
     #[test]
     fn prop_current_never_exceeds_max(s in arb_sample(), st in arb_state()) {
         let cfg = Config::default();
         if let Ok(d) = decide(&s, &cfg, &st) {
-            prop_assert!(d.curr_ua >= 0, "电流不得为负: {}", d.curr_ua);
-            prop_assert!(d.curr_ua <= CURR_MAX_UA, "电流超上限: {}", d.curr_ua);
+            if d.should_write {
+                prop_assert!(d.curr_ua >= 0, "电流不得为负: {}", d.curr_ua);
+                prop_assert!(d.curr_ua <= CURR_MAX_UA, "电流超上限: {}", d.curr_ua);
+            } else {
+                // `decide()` 走 `Bounds::default()`（物理上限）；零写入同样必须回显
+                prop_assert_eq!(d.curr_ua, st.curr_ua, "零写入必须原样回显电流");
+            }
         }
     }
 
@@ -130,12 +184,7 @@ proptest! {
     fn prop_gear_within_range(s in arb_sample(), st in arb_state(), caps in arb_caps()) {
         let cfg = Config::default();
         if let Ok(d) = decide_with(&s, &cfg, &st, &caps) {
-            prop_assert!(
-                d.gear <= caps.gear.max,
-                "档位超档案上限: gear={} max={}",
-                d.gear,
-                caps.gear.max
-            );
+            assert_invariant(&d, &st, &caps)?;
         }
     }
 
@@ -146,13 +195,7 @@ proptest! {
     fn prop_current_within_caps(s in arb_sample(), st in arb_state(), caps in arb_caps()) {
         let cfg = Config::default();
         if let Ok(d) = decide_with(&s, &cfg, &st, &caps) {
-            prop_assert!(d.curr_ua >= 0, "电流不得为负: {}", d.curr_ua);
-            prop_assert!(
-                d.curr_ua <= caps.current.max_ua,
-                "电流超档案上限: curr={} max={}",
-                d.curr_ua,
-                caps.current.max_ua
-            );
+            assert_invariant(&d, &st, &caps)?;
         }
     }
 
@@ -167,6 +210,13 @@ proptest! {
         s.status = ChargingStatus::Charging;
         s.temp_c = ABS_MAX_TEMP_C + extra;
         s.virt_c = None; // 排除虚拟温度干扰
+
+        // ⚠️ 必须避开低电量门禁：它排在硬保护**之前**（见 `decision.rs`），
+        //    低电量时连硬保护都不写 —— 宁可欠压也不写大电流（2026-10-31 事故）。
+        //    本命题要验证的是"硬保护这条路径"，所以样本必须是正常工作区。
+        s.soc = 50;
+        s.voltage_uv = 4_000_000;
+
         let d = decide(&s, &cfg, &st).expect("决策应当成功");
         prop_assert_eq!(d.phase, hyperpower_core::state::Phase::HardProtect,
             "达到硬上限必须硬保护: temp={}", s.temp_c);
@@ -190,6 +240,10 @@ proptest! {
             temp_c: t,
             virt_c: None,
             status: ChargingStatus::Charging,
+            // ⚠️ 避开低电量门禁：它排在迟滞判定之前，命中时 `phase` 会停在
+            //    `state.phase`，本命题就测不到迟滞逻辑了。
+            soc: 50,
+            voltage_uv: 4_000_000,
             ..s
         };
         let tightening_state = State {
@@ -229,9 +283,42 @@ proptest! {
             // 非法配置必须被拒绝（fail-closed），而不是产生越界值
             Err(_) => {}
             Ok(d) => {
-                prop_assert!(d.curr_ua <= caps.current.max_ua, "电流越界: {}", d.curr_ua);
-                prop_assert!(d.gear <= caps.gear.max, "档位越界: {}", d.gear);
+                assert_invariant(&d, &st, &caps)?;
             }
         }
+    }
+
+    /// 命题 6：低电量 / 低电压必须**零写入**且原样回显
+    ///
+    /// 2026-10-31 Xiaomi 17T 真机事故：电池 1% / 3.12 V / 45.4 ℃ 时插电，
+    /// 模块写 30 A（写探）与档位兜底 30（硬保护），反复欠压重启。
+    ///
+    /// 因此这条门禁**排在硬保护与释放之前**：宁可让限制残留，也不写大电流。
+    /// 本命题同时锁住三件事：不写、不释放、不伪造目标值。
+    #[test]
+    fn prop_low_battery_never_writes(
+        st in arb_state(),
+        caps in arb_caps(),
+        soc in 0u8..=LOW_BATTERY_SOC_ZERO_WRITE,
+        volt in 3_000_000i32..LOW_BATTERY_VOLT_ZERO_WRITE_UV,
+        low_by_soc in any::<bool>(),
+    ) {
+        let cfg = Config::default();
+        let s = Sample {
+            temp_c: 35.0,
+            virt_c: None,
+            current_ua: 1_000_000,
+            // 两种触发条件各测一半：`low_by_soc` 决定是低电量还是低电压
+            voltage_uv: if low_by_soc { 4_000_000 } else { volt },
+            soc: if low_by_soc { soc } else { 50 },
+            status: ChargingStatus::Charging,
+        };
+
+        let d = decide_with(&s, &cfg, &st, &caps).expect("低电量决策不应失败");
+        prop_assert!(!d.should_write, "低电量必须零写入（soc={} volt={}）", s.soc, s.voltage_uv);
+        prop_assert!(!d.release, "低电量不得交回官方（释放也会拉欠压）");
+        prop_assert_eq!(d.reason, hyperpower_core::Reason::LowBattery);
+        prop_assert_eq!(d.gear, st.gear, "零写入必须原样回显档位");
+        prop_assert_eq!(d.curr_ua, st.curr_ua, "零写入必须原样回显电流");
     }
 }

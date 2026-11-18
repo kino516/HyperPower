@@ -65,9 +65,16 @@ if [ -n "$_w" ] && [ -n "$_s" ] && [ -S "$DATADIR/ipc/control.sock" ]; then
   # socket 文件存在不等于有人监听（进程卡死时文件会残留），
   # 用一次带超时的真实 ctl 探测确认。ctl 若因连接失败尝试自愈，
   # 新进程也会被 supervisor.lock / worker.lock 挡住，不影响旧进程。
-  _alive=1
+  # ⚠️ 默认「**不健康**」：探测不出来就走重启路径。
+  #
+  # 重启是幂等的、可恢复的（新 worker 会重新检测、重新接管）；
+  # 反之若默认「健康」，探测链一旦失效（timeout 不存在 / 输出格式变了）
+  # 模块就**永久哑掉** —— 那正是本补丁要修的那个 bug。宁多重启一次。
+  _alive=0
   if command -v timeout >/dev/null 2>&1; then
-    _out=$(timeout 1 "$BIN" ctl status 2>/dev/null)
+    # 3 s 而不是 1 s：daemon 可能正卡在 3 s 的 sysfs 看门狗读里，
+    # 1 s 会把一个健康进程误判成死的，然后白杀一次。
+    _out=$(timeout 3 "$BIN" ctl status 2>/dev/null)
     case "$_out" in
       *'"battery"'*|*'"daemon"'*) _alive=1 ;;
       *) _alive=0 ;;

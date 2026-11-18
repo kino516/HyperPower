@@ -85,7 +85,13 @@ export const charging = computed<boolean>(() => {
 // 也就是说：一条纯耗电的死命令，外加每次都给 `state.events` 赋新数组
 // 触发的无谓响应式更新。删掉后每 15 秒少一个 root shell。
 
-let refreshing = false;
+/**
+ * 正在进行的刷新数（silent 与非 silent **共用**）
+ *
+ * 用计数而不是布尔：两种调用都会改这个标记，布尔会被「后完成的那个」
+ * 提前清掉 —— 于是轮询照样能叠加。计数则只会归零一次。
+ */
+let inFlight = 0;
 
 /**
  * 拉取一次状态
@@ -109,8 +115,9 @@ let refreshing = false;
  * @param silent 不触碰 `loading`（后台轮询用）
  */
 export async function refresh(silent = false): Promise<void> {
-  if (silent && refreshing) return;
-  refreshing = true;
+  // 轮询不叠加：已有任何一次刷新在飞就跳过本次
+  if (silent && inFlight > 0) return;
+  inFlight += 1;
   if (!silent) {
     state.loading = true;
   }
@@ -128,7 +135,7 @@ export async function refresh(silent = false): Promise<void> {
       },
     );
   } finally {
-    refreshing = false;
+    inFlight -= 1;
     if (!silent) {
       state.loading = false;
     }

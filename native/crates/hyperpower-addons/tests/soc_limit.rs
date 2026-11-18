@@ -621,6 +621,125 @@ fn 没有fake_soc节点时不写() {
     );
 }
 
+// ============================================================
+//  ②.6 电量显示同步（`limit.sync_display`，2026-11-18）
+// ============================================================
+
+/// 关闭同步后**不写** `fake_soc`（保持系统自己的算法）
+#[test]
+fn 关闭同步时不写fake_soc() {
+    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+
+    let mut cfg = enabled_config(90);
+    cfg.sync_display = false;
+    let mut addon = probed(cfg, &mut io);
+    addon.tick(&mut io, 0);
+
+    assert_eq!(
+        io.write_log.iter().filter(|(p, _)| p == FAKE_SOC).count(),
+        0,
+        "同步关着时一次都不该写"
+    );
+    assert_eq!(
+        io.files.get(FAKE_SOC).map(String::as_str),
+        Some("-22"),
+        "原值不得被改动"
+    );
+}
+
+/// 运行中关闭同步 ⇒ **恢复** `fake_soc` 原值
+///
+/// # 为什么不能只是"不写"
+///
+/// 停止写入后，图标会停在**最后一次同步的结果**上 —— 那个值会随
+/// 电量变化而越来越不准（`fake_soc` 是覆盖值，驱动不再更新它）。
+/// ⇒ 必须显式写回原值（本机原值是负数，表示"不覆盖"）。
+#[test]
+fn 关闭同步时恢复系统电量显示() {
+    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+
+    let mut addon = probed(enabled_config(90), &mut io);
+    addon.tick(&mut io, 0);
+    assert_eq!(
+        io.files.get(FAKE_SOC).map(String::as_str),
+        Some("82"),
+        "先同步一次，作为恢复的对照"
+    );
+
+    let mut cfg = enabled_config(90);
+    cfg.sync_display = false;
+    addon.set_config(cfg);
+    addon.tick(&mut io, 1);
+
+    assert_eq!(
+        io.files.get(FAKE_SOC).map(String::as_str),
+        Some("-22"),
+        "关闭同步后必须恢复原值，不能停在过期的 82"
+    );
+}
+
+/// 状态里如实报告同步开关 / 是否具备条件 / 是否正在改写
+///
+/// 界面据此决定开关是否可点：`sync_available=false` 时置灰并说明原因，
+/// 不能让用户点了没反应。
+#[test]
+fn 状态里报告同步能力() {
+    // 有 `fg1_rsoc` + 可写 `fake_soc` ⇒ 具备条件，跑过一拍后处于改写中
+    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+    let mut addon = probed(enabled_config(90), &mut io);
+    addon.tick(&mut io, 0);
+
+    let s = addon.status();
+    assert_eq!(s.detail["sync_display"], true, "默认开启");
+    assert_eq!(s.detail["sync_available"], true);
+    assert_eq!(s.detail["sync_engaged"], true, "写过 fake_soc ⇒ 正在改写");
+    assert_eq!(s.detail["node_rsoc"], RSOC);
+    assert_eq!(s.detail["node_fake_soc"], FAKE_SOC);
+
+    // 没有 `fake_soc` 的机型：可用性必须如实报 `false`（界面置灰开关）
+    let mut io2 = FakeIo::k70pro_with_rsoc(95, 82);
+    let mut addon2 = probed(enabled_config(90), &mut io2);
+    addon2.tick(&mut io2, 0);
+
+    let s2 = addon2.status();
+    assert_eq!(s2.detail["sync_available"], false);
+    assert_eq!(s2.detail["sync_engaged"], false);
+    assert_eq!(
+        s2.detail["node_fake_soc"],
+        serde_json::Value::Null,
+        "没探测到时应当是 null 而不是空串"
+    );
+}
+
+/// 同步开着但**写不进去** ⇒ 状态必须如实报错（不许静默）
+///
+/// 真机上这种失败几乎都是 SELinux 没放行（`sepolicy.rule` 改完没重启）
+/// 或节点被别的程序占着。界面看不到这个标记时，用户只知道"开关开了没用"。
+#[test]
+fn 同步写入失败被如实上报() {
+    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+    let mut addon = probed(enabled_config(90), &mut io);
+
+    // 模拟探测之后节点失去可写权限（SELinux / 被占用）
+    io.writable.retain(|p| p != FAKE_SOC);
+    addon.tick(&mut io, 0);
+
+    let s = addon.status();
+    assert_eq!(
+        s.detail["sync_error"], true,
+        "写不进去必须报 sync_error，否则界面无法解释「开了没效果」"
+    );
+    assert_eq!(s.detail["sync_engaged"], false, "没写成 ⇒ 未处于改写中");
+
+    // 权限恢复后再跑一拍：错误必须自动清掉（不能一直挂着）
+    io.writable.push(FAKE_SOC.to_string());
+    addon.tick(&mut io, 1);
+
+    let s2 = addon.status();
+    assert_eq!(s2.detail["sync_error"], false, "写成功后错误应清除");
+    assert_eq!(s2.detail["sync_engaged"], true);
+}
+
 #[test]
 fn 未充电时不巡检也不写() {
     // 制造"与目标不一致"的情形 —— 若它巡检就一定会写

@@ -78,10 +78,23 @@ sleep 1
 
 # 再确认一次：仍有旧进程说明它杀不掉（常见于 D 状态）。
 # 此时继续安装会导致新旧两个 worker 同时写 sysfs，必须让用户先重启。
+#
+# ⚠️ 不能只靠 `pgrep -f "<子串>"` 下结论：任何 cmdline 里恰好含
+#    `/bin/hyperpower worker` 的**无关**进程（用户自己跑的 grep/tail、
+#    别的脚本）都会命中，然后 abort 掉一次本来正常的安装，
+#    而提示词「仍有旧进程未退出」完全误导。
+#    所以再加一道 `/proc/PID/exe` 校验：必须真的是 hyperpower / thermo 这个二进制。
 _left=""
 for _pat in "/bin/thermo supervisor" "/bin/thermo worker" \
             "/bin/hyperpower supervisor" "/bin/hyperpower worker"; do
-  _left="$_left $(pgrep -f "$_pat" 2>/dev/null)"
+  for _p in $(pgrep -f "$_pat" 2>/dev/null); do
+    _exe=$(readlink "/proc/$_p/exe" 2>/dev/null) || continue
+    # 二进制被替换/删除后，readlink 结果会带 " (deleted)" 后缀
+    _exe=${_exe% (deleted)}
+    case "$_exe" in
+      */bin/hyperpower|*/bin/thermo) _left="$_left $_p" ;;
+    esac
+  done
 done
 if [ -n "$(echo $_left | tr -d ' ')" ]; then
   abort "! 仍有旧进程未退出（PID:$(echo $_left)）。请先重启手机，再重新安装模块。"

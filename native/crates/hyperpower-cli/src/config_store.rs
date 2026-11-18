@@ -409,6 +409,15 @@ pub const KEYS: &[KeySpec] = &[
         "limit.full_interval_days",
         KeyKind::Int { min: 0, max: 365 },
     ),
+    // 电量显示同步（2026-11-18 用户需求）
+    //
+    // | 值 | 行为 |
+    // |---|---|
+    // | `true`（默认） | 每拍把系统显示电量校正成驱动口径的 SOC（写 `fake_soc`） |
+    // | `false` | 恢复 `fake_soc` 原值，图标回到系统自己的算法 |
+    //
+    // ⚠️ 出厂默认与既有行为一致（旧版"启用即同步"），升级不改变观感。
+    spec("limit.sync_display", KeyKind::Bool),
     // ── §8.5 PPS 解锁分区（6，**附加功能**）──
     //
     // ⚠️ 与 `limit.*` **完全独立**：写坏一个不影响另一个。
@@ -574,7 +583,9 @@ pub fn default_config() -> Value {
             // 定期满充：默认关闭，两个条件分别是「10 个完整循环」与「7 天」
             "full_enabled": false,
             "full_after_cycles": 10,
-            "full_interval_days": 7
+            "full_interval_days": 7,
+            // 电量显示同步：默认开启（与既有行为一致）
+            "sync_display": true
         },
         "pps": {
             "enabled": false,
@@ -1723,7 +1734,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 键总数为五十八() {
+    fn 键总数为五十九() {
         // 51 = 移除 device.power_limit_w、加入充电历史（+3）、调试模式（+2）
         //      与 PPS 解锁（+6）后的基线。
         //
@@ -1732,7 +1743,10 @@ mod tests {
         //
         // +3（2026-11-15）见 §8：定期满充（电池校准）：
         //     `limit.full_enabled` / `limit.full_after_cycles` / `limit.full_interval_days`。
-        assert_eq!(key_count(), 58, "定期满充（+3）后合计 58 个键");
+        //
+        // +1（2026-11-18）见 §8：电量显示同步：
+        //     `limit.sync_display` —— 把系统显示电量校正成驱动口径的 SOC。
+        assert_eq!(key_count(), 59, "电量显示同步（+1）后合计 59 个键");
     }
 
     /// 时间键：接受 `H:MM` 并规范化；非法值拒绝且**不改原值**

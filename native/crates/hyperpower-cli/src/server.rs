@@ -217,6 +217,43 @@ impl ControlServer {
         self.listener.as_raw_fd()
     }
 
+    /// 监听路径是否仍然指向**本**监听者
+    ///
+    /// # 为什么需要（2026-11-18 真机：软重启后永久失联）
+    ///
+    /// `UnixListener` 一旦绑定成功，socket **文件**被 unlink 之后监听本身
+    /// 仍然存在 —— 但没有任何路径能连到它：
+    ///
+    /// | 现象 | 原因 |
+    /// |---|---|
+    /// | 客户端「连接 worker 失败」 | 路径已经不存在 |
+    /// | 不会自动恢复 | 主循环的重试只看 `engine.server.is_none()` |
+    ///
+    /// 结果只能重启手机。这里比较「路径 inode」与「监听 fd inode」：
+    /// 不一致（被删 / 被别的进程替换）就返回 `false`，由主循环重建。
+    ///
+    /// 用 `fstat` 而不是"绑定时记下 inode"：前者是**权威**的（直接问内核
+    /// 这个 fd 绑的是哪个 inode），不存在"记录时就已经是别人的"这种窗口。
+    #[cfg(unix)]
+    pub fn path_is_live(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+
+        let Ok(meta) = std::fs::metadata(&self.path) else {
+            return false; // 文件没了 ⇒ 肯定不可达
+        };
+        // SAFETY: `fstat` 只读；`libc::stat` 是 POD，由内核完整回填；
+        //         fd 借用自仍然存活的 `self.listener`。
+        let (dev, ino) = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(self.listener.as_raw_fd(), &mut st) != 0 {
+                return false;
+            }
+            (st.st_dev as u64, st.st_ino as u64)
+        };
+        meta.dev() == dev && meta.ino() == ino
+    }
+
     /// 当前已连接的客户端数
     ///
     /// # 为什么要暴露到生产代码
@@ -535,6 +572,40 @@ mod tests {
         let mut buf = String::new();
         let _ = client.read_to_string(&mut buf);
         assert!(buf.contains("\"ok\":true"), "应收到成功响应，实得：{buf}");
+    }
+
+    /// socket 文件被 unlink 后，`path_is_live` 必须判假
+    ///
+    /// 这是 2026-11-18 软重启失效的根因：监听还在，路径没了 ⇒ 客户端永久连不上。
+    /// 自愈逻辑依赖这个判定，所以必须有测试钉住。
+    #[test]
+    fn socket文件被删除后path_is_live为假() {
+        let path = tmp_sock("live");
+        let _ = std::fs::remove_file(&path);
+        let server = ControlServer::bind(&path).unwrap();
+        assert!(server.path_is_live(), "刚绑定完应当是活的");
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(!server.path_is_live(), "文件被删后必须判定为不可达");
+
+        // 重建后应当恢复（旧监听仍占着 inode，但路径已经指向新的）
+        let server2 = ControlServer::bind(&path).unwrap();
+        assert!(server2.path_is_live(), "重建后应当重新可用");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 路径被替换成**另一个** socket 时也必须判假（inode 变了）
+    #[test]
+    fn socket文件被替换后path_is_live为假() {
+        let path = tmp_sock("replaced");
+        let _ = std::fs::remove_file(&path);
+        let old = ControlServer::bind(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        let fresh = ControlServer::bind(&path).unwrap();
+        assert!(!old.path_is_live(), "被替换成别的 inode 后必须判定为不可达");
+        assert!(fresh.path_is_live(), "新的那个应当是活的");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

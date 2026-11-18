@@ -542,6 +542,39 @@ pub const BATTERY_DIRS: &[&str] = &[
     "/sys/class/power_supply/main",
 ];
 
+/// **驱动口径的 SOC** 节点候选（`rsoc`，%）
+///
+/// # 为什么需要单独读一个"电量"
+///
+/// 系统显示的电量（`battery/capacity`）和**电量计内部用的电量**
+/// （`fg1_rsoc` / `rsoc`）不是同一个数，真机实测可以差 **6~20%**
+/// （见 `docs/audit-2026-11-01/RELEASE-AUDIT.md` 的三源对照表）：
+///
+/// | 来源 | 节点 | K70 Pro 实测 |
+/// |---|---|---|
+/// | 电池图标 | `power_supply/battery/capacity` | **80%** |
+/// | 电量计 | `qcom-battery/fg1_rsoc` | **88%** |
+///
+/// 采用标准 Linux `power_supply` 的机型上，充电截止阈值
+/// （`charge_control_end_threshold`）是**按 `rsoc` 比较**的，而用户看的是
+/// `capacity` —— 于是会出现「明明设了 80%，图标还显示 88% 并且还在充」
+/// 这种让人以为功能失灵的画面。
+///
+/// ⇒ 把 `rsoc` 作为**独立读数**暴露出来（`ctl status` 的
+///   `battery.soc_driver`），界面才能同时展示两个口径。
+///
+/// ⚠️ 与 `hyperpower-addons` 的 `RSOC_CANDIDATES` **同源但各存一份**：
+///    addon 不得依赖 cli（R4 的隔离纪律），而 cli 侧这张表是**观测**用途，
+///    不参与任何写入。改动时请**两处一起改**。
+///
+/// ⚠️ 顺序即优先级：`qcom-battery` 是电量计的原始出口，优先读它；
+///    `power_supply/battery` 下同名的 `fg1_rsoc` 是厂商转发出来的副本。
+pub const RSOC_CANDIDATES: &[&str] = &[
+    "/sys/class/qcom-battery/fg1_rsoc",
+    "/sys/class/power_supply/battery/fg1_rsoc",
+    "/sys/class/power_supply/battery/rsoc",
+];
+
 /// SOC 上限控制节点候选（**路径因机型而异，必须探测**）
 pub const SMART_CHG_CANDIDATES: &[&str] = &[
     "/sys/class/xm_power/charger/smart_charge/smart_chg",
@@ -780,6 +813,26 @@ fn join_candidates(dirs: &[String], name: &str) -> Vec<String> {
     dirs.iter().map(|d| format!("{d}/{name}")).collect()
 }
 
+/// 把 sysfs 里的百分比原文解析成 `0~100`
+///
+/// # 三个约定
+///
+/// | 输入 | 结果 | 为什么 |
+/// |---|---|---|
+/// | `"82"` | `Some(82)` | 正常 |
+/// | `"105"` / `"-1"` | 钳到 `100` / `0` | 驱动满电/校准瞬间会短暂越界，这不是错误 |
+/// | 其它（空串、`"N/A"`、读失败） | `None` | **不猜数值**（R17）：界面显示「—」 |
+///
+/// ⚠️ 与 `capacity` 的读法（`clamp` 后 `unwrap_or(0)`）**刻意不同**：
+///    决策层的 `Sample.soc` 需要一个确定值，而这里的 SOC 只用来**展示**，
+///    读不到时宁可显示「—」也不能显示一个假的 0%。
+pub fn parse_soc_percent(raw: &str) -> Option<u8> {
+    raw.trim()
+        .parse::<i64>()
+        .ok()
+        .and_then(|v| u8::try_from(v.clamp(0, 100)).ok())
+}
+
 // ============================================================
 //  探测结果
 // ============================================================
@@ -812,6 +865,18 @@ pub struct Nodes {
     pub battery_status: Option<Node>,
     /// 电池电量（只读）
     pub battery_capacity: Option<Node>,
+    /// **驱动口径的 SOC**（只读，`fg1_rsoc` / `rsoc`，%）
+    ///
+    /// 与 [`battery_capacity`](Self::battery_capacity) **是两个不同的数** ——
+    /// 前者是电量计内部用的值（标准框架的充电截止阈值按它比较），
+    /// 后者是系统显示/电池图标用的值。真机实测可差 6~20%。
+    ///
+    /// ⚠️ **仅用于观测与显示，不参与决策**。决策层用的仍是
+    ///    `battery_capacity`（`engine::sample`），改动那一点会让温控与
+    ///    上限判断的口径一起变，属于另一件事。
+    ///
+    /// 机型没有该节点时为 `None`（界面显示「—」）。
+    pub battery_rsoc: Option<Node>,
     /// 机身温度（只读，可选）
     pub board_temp: Option<Node>,
     /// **电荷泵芯片温度**（只读，可选）
@@ -945,6 +1010,16 @@ impl Nodes {
         let battery_status = pick_existing(&join_candidates(&batt_dirs, "status"));
         let battery_capacity = pick_existing(&join_candidates(&batt_dirs, "capacity"));
 
+        // 驱动口径的 SOC（观测用，见 [`RSOC_CANDIDATES`]）
+        //
+        // ⚠️ **先按已探测到的电池目录找**，再退到全局候选表：
+        //    前者尊重档案给出的目录（换机型后仍正确），后者覆盖
+        //    `qcom-battery` 这类与控制节点不同目录的位置。
+        let mut rsoc_cands = join_candidates(&batt_dirs, "fg1_rsoc");
+        rsoc_cands.extend(join_candidates(&batt_dirs, "rsoc"));
+        rsoc_cands.extend(RSOC_CANDIDATES.iter().map(|s| (*s).to_string()));
+        let battery_rsoc = pick_existing(&rsoc_cands);
+
         // ── 可选观测节点 ──
         let board_cands: Vec<String> = profile_nodes
             .map(|n| n.soc_ctrl.clone())
@@ -997,6 +1072,7 @@ impl Nodes {
             battery_voltage,
             battery_status,
             battery_capacity,
+            battery_rsoc,
             board_temp,
             cp_die_temp,
             gear_table,
@@ -1018,6 +1094,21 @@ impl Nodes {
     /// 观测电池状态所需节点是否齐备
     pub fn can_observe(&self) -> bool {
         self.battery_temp.is_some() && self.battery_status.is_some()
+    }
+
+    /// 读**驱动口径的 SOC**（%，仅供观测/显示）
+    ///
+    /// # 读不到就是 `None`
+    ///
+    /// 节点不存在、读失败、值越界一律返回 `None`（界面显示「—」）。
+    /// **绝不**回退成 0 —— `0%` 是一个有效读数，两者混用会让用户
+    /// 以为电量真的空了（同一条纪律见 `read_battery` 的 `soc_driver`）。
+    pub fn read_soc_driver(&self) -> Option<u8> {
+        self.battery_rsoc
+            .as_ref()?
+            .read()
+            .ok()
+            .and_then(|raw| parse_soc_percent(&raw))
     }
 
     /// 缺失的**必需**节点（供诊断输出）
@@ -2538,6 +2629,22 @@ algo_type\tmonitor
                 "官方曲线是设备树属性，路径应在 devicetree 下：{d}"
             );
         }
+    }
+
+    /// SOC 百分比解析：正常值照读，越界钳位，读不到返回 `None`
+    ///
+    /// ⚠️ 最后一条是重点：`0` 是有效读数，不能拿它当"读不到"。
+    ///    界面靠 `None` 显示「—」，靠 `0` 显示「0%」。
+    #[test]
+    fn soc百分比解析() {
+        assert_eq!(parse_soc_percent("82"), Some(82));
+        assert_eq!(parse_soc_percent(" 82\n"), Some(82), "必须容忍换行/空格");
+        assert_eq!(parse_soc_percent("0"), Some(0), "0 是有效读数，不是读不到");
+        assert_eq!(parse_soc_percent("100"), Some(100));
+        assert_eq!(parse_soc_percent("105"), Some(100), "满电瞬间越界应钳位");
+        assert_eq!(parse_soc_percent("-3"), Some(0), "校准瞬间负值应钳位");
+        assert_eq!(parse_soc_percent(""), None);
+        assert_eq!(parse_soc_percent("N/A"), None, "非数字就是不猜");
     }
 
     /// 权限错误必须能从 anyhow 链里识别出来

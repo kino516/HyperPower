@@ -340,6 +340,24 @@ fn status(ctx: &Ctx<'_>) -> Response {
         Some(s) => json!({
             "temp_c": (s.temp_dc as f64) / 10.0,
             "soc": s.soc,
+            // 🔴 **驱动口径的 SOC**（`fg1_rsoc` / `rsoc`），与 `soc` **不是同一个数**
+            //
+            // # 为什么必须单独输出（2026-11-18 用户要求）
+            //
+            // 标准 Linux `power_supply` 的机型上，系统显示的电量
+            // （`battery/capacity`）与电量计内部的 SOC（`fg1_rsoc`）
+            // 可以差 6~20%，而充电截止阈值是按**后者**比较的：
+            //
+            // | 来源 | K70 Pro 实测 |
+            // |---|---|
+            // | 电池图标 `capacity` | **80%** |
+            // | 电量计 `fg1_rsoc` | **88%** |
+            //
+            // 只给一个 `soc` 时，用户无法判断"设 80% 为什么还在充"。
+            // ⇒ 两个口径都输出，界面并列展示。
+            //
+            // 机型没有该节点时为 `null`（界面显示「—」，**不猜数值**）。
+            "soc_driver": s.soc_driver,
             "power_w": s.power_w,
             "status": s.status,
             // 🔴 **实际**电流（A），与 `control.curr_now`（模块**写入**的值）不同
@@ -368,6 +386,8 @@ fn status(ctx: &Ctx<'_>) -> Response {
         None => json!({
             "temp_c": 0.0,
             "soc": null,
+            // 与 `soc` 一样：读不到整块电池读数时也是 `null`
+            "soc_driver": null,
             "power_w": 0.0,
             "status": "Unknown",
             "current_a": null,
@@ -522,6 +542,11 @@ struct BatteryReading {
     status: String,
     /// 电量（%）
     soc: u8,
+    /// **驱动口径的 SOC**（%，`fg1_rsoc` / `rsoc`）
+    ///
+    /// 与 [`Self::soc`]（系统显示的 `capacity`）可能不一致；
+    /// 机型没有该节点时为 `None`。
+    soc_driver: Option<u8>,
     /// 功率（W，由电流与电压推算）
     power_w: f64,
 }
@@ -553,6 +578,8 @@ fn read_battery(nodes: &Nodes) -> Option<BatteryReading> {
         .and_then(|n| n.read_i64().ok())
         .and_then(|v| u8::try_from(v.clamp(0, 100)).ok())
         .unwrap_or(0);
+    // 驱动口径的 SOC（观测用；读不到就是 `None`，不回退到 0）
+    let soc_driver = nodes.read_soc_driver();
     let power = (curr.unsigned_abs() as f64) * (volt.unsigned_abs() as f64) / 1e12;
     Some(BatteryReading {
         temp_dc: temp,
@@ -560,6 +587,7 @@ fn read_battery(nodes: &Nodes) -> Option<BatteryReading> {
         volt_uv: volt,
         status,
         soc,
+        soc_driver,
         power_w: (power * 100.0).round() / 100.0,
     })
 }
@@ -2027,6 +2055,13 @@ mod tests {
                 assert_eq!(
                     d["state"], "idle",
                     "未检测时 state 应为 idle —— 若哪天变了，本条注释需更新"
+                );
+                // 电池读数整块缺失时，两个电量口径都必须是 `null`
+                // （2026-11-18 新增 `soc_driver`：驱动口径的 SOC）
+                assert_eq!(
+                    d["battery"]["soc_driver"],
+                    serde_json::Value::Null,
+                    "没有驱动口径节点时 `soc_driver` 必须是 null，不能是 0"
                 );
             }
             other => panic!("status 应返回数据，实际：{other:?}"),

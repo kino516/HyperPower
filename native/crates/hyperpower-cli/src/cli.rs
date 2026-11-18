@@ -1112,6 +1112,8 @@ pub fn run_probe(official: bool, json: bool) -> Result<()> {
         ("电池电压", &nodes.battery_voltage),
         ("电池状态", &nodes.battery_status),
         ("电池电量", &nodes.battery_capacity),
+        // 驱动口径的 SOC（与上一行**不是同一个数**，见 `sysfs::RSOC_CANDIDATES`）
+        ("SOC 电量", &nodes.battery_rsoc),
         ("机身温度", &nodes.board_temp),
         ("电荷泵温度", &nodes.cp_die_temp),
         ("档位表", &nodes.gear_table),
@@ -1200,6 +1202,9 @@ fn print_candidate_tables() {
     let groups: &[(&str, &[&str], bool)] = &[
         // (名称, 候选表, 是否要求可写)
         ("充电上限控制字", crate::sysfs::SMART_CHG_CANDIDATES, true),
+        // SOC 电量（驱动口径，只读）—— 换机型时用它确认
+        // 「系统显示电量」与「SOC 电量」两个数是否来自不同的节点
+        ("SOC 电量（驱动口径）", crate::sysfs::RSOC_CANDIDATES, false),
         (
             "档位表（设备树）",
             crate::sysfs::GEAR_TABLE_CANDIDATES,

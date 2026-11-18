@@ -26,8 +26,8 @@
 | 控制 socket | `/data/adb/hyperpower/ipc/control.sock`（0600 root，`SO_PEERCRED` UID=0） |
 | 二进制 | `bin/hyperpower`（唯一）；`bin/ctl` / `bin/daemon` 是 shim |
 | 支持基线 | Android 12（API 31）+，仅 arm64-v8a |
-| 配置 | `config.json`，**58 个键 / 11 个分区**（`config_store.rs` 的 `KEYS` 是唯一真源） |
-| 测试基线 | 本机 Windows `cargo test --workspace` = **449 passed**（2026-11-15）；proptest 仅非 Windows |
+| 配置 | `config.json`，**59 个键 / 11 个分区**（`config_store.rs` 的 `KEYS` 是唯一真源） |
+| 测试基线 | 本机 Windows `cargo test --workspace` = **454 passed**（2026-11-18）；proptest 仅非 Windows |
 | 命令面 | 24 个顶层命令名（子命令合计 50+；旧文档的 45/52 是含二级动作的口径） |
 | 许可 | GPL-3.0；模块 zip **不含 APK** |
 
@@ -141,7 +141,7 @@ HyperPower/
 | 调度、休眠、信号 | `worker.rs`、`sleep_events.rs`、`supervisor.rs` | `docs/15`；`sleep_events` 纯函数 |
 | 充电上限 | `hyperpower-addons/src/soc_limit/` | `tests/soc_limit.rs`（双方言 + 使能位） |
 | PPS | `hyperpower-addons/src/pps/` | 门控四条件 + 三条硬约束 |
-| 配置键 | `config_store.rs` 的 `KEYS` + `default_config()` | 测试 `键总数为五十八` |
+| 配置键 | `config_store.rs` 的 `KEYS` + `default_config()` | 测试 `键总数为五十九` |
 | 检测/档案 | `detect.rs`、`profile_io.rs`、`hyperpower-ipc/src/device.rs` | `pending_items` / `failed_items` |
 | 命令/输出 | `commands.rs`、`cli.rs`、`hyperpower-ipc/` | 单行 JSON；`tools/jsoncheck.sh` |
 | WebUI | `webui/src/{api.ts,pages/,theme.css}` | `npm run build` 的全部门禁 |
@@ -200,7 +200,7 @@ HyperPower/
 - 写入原子：tmp → `fsync` → `rename`；批量写任一失败整批拒绝；
 - 运行期钳位**绝不落盘**（检测可能不准，钳位会污染用户配置）。
 
-> 当前是 **58 键 / 11 分区**（56 个 `spec(...)` + 2 个 `ro(...)`）。
+> 当前是 **59 键 / 11 分区**（57 个 `spec(...)` + 2 个 `ro(...)`）。
 > AGENTS.md 旧版的 51、README / `docs/04` 的 43 都过时。
 
 ### R8 契约只增不改
@@ -324,7 +324,7 @@ cargo test --workspace
 1. `config_store.rs`：`KEYS` 加 `spec(...)`（类型/范围/只读）；
 2. `default_config()` + `module/src/defaults/config.json` 同步；
 3. **接线**：在 `to_core()` / 消费点读取（否则就是"能改但不生效"）；
-4. 测试 `键总数为五十八` 会失败 ⇒ 改成新数量；
+4. 测试 `键总数为五十九` 会失败 ⇒ 改成新数量；
 5. WebUI 表单/类型（`webui/src/types.ts`、对应页面）；
 6. 更新 `docs/04`（注意它当前已滞后）；
 7. `cargo xtask check` + `cargo xtask webui`。
@@ -437,7 +437,7 @@ $BIN/ctl status
 | WebUI | `cargo xtask webui` 或 `cd webui && npm run build` | 类型 + 3 个自检 + 7 道源/产物门禁 |
 
 > ⚠️ Windows 上 `cargo xtask check` 的 `test_args()` 只跑 `core + ipc`，
-> 但实测 `cargo test --workspace` 能跑 **449 项**（含 cli/addons）。想跑全量就直接用 `cargo test --workspace`。
+> 但实测 `cargo test --workspace` 能跑 **454 项**（含 cli/addons）。想跑全量就直接用 `cargo test --workspace`。
 
 ### 5.2 完成定义（DoD）
 
@@ -522,7 +522,7 @@ $BIN/ctl addon show pps
 | 控件消失 | 大驼峰组件漏 import | `node check-component-import.mjs` |
 | 前端白屏无报错 | TDZ / 模板问题 | 浏览器实开；看 `window.__errs` |
 | `hyperpower` 命令没反应 | worker 卡死 / socket 残留 | `verify`；看 events；必要时重启 |
-| 测试 `键总数为五十八` 失败 | 加了/删了配置键没改断言 | 同步测试与文档 |
+| 测试 `键总数为五十九` 失败 | 加了/删了配置键没改断言 | 同步测试与文档 |
 | `cargo xtask` 找不到 | 不在仓库根 / 没有 alias | `cd` 到根；或 `cargo run --manifest-path xtask/Cargo.toml --` |
 | `cargo test` 找不到 Cargo.toml | 在根目录执行 | `cd native` |
 

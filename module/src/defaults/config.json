@@ -51,7 +51,8 @@
     "warn_on_conflict": true,
     "full_enabled": false,
     "full_after_cycles": 10,
-    "full_interval_days": 7
+    "full_interval_days": 7,
+    "sync_display": true
   },
   "pps": {
     "enabled": false,

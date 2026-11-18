@@ -34,8 +34,27 @@ export interface Battery {
   current_a: number | null;
   /** 瞬时功率（W） */
   power_w: number;
-  /** 电量（%） */
+  /** 电量（%），系统显示口径（`battery/capacity`，即电池图标那个数） */
   soc: number;
+  /**
+   * **驱动口径的 SOC**（%，`fg1_rsoc` / `rsoc`）
+   *
+   * # 为什么与 [`soc`](Battery.soc) 是两个字段（2026-11-18）
+   *
+   * 采用标准 Linux `power_supply` 的机型上，系统显示的电量与电量计内部
+   * 的 SOC 可以差 **6~20%**，而充电截止阈值是按**后者**比较的：
+   *
+   * | 来源 | 节点 | K70 Pro 实测 |
+   * |---|---|---|
+   * | 电池图标 | `power_supply/battery/capacity` | **80%** |
+   * | 电量计 | `qcom-battery/fg1_rsoc` | **88%** |
+   *
+   * 只显示一个数时，用户无法解释"设 80% 为什么还在充"。
+   *
+   * ⚠️ 机型没有该节点时为 `null` —— 界面显示「—」，**绝不显示 0%**
+   *    （那会让用户以为电量空了）。
+   */
+  soc_driver: number | null;
   /** `Charging` / `Discharging` / `Full` / `Not charging` */
   status: string;
   /** 电池温度（℃） */
@@ -253,6 +272,32 @@ export interface SocLimitDetail {
    * ⚠️ 文案来自后端，前端只管显示。
    */
   note_ui_not_synced?: string;
+  // ── 电量显示同步（2026-11-18）──
+  /**
+   * 是否把**系统显示电量**同步成驱动口径的 SOC（写 `fake_soc`）
+   *
+   * 老版本后端没有这个字段，所以是可选：界面回退到 `true`
+   * （旧版行为就是"启用即同步"）。
+   */
+  sync_display?: boolean;
+  /**
+   * 本机是否**具备**同步条件（能读 `rsoc` 且能写 `fake_soc`）
+   *
+   * `false` 时开关必须置灰并说明原因 —— 否则用户点了没反应。
+   */
+  sync_available?: boolean;
+  /** 当前是否**正在**改写系统显示（写过且未恢复） */
+  sync_engaged?: boolean;
+  /**
+   * 同步开着但**写不进去**（SELinux 未放行 / 节点只读 / 被占用）
+   *
+   * 界面必须据此提示「开了但没生效」，不能静默 —— 否则用户只会认为功能坏了。
+   */
+  sync_error?: boolean;
+  /** 驱动口径 SOC 节点路径（诊断用） */
+  node_rsoc?: string | null;
+  /** 系统显示覆盖节点路径（诊断用） */
+  node_fake_soc?: string | null;
 }
 
 /**

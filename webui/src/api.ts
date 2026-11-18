@@ -1200,6 +1200,8 @@ const demo = {
   fullEnabled: true,
   fullAfterCycles: 10,
   fullIntervalDays: 7,
+  /** 电量显示同步（演示用）：与出厂默认一致（开启） */
+  syncDisplay: true,
   /** 当前生效的模式（演示用） */
   mode: "custom",
   /** 调试模式开关（演示用） */
@@ -1357,6 +1359,7 @@ function mock(parts: string[]): unknown {
       if (k === "limit.full_enabled") demo.fullEnabled = v === "true";
       if (k === "limit.full_after_cycles") demo.fullAfterCycles = Number(v);
       if (k === "limit.full_interval_days") demo.fullIntervalDays = Number(v);
+      if (k === "limit.sync_display") demo.syncDisplay = v === "true";
     }
     return { ok: true };
   }
@@ -1422,6 +1425,9 @@ function mock(parts: string[]): unknown {
         current_a: 10.52,
         power_w: 42.7,
         soc: 65,
+        // 演示值刻意与 `soc` 不同：让「系统显示 65% · SOC 电量 63%」
+        // 这种真实场景在浏览器里就能看到（真机实测可差 6~20%）
+        soc_driver: 63,
         status: "Charging",
         temp_c: 38.6,
         // 演示值取恒流末段的高电压（真机全程约 3.9 → 4.5 V），
@@ -1602,6 +1608,16 @@ function mockLimit(): AddonStatus {
       // 与后端 `NOTE_UI_NOT_SYNCED` 同款文案（演示模式要能看出这块提示的样子）
       note_ui_not_synced:
         "系统设置里显示的百分比不会跟着变（那是系统自己的文案）。以本页的「已生效」为准。",
+      // ── 电量显示同步（演示数据）──
+      //
+      // 模拟一台**具备同步条件**的机型（能读 `rsoc`、能写 `fake_soc`），
+      // 让浏览器里能看到开关可点、两个电量并列的样子。
+      sync_display: demo.syncDisplay,
+      sync_available: true,
+      sync_engaged: demo.limitEnabled && demo.syncDisplay,
+      sync_error: false,
+      node_rsoc: "/sys/class/power_supply/battery/fg1_rsoc",
+      node_fake_soc: "/sys/class/power_supply/battery/fake_soc",
     },
     enabled: demo.limitEnabled,
     errors: 0,

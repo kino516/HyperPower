@@ -51,7 +51,7 @@ import type { DeviceProfileView } from "../types";
 const st = computed(() => sysState.status);
 
 /**
- * 「详细读数」的 12 个格子
+ * 「详细读数」的格子（数组，**不是手写 12 个 `<div>`**）
  *
  * # 为什么用数组 + `v-for`，而不是手写 12 个 `<div>`
  *
@@ -62,7 +62,7 @@ const st = computed(() => sysState.status);
  * # 顺序依据
  *
  * 按"用户看这块时的关注顺序"排，而不是按后端字段顺序：
- * 电流 → 电压 → 档位/功率 → 温度 → 协议 → 运行时长。
+ * 电流 → 电压 → 电量（系统显示 / SOC 两个口径）→ 档位/功率 → 温度 → 运行时长。
  * 两个电流排最前是因为它们的**差额**最能说明问题
  * （差得多 = 系统没跟上模块的意图）。
  *
@@ -91,6 +91,29 @@ const readouts = computed<{ label: string; value: string }[]>(() => {
       label: "电压",
       value:
         s.battery.voltage_v === null ? dash : `${volts2(s.battery.voltage_v)} V`,
+    },
+    // 🔵 SOC 电量（驱动口径）—— 2026-11-18 用户要求加入
+    //
+    // # 为什么单开一格，而不是替换上面的「电量」
+    //
+    // 标准 Linux `power_supply` 机型上两者**不是同一个数**（实测差 6~20%）：
+    //
+    // | 上面进度条的「电量」 | 本格「SOC 电量」 |
+    // |---|---|
+    // | `battery/capacity`（电池图标） | `fg1_rsoc` / `rsoc`（电量计） |
+    // | 用户看到的 | **充电截止阈值实际比较的** |
+    //
+    // 只显示前者时，「设 80% 还在充」无法解释；只显示后者时又对不上图标。
+    // 两个都给，用户自己一眼看出偏差。
+    //
+    // ⚠️ 机型没有该节点时是 `null` ⇒ 显示「—」，**不显示 0%**
+    //    （`0%` 是有效读数，混用会让用户以为电量空了）。
+    {
+      label: "SOC 电量",
+      value:
+        s.battery.soc_driver === null
+          ? dash
+          : `${f0(s.battery.soc_driver)}%`,
     },
     { label: "目标功率上限", value: `${f0(s.control.power_limit_w)} W` },
     // ⚠️ 这里原有「电荷泵温度」，已删除（2026-10-17 用户要求）

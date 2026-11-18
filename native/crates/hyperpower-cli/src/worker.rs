@@ -626,6 +626,30 @@ pub fn run() -> Result<()> {
         // 之后不会自动恢复 —— 用户永远连不上，只能重启手机。
         // 这里在**持有 `worker.lock` 的前提下**重试（不会有第二个 worker），
         // 成功即恢复全部 ctl 能力。
+        // ── 控制通道被外部删除 ⇒ 立即重建 ──
+        //
+        // 场景（2026-11-18 真机）：开机脚本 `rm -f control.sock` 时 worker
+        // 还活着。监听 fd 仍在，但路径没了 ⇒ 所有客户端**永久**连不上，
+        // 只能重启手机。旧代码只在 `server.is_none()` 时重试，所以永远不会重建。
+        //
+        // 每拍一次 `stat` 对比，成本可忽略。
+        //
+        // ⚠️ 局限：若主循环正处在「未充电且无客户端」的深度阻塞里，
+        //    要等下一次唤醒（插电 / uevent）才会执行到这里。所以这条只是**兜底**，
+        //    第一道防线仍然是开机脚本「不删活着的 socket」。
+        #[cfg(unix)]
+        if engine.server.as_ref().is_some_and(|s| !s.path_is_live()) {
+            log::warn!("控制通道 socket 文件已消失或被替换，立即重建");
+            events.emit(
+                kind::LIFECYCLE,
+                "控制通道 socket 被删除，正在重建",
+                serde_json::json!({}),
+            );
+            engine.server = None;
+            // 清掉节流，让下面那段**立刻**重绑（不必等 15 秒）
+            last_server_try = None;
+        }
+
         #[cfg(unix)]
         if engine.server.is_none() {
             let due = last_server_try.is_none_or(|t| t.elapsed().as_secs() >= 15);

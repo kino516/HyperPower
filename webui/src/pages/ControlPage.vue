@@ -205,6 +205,8 @@ const pendingSoc = ref<number | null>(null);
 const pendingLimitOn = ref<boolean | null>(null);
 /** 定期满充开关的乐观值（同 `pendingLimitOn`） */
 const pendingFullOn = ref<boolean | null>(null);
+/** 电量同步开关的乐观值（同 `pendingLimitOn`） */
+const pendingSync = ref<boolean | null>(null);
 
 // ── 卡片 5：PPS 解锁 ──
 const ppsInfo = ref<AddonStatus | null>(null);
@@ -736,6 +738,47 @@ const limitDetail = computed<SocLimitDetail | null>(() =>
 const socTarget = computed(() => limitDetail.value?.soc_target ?? 80);
 const socActive = computed(() => limitDetail.value?.soc_active ?? null);
 
+// ── 电量口径（2026-11-18 用户要求：显示 SOC 电量 + 同步）──
+
+/**
+ * **系统显示**的电量（电池图标口径，`battery/capacity`）
+ *
+ * 与 [`socDriver`] 并列展示：标准 Linux `power_supply` 机型上两者实测
+ * 可以差 6~20%，而充电截止阈值按**后者**比较。
+ *
+ * 数据来自全局轮询（`sysState.status`，每 3 秒一条 `ctl status`）——
+ * 不再额外发命令，也不依赖 addon 内部的缓存值（那个最多滞后一拍）。
+ */
+const socDisplay = computed(() => sysState.status?.battery.soc ?? null);
+
+/** **驱动口径**的 SOC（`fg1_rsoc` / `rsoc`）；本机无该节点时为 `null` */
+const socDriver = computed(() => sysState.status?.battery.soc_driver ?? null);
+
+/**
+ * 同步开关的后端状态
+ *
+ * ⚠️ `?? true`：老版本后端没有这个字段，而旧版行为就是"启用即同步" ——
+ *    回退成 `false` 会让升级瞬间的界面显示与实际行为相反。
+ */
+const syncEnabled = computed(() => limitDetail.value?.sync_display ?? true);
+
+/**
+ * 本机是否**具备**同步条件（能读 `rsoc` 且能写 `fake_soc`）
+ *
+ * 老版本后端同样没有这个字段 ⇒ `false`（开关置灰）。
+ */
+const syncAvailable = computed(() => limitDetail.value?.sync_available ?? false);
+
+/**
+ * 开关显示值：本地乐观值优先，让开关立刻跟手
+ *
+ * ⚠️ 本机**不具备**同步条件时显示为「关」：配置值可能仍是 `true`，
+ *    但既然写不进去，把开关画成「开」就是在骗用户。
+ */
+const syncShown = computed(
+  () => pendingSync.value ?? (syncAvailable.value ? syncEnabled.value : false),
+);
+
 /**
  * **使用前提**（后端 `spec.requires`）—— 卡片顶部那块提示
  *
@@ -946,6 +989,51 @@ async function onPickFullDays(n: number): Promise<void> {
     return;
   }
   await patchLimitFull([["limit.full_interval_days", String(n)]]);
+}
+
+// ── 电量显示同步（2026-11-18）──
+
+/**
+ * 开关：**系统显示电量 ↔ SOC 电量**同步
+ *
+ * # 语义
+ *
+ * | 状态 | 行为 |
+ * |---|---|
+ * | 开 | 每拍把 `fake_soc` 写成当前 `rsoc` ⇒ 电池图标 == SOC 电量 |
+ * | 关 | 后端**恢复** `fake_soc` 原值，图标回到系统自己的算法 |
+ *
+ * # 为什么走 `set` 而不是 `limit on/off`
+ *
+ * 这是**配置项**（`limit.sync_display`），与"启用充电上限"是两件事：
+ * 关掉同步不影响限制生效。写配置后由 worker 在下一拍推给 addon
+ * （`addon_host::reload_config`）。
+ *
+ * ⚠️ 关闭时后端不只是"停止写入"，而是**写回原值** —— 否则图标会停在
+ *    最后一次同步的过期值上（`fake_soc` 是覆盖值，驱动不再更新它）。
+ */
+async function onToggleSync(v: boolean): Promise<void> {
+  if (busy.value) {
+    return;
+  }
+  busy.value = true;
+  pendingSync.value = v;
+  try {
+    await api.setConfig([["limit.sync_display", String(v)]]);
+    await wait(SETTLE_MS);
+    await Promise.all([loadLimit(), refresh()]);
+    void showSnackbar({
+      message: v
+        ? "已开启电量同步：电池图标将显示 SOC 电量"
+        : "已关闭电量同步：电池图标恢复系统算法",
+      duration: "short",
+    });
+  } catch (e) {
+    fail(e);
+  } finally {
+    pendingSync.value = null;
+    busy.value = false;
+  }
 }
 
 /**
@@ -1795,6 +1883,85 @@ async function applySoc(): Promise<void> {
       >
         先打开上面的开关，才能调整目标电量
       </MiuixText>
+
+      <MiuixDivider class="gap" />
+
+      <!--
+        ── 电量显示同步（2026-11-18 用户要求）────────────────────────┐
+
+        用户原话：「采用标准 Linux power_supply 的机型显示的电量与 SOC
+        电量不一致 …… 在充电上限功能中加入 SOC 电量显示与同步功能
+        （让系统显示电量与 SOC 电量同步）」。
+
+        两个"电量"不是同一个数（真机实测差 6~20%）：
+
+        | 界面上叫什么 | 节点 | 谁在用 |
+        |---|---|---|
+        | 系统显示 | `battery/capacity` | 电池图标 / 状态页进度条 |
+        | **SOC 电量** | `fg1_rsoc` | **充电截止阈值按它比较** |
+
+        只显示一个数时，「设 80% 却显示 88%」无法解释 ⇒ 两个并列。
+        同步开关 = 每拍写 `fake_soc = rsoc`，让图标与驱动同口径。
+
+        ⚠️ 数据来自全局轮询的 `ctl status`（`battery.soc` /
+           `battery.soc_driver`），不额外发命令。
+
+        ⚠️ 关闭同步时后端会**恢复** `fake_soc` 原值，而不是"不写就不管"。
+      -->
+      <div class="row">
+        <div class="row__text">
+          <MiuixText type="body1">电量显示同步</MiuixText>
+          <MiuixText
+            type="footnote1"
+            color="var(--m-color-on-surface-secondary)"
+          >
+            系统显示 {{ socDisplay === null ? "—" : `${socDisplay}%` }} · SOC
+            电量 {{ socDriver === null ? "—" : `${socDriver}%` }}
+          </MiuixText>
+        </div>
+        <MiuixSwitch
+          :model-value="syncShown"
+          :disabled="!limitEnabled || busy || !syncAvailable"
+          @update:model-value="onToggleSync"
+        />
+      </div>
+
+      <div class="notice">
+        <MiuixText
+          type="footnote2"
+          color="var(--m-color-on-surface-secondary)"
+        >
+          <template v-if="!syncAvailable">
+            本机缺少电量计节点（fg1_rsoc）或可写的显示节点（fake_soc），
+            无法同步 —— 两个数不一致来自驱动自己的显示算法，模块改不了。
+          </template>
+          <template v-else-if="!limitEnabled">
+            启用上面的开关后，电量同步才会生效（关闭时不会改写任何节点）。
+          </template>
+          <template v-else>
+            <b>充电截止是按 SOC 电量比较的</b>，而电池图标显示的是系统口径 ——
+            两者不一致时就会出现「设 80% 却显示 88%」。开启同步后图标按 SOC
+            电量改写，设多少、显示多少、停充在多少三者一致；关闭后图标恢复
+            系统自己的算法（含校准与平滑）。
+          </template>
+        </MiuixText>
+      </div>
+
+      <!--
+        同步**开关开着却写不进去** —— 必须给出可操作的提示。
+        最常见原因是 SELinux 没放行（`sepolicy.rule` 改完没重启），
+        其次是节点被别的程序占着。不提示的话用户只看到"开了没效果"。
+      -->
+      <div v-if="syncShown && limitDetail?.sync_error" class="notice notice--warn">
+        <MiuixText
+          type="footnote1"
+          color="var(--m-color-on-tertiary-container)"
+        >
+          <b>同步已开启，但写入电量显示节点失败。</b>
+          可能是 SELinux 未放行（改过 <code>sepolicy.rule</code> 需重启手机），
+          或该节点被其它程序占用。此时电池图标仍是系统口径。
+        </MiuixText>
+      </div>
 
       <MiuixDivider class="gap" />
 
