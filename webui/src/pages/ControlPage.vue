@@ -207,6 +207,8 @@ const pendingLimitOn = ref<boolean | null>(null);
 const pendingFullOn = ref<boolean | null>(null);
 /** 电量同步开关的乐观值（同 `pendingLimitOn`） */
 const pendingSync = ref<boolean | null>(null);
+/** 「按 SOC 限制」开关的乐观值 */
+const pendingFollow = ref<boolean | null>(null);
 
 // ── 卡片 5：PPS 解锁 ──
 const ppsInfo = ref<AddonStatus | null>(null);
@@ -744,7 +746,11 @@ const socActive = computed(() => limitDetail.value?.soc_active ?? null);
  * **系统显示**的电量（电池图标口径，`battery/capacity`）
  *
  * 与 [`socDriver`] 并列展示：标准 Linux `power_supply` 机型上两者实测
- * 可以差 6~20%，而充电截止阈值按**后者**比较。
+ * 可以差 6~20%。
+ *
+ * ⚠️ 2026-11-19 真机反馈修正：标准接口的充电截止按**系统显示电量**
+ *    （`capacity`，即本值）比较，不按 SOC。把图标同步成 SOC 会造成
+ *    「设 90、显示 85 就停」的假象，所以标准接口下不提供同步。
  *
  * 数据来自全局轮询（`sysState.status`，每 3 秒一条 `ctl status`）——
  * 不再额外发命令，也不依赖 addon 内部的缓存值（那个最多滞后一拍）。
@@ -770,13 +776,61 @@ const syncEnabled = computed(() => limitDetail.value?.sync_display ?? true);
 const syncAvailable = computed(() => limitDetail.value?.sync_available ?? false);
 
 /**
+ * 本机方言是否**支持**显示同步
+ *
+ * 标准 `power_supply` 接口按系统电量截止，同步会让显示与截止口径
+ * 不一致（设 90 却像在 85 停下），因此后端直接报 `false`。
+ * 老版本后端没有这个字段 ⇒ `true`（按旧行为处理）。
+ */
+const syncSupported = computed(() => limitDetail.value?.sync_supported ?? true);
+
+/** 不支持同步的人话原因（标准接口 / 缺节点），由后端提供 */
+const syncReason = computed(() => limitDetail.value?.sync_reason ?? null);
+
+/** 目标 100% 在标准接口上等价于「不限」 */
+const socUnlimited = computed(() => limitDetail.value?.soc_unlimited ?? false);
+
+// ── 按 SOC 限制（2026-11-20）──
+
+/** 是否开启「按 SOC 限制」（跟随电量计） */
+const followSoc = computed(() => limitDetail.value?.follow_soc ?? false);
+
+/** 本机是否具备跟随 SOC 的节点（标准接口专属） */
+const followSupported = computed(
+  () => limitDetail.value?.follow_soc_supported ?? false,
+);
+
+/** 最近一次 `capacity - rsoc`（诊断用） */
+const followOffset = computed(() => limitDetail.value?.follow_offset ?? null);
+
+/** 跟随模式目标在系统满电下不可达 */
+const socUnreachable = computed(
+  () => limitDetail.value?.soc_unreachable ?? false,
+);
+
+/** 跟随模式本拍写入的阈值（capacity 口径） */
+const socThreshold = computed(() => limitDetail.value?.soc_threshold ?? null);
+
+/**
+ * 上限判断用的「当前电量」
+ *
+ * 跟随 SOC 时用 `socDriver`（图标也被同步成它），否则用系统显示。
+ */
+const socBasis = computed(() =>
+  followSoc.value ? socDriver.value : socDisplay.value,
+);
+
+/**
  * 开关显示值：本地乐观值优先，让开关立刻跟手
  *
  * ⚠️ 本机**不具备**同步条件时显示为「关」：配置值可能仍是 `true`，
  *    但既然写不进去，把开关画成「开」就是在骗用户。
+ * ⚠️ 跟随 SOC 时同步是硬前提，始终显示「开」并置灰。
  */
 const syncShown = computed(
-  () => pendingSync.value ?? (syncAvailable.value ? syncEnabled.value : false),
+  () =>
+    followSoc.value ||
+    (pendingSync.value ?? (syncAvailable.value ? syncEnabled.value : false)),
 );
 
 /**
@@ -1009,6 +1063,9 @@ async function onPickFullDays(n: number): Promise<void> {
  * 关掉同步不影响限制生效。写配置后由 worker 在下一拍推给 addon
  * （`addon_host::reload_config`）。
  *
+ * ⚠️ 仅小米控制字方言有效；标准接口按系统电量截止，后端会直接
+ *    忽略这个开关并恢复原值（见 `soc_limit::sync_supported`）。
+ *
  * ⚠️ 关闭时后端不只是"停止写入"，而是**写回原值** —— 否则图标会停在
  *    最后一次同步的过期值上（`fake_soc` 是覆盖值，驱动不再更新它）。
  */
@@ -1036,10 +1093,48 @@ async function onToggleSync(v: boolean): Promise<void> {
   }
 }
 
+/** 「按 SOC 限制」开关的显示值（乐观值优先） */
+const followShown = computed(() => pendingFollow.value ?? followSoc.value);
+
+/**
+ * 开启/关闭「按 SOC 限制」
+ *
+ * 开启时同时把 `limit.sync_display` 置 true：上限跟随 SOC 时，
+ * 图标必须显示同一个数，否则用户看到的又不是截止口径。
+ */
+async function onToggleFollowSoc(v: boolean): Promise<void> {
+  if (busy.value) {
+    return;
+  }
+  busy.value = true;
+  pendingFollow.value = v;
+  try {
+    const pairs: [string, string][] = v
+      ? [
+          ["limit.follow_soc", "true"],
+          ["limit.sync_display", "true"],
+        ]
+      : [["limit.follow_soc", "false"]];
+    await api.setConfig(pairs);
+    await wait(SETTLE_MS);
+    await Promise.all([loadLimit(), refresh()]);
+    void showSnackbar({
+      message: v
+        ? "已开启按 SOC 限制：上限与图标都按 SOC 电量"
+        : "已关闭按 SOC 限制：上限按系统电量",
+      duration: "short",
+    });
+  } catch (e) {
+    fail(e);
+  } finally {
+    pendingFollow.value = null;
+    busy.value = false;
+  }
+}
+
 /**
  * 只取 **PPS** 的 detail（类型收窄）
- */
-const ppsDetail = computed<PpsDetail | null>(() =>
+ */const ppsDetail = computed<PpsDetail | null>(() =>
   isPpsStatus(ppsInfo.value) ? ppsInfo.value.detail : null,
 );
 
@@ -1835,8 +1930,17 @@ async function applySoc(): Promise<void> {
             目标电量
           </MiuixText>
         </div>
-        <div class="chip" :class="socActive !== null ? 'chip--on' : ''">
-          {{ socActive !== null ? `生效中 ${socActive}%` : "未生效" }}
+        <div
+          class="chip"
+          :class="socUnlimited || socActive !== null ? 'chip--on' : ''"
+        >
+          {{
+            socUnlimited
+              ? "不限"
+              : socActive !== null
+                ? `生效中 ${socActive}%`
+                : "未生效"
+          }}
         </div>
       </div>
 
@@ -1862,7 +1966,7 @@ async function applySoc(): Promise<void> {
             type="footnote2"
             color="var(--m-color-on-surface-secondary)"
           >
-            {{ socMax }}%
+            {{ socMax }}%（不限）
           </MiuixText>
         </div>
       </div>
@@ -1884,7 +1988,73 @@ async function applySoc(): Promise<void> {
         先打开上面的开关，才能调整目标电量
       </MiuixText>
 
+      <!--
+        系统电量已经高于上限 ⇒ 驱动不会再充。必须说清楚，
+        否则用户会以为「设了上限但没生效」。
+      -->
+      <div
+        v-if="
+          limitEnabled &&
+          !socUnlimited &&
+          socBasis !== null &&
+          socTarget < socBasis
+        "
+        class="notice"
+      >
+        <MiuixText
+          type="footnote2"
+          color="var(--m-color-on-surface-secondary)"
+        >
+          当前{{ followSoc ? "SOC 电量" : "系统电量" }} {{ socBasis }}%
+          已高于上限 {{ socTarget }}%，不会主动充电；降到上限以下后才会恢复。
+        </MiuixText>
+      </div>
+
       <MiuixDivider class="gap" />
+
+      <!--
+        ── 按 SOC 限制（2026-11-20）────────────────────────────────┐
+
+        标准接口的驱动只认 `capacity`。开启本开关后模块用实时偏差
+        平移阈值，让停充点落在用户设定的 SOC 上，并把图标同步成 SOC。
+
+        只在节点齐全时显示（capacity / rsoc / fake_soc / en / status）。
+      -->
+      <template v-if="followSupported">
+        <div class="row">
+          <div class="row__text">
+            <MiuixText type="body1">按 SOC 限制（跟随电量计）</MiuixText>
+            <MiuixText
+              type="footnote1"
+              color="var(--m-color-on-surface-secondary)"
+            >
+              上限与图标都按 SOC；受系统满电限制时可能到不了目标
+              <template v-if="followSoc && followOffset !== null">
+                · 当前偏差
+                {{ followOffset > 0 ? `+${followOffset}` : followOffset }}%
+              </template>
+            </MiuixText>
+          </div>
+          <MiuixSwitch
+            :model-value="followShown"
+            :disabled="!limitEnabled || busy"
+            @update:model-value="onToggleFollowSoc"
+          />
+        </div>
+
+        <div v-if="followSoc && socUnreachable" class="notice notice--warn">
+          <MiuixText
+            type="footnote1"
+            color="var(--m-color-on-tertiary-container)"
+          >
+            <b>已达系统满电，但 SOC 仍低于目标 {{ socTarget }}%。</b>
+            系统电量封顶 100%，电量计校准偏差让 SOC 到不了目标；
+            可把目标调低，或做一次完整充放电校准。
+          </MiuixText>
+        </div>
+
+        <MiuixDivider class="gap" />
+      </template>
 
       <!--
         ── 电量显示同步（2026-11-18 用户要求）────────────────────────┐
@@ -1897,11 +2067,16 @@ async function applySoc(): Promise<void> {
 
         | 界面上叫什么 | 节点 | 谁在用 |
         |---|---|---|
-        | 系统显示 | `battery/capacity` | 电池图标 / 状态页进度条 |
-        | **SOC 电量** | `fg1_rsoc` | **充电截止阈值按它比较** |
+        | 系统显示 | `battery/capacity` | 电池图标 / 状态页进度条 / **标准接口按它截止** |
+        | **SOC 电量** | `fg1_rsoc` | 电量计读数（小米控制字方言才按它截止） |
 
         只显示一个数时，「设 80% 却显示 88%」无法解释 ⇒ 两个并列。
         同步开关 = 每拍写 `fake_soc = rsoc`，让图标与驱动同口径。
+
+        ⚠️ 2026-11-19 真机反馈修正：标准接口的 `charge_control_end_threshold`
+           按**系统电量**截止，不按 `fg1_rsoc`。同步会造成「设 90、显示
+           85 就停」的假象，还会让 100% 目标直接不充 ⇒ 标准接口下后端
+           不写 `fake_soc`，开关置灰并说明原因。
 
         ⚠️ 数据来自全局轮询的 `ctl status`（`battery.soc` /
            `battery.soc_driver`），不额外发命令。
@@ -1917,11 +2092,14 @@ async function applySoc(): Promise<void> {
           >
             系统显示 {{ socDisplay === null ? "—" : `${socDisplay}%` }} · SOC
             电量 {{ socDriver === null ? "—" : `${socDriver}%` }}
+            <template v-if="followSoc && socThreshold !== null">
+              · 写入阈值 {{ socThreshold }}%
+            </template>
           </MiuixText>
         </div>
         <MiuixSwitch
           :model-value="syncShown"
-          :disabled="!limitEnabled || busy || !syncAvailable"
+          :disabled="!limitEnabled || busy || !syncAvailable || followSoc"
           @update:model-value="onToggleSync"
         />
       </div>
@@ -1931,18 +2109,31 @@ async function applySoc(): Promise<void> {
           type="footnote2"
           color="var(--m-color-on-surface-secondary)"
         >
-          <template v-if="!syncAvailable">
-            本机缺少电量计节点（fg1_rsoc）或可写的显示节点（fake_soc），
-            无法同步 —— 两个数不一致来自驱动自己的显示算法，模块改不了。
+          <template v-if="followSoc">
+            跟随 SOC 模式下同步强制开启：图标显示 SOC 电量，上限也用同一个数。
+            模块每拍按「系统电量 - SOC」的实时偏差平移驱动阈值，让停充点
+            落在目标 SOC 上；偏差会随电量变化，所以显示与写入阈值可能不同。
+          </template>
+          <template v-else-if="!syncSupported">
+            本机走标准充电接口：<b>充电截止按系统电量（电池图标）比较</b>，
+            SOC 电量只是电量计读数。把图标改成 SOC 会让显示与截止口径
+            不一致（设 90 却像在 85 停下），因此本机不提供显示同步；
+            如需按 SOC 限制，请开启上方的「按 SOC 限制」。
+          </template>
+          <template v-else-if="!syncAvailable">
+            {{
+              syncReason ??
+              "本机缺少电量计节点（fg1_rsoc）或可写的显示节点（fake_soc），无法同步 —— 两个数不一致来自驱动自己的显示算法，模块改不了。"
+            }}
           </template>
           <template v-else-if="!limitEnabled">
             启用上面的开关后，电量同步才会生效（关闭时不会改写任何节点）。
           </template>
           <template v-else>
-            <b>充电截止是按 SOC 电量比较的</b>，而电池图标显示的是系统口径 ——
-            两者不一致时就会出现「设 80% 却显示 88%」。开启同步后图标按 SOC
-            电量改写，设多少、显示多少、停充在多少三者一致；关闭后图标恢复
-            系统自己的算法（含校准与平滑）。
+            <b>小米控制字方言下，充电截止按 SOC 电量比较</b>，而电池图标
+            显示的是系统口径 —— 两者不一致时就会出现「设 80% 却显示 88%」。
+            开启同步后图标按 SOC 电量改写，设多少、显示多少、停充在多少
+            三者一致；关闭后图标恢复系统自己的算法（含校准与平滑）。
           </template>
         </MiuixText>
       </div>

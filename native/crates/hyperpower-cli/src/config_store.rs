@@ -418,6 +418,15 @@ pub const KEYS: &[KeySpec] = &[
     //
     // ⚠️ 出厂默认与既有行为一致（旧版"启用即同步"），升级不改变观感。
     spec("limit.sync_display", KeyKind::Bool),
+    // 按 SOC 限制（跟随电量计，2026-11-20）
+    //
+    // 标准接口的 `charge_control_end_threshold` 只认系统电量
+    // （`battery/capacity`），不认 `fg1_rsoc`。开启本键后模块做闭环：
+    // 用实时 `capacity - rsoc` 偏差平移阈值，让停充点落在用户设定的
+    // SOC 上，同时把图标同步成 SOC。
+    //
+    // 默认 `false`：不改变 v1.1.1 的「按系统电量」行为。
+    spec("limit.follow_soc", KeyKind::Bool),
     // ── §8.5 PPS 解锁分区（6，**附加功能**）──
     //
     // ⚠️ 与 `limit.*` **完全独立**：写坏一个不影响另一个。
@@ -585,7 +594,9 @@ pub fn default_config() -> Value {
             "full_after_cycles": 10,
             "full_interval_days": 7,
             // 电量显示同步：默认开启（与既有行为一致）
-            "sync_display": true
+            "sync_display": true,
+            // 按 SOC 限制：默认关闭（v1.1.1 行为不变）
+            "follow_soc": false
         },
         "pps": {
             "enabled": false,
@@ -1734,7 +1745,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 键总数为五十九() {
+    fn 键总数为六十() {
         // 51 = 移除 device.power_limit_w、加入充电历史（+3）、调试模式（+2）
         //      与 PPS 解锁（+6）后的基线。
         //
@@ -1746,7 +1757,10 @@ mod tests {
         //
         // +1（2026-11-18）见 §8：电量显示同步：
         //     `limit.sync_display` —— 把系统显示电量校正成驱动口径的 SOC。
-        assert_eq!(key_count(), 59, "电量显示同步（+1）后合计 59 个键");
+        //
+        // +1（2026-11-20）见 §8：按 SOC 限制（跟随电量计）：
+        //     `limit.follow_soc` —— 标准接口用偏差平移阈值，让停充点跟随 rsoc。
+        assert_eq!(key_count(), 60, "按 SOC 限制（+1）后合计 60 个键");
     }
 
     /// 时间键：接受 `H:MM` 并规范化；非法值拒绝且**不改原值**

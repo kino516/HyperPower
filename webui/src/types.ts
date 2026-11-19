@@ -42,14 +42,17 @@ export interface Battery {
    * # 为什么与 [`soc`](Battery.soc) 是两个字段（2026-11-18）
    *
    * 采用标准 Linux `power_supply` 的机型上，系统显示的电量与电量计内部
-   * 的 SOC 可以差 **6~20%**，而充电截止阈值是按**后者**比较的：
+   * 的 SOC 可以差 **6~20%**。
+   *
+   * ⚠️ 2026-11-19 真机反馈修正：标准接口的 `charge_control_end_threshold`
+   * 按**系统显示电量**（`capacity`）截止，**不按**这个数。把图标同步成
+   * SOC 会造成「设 90、显示 85 就停」的假象，因此本字段只作**诊断参考**，
+   * 不参与充电上限的截止判断。
    *
    * | 来源 | 节点 | K70 Pro 实测 |
    * |---|---|---|
    * | 电池图标 | `power_supply/battery/capacity` | **80%** |
    * | 电量计 | `qcom-battery/fg1_rsoc` | **88%** |
-   *
-   * 只显示一个数时，用户无法解释"设 80% 为什么还在充"。
    *
    * ⚠️ 机型没有该节点时为 `null` —— 界面显示「—」，**绝不显示 0%**
    *    （那会让用户以为电量空了）。
@@ -286,6 +289,29 @@ export interface SocLimitDetail {
    * `false` 时开关必须置灰并说明原因 —— 否则用户点了没反应。
    */
   sync_available?: boolean;
+  /**
+   * 本机方言是否**支持**显示同步
+   *
+   * 标准 `power_supply` 接口按系统电量截止，同步会让显示与截止口径
+   * 不一致，因此为 `false`（开关置灰）。老版本后端没有该字段 ⇒ 按
+   * `true` 处理（旧行为）。
+   */
+  sync_supported?: boolean;
+  /** 不支持同步的人话原因（标准接口 / 缺节点），界面直接展示 */
+  sync_reason?: string | null;
+  /** 目标 100% 在标准接口上等价于「不限」（界面显示「不限」） */
+  soc_unlimited?: boolean;
+  // ── 按 SOC 限制（2026-11-20）──
+  /** 是否开启「按 SOC 限制」（跟随电量计） */
+  follow_soc?: boolean;
+  /** 本机是否具备跟随 SOC 所需的节点（capacity / rsoc / fake_soc / en / status） */
+  follow_soc_supported?: boolean;
+  /** 最近一次 `capacity - rsoc`（诊断用） */
+  follow_offset?: number | null;
+  /** 跟随模式本拍写入的阈值（capacity 口径，诊断用） */
+  soc_threshold?: number | null;
+  /** 跟随模式目标在系统满电下不可达（电量计校准偏差） */
+  soc_unreachable?: boolean;
   /** 当前是否**正在**改写系统显示（写过且未恢复） */
   sync_engaged?: boolean;
   /**

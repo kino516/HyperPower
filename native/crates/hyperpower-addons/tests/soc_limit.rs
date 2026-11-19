@@ -41,7 +41,11 @@ const STD_EN: &str = "/sys/class/qcom-battery/charge_control_en";
 /// 系统显示电量（`capacity`）—— 用户看到的那个数
 const CAPACITY: &str = "/sys/class/power_supply/battery/capacity";
 
-/// 驱动内部真实电量（`rsoc`）—— `charge_control_end_threshold` 按它比较
+/// 电量计口径 SOC（`fg1_rsoc`）
+///
+/// ⚠️ 2026-11-19 真机反馈修正：标准接口的 `charge_control_end_threshold`
+///    按**系统电量**（`capacity`）截止，不按这个值；它只用于满充计数、
+///    界面诊断，以及小米控制字方言下的显示同步。
 const RSOC: &str = "/sys/class/qcom-battery/fg1_rsoc";
 
 /// 系统电量覆盖节点（可写，用来把电池图标校正成驱动真实值）
@@ -154,6 +158,29 @@ impl FakeIo {
         io
     }
 
+    /// K70 Pro + 跟随 SOC 所需的全部节点（capacity / rsoc / fake_soc / status）
+    fn k70pro_follow(capacity: u8, rsoc: u8, status: &str) -> Self {
+        let mut io = Self::k70pro_with_display(capacity, rsoc, "-22");
+        io.files.insert(STATUS.to_string(), status.to_string());
+        io
+    }
+
+    /// 小米控制字方言 + rsoc（验证同步只在支持的方言下工作）
+    fn hyperos_with_rsoc(capacity: u8, rsoc: u8) -> Self {
+        let mut io = Self::hyperos();
+        io.files.insert(CAPACITY.to_string(), capacity.to_string());
+        io.files.insert(RSOC.to_string(), rsoc.to_string());
+        io
+    }
+
+    /// 小米控制字方言 + rsoc + 可写的 fake_soc
+    fn hyperos_with_display(capacity: u8, rsoc: u8, fake_soc: &str) -> Self {
+        let mut io = Self::hyperos_with_rsoc(capacity, rsoc);
+        io.files.insert(FAKE_SOC.to_string(), fake_soc.to_string());
+        io.writable.push(FAKE_SOC.to_string());
+        io
+    }
+
     fn writes(&self) -> usize {
         self.write_log.len()
     }
@@ -182,6 +209,17 @@ impl AddonIo for FakeIo {
     }
 
     fn read(&mut self, path: &str) -> Result<String, String> {
+        // 复现真机行为：`fake_soc` 会把 `battery/capacity` 也覆盖成 SOC。
+        // 跟随模式必须临时恢复原值才能读到驱动实际比较的原始容量。
+        if path == CAPACITY {
+            if let Some(fake) = self.files.get(FAKE_SOC) {
+                if let Ok(v) = fake.trim().parse::<i32>() {
+                    if v >= 0 {
+                        return Ok(v.to_string());
+                    }
+                }
+            }
+        }
         self.files
             .get(path)
             .cloned()
@@ -538,19 +576,20 @@ fn 关闭功能时不显示生效值() {
     assert_eq!(s.detail["soc_in_effect"], false);
 }
 
-/// 🔴 **回归守卫**：把系统电量显示校正成驱动真实电量
+/// 🔴 **回归守卫**：小米控制字方言下把系统电量显示校正成驱动真实电量
 ///
 /// # 用户要求（2026-10-20）
 ///
 /// 「充电上限设置成 95，写入驱动 95，**系统显示 95**；
 ///   系统显示不准，按驱动读取的电量调整」
 ///
-/// 真机上 `capacity`（图标）虚高 6~20%，而 `fg1_rsoc` 才是驱动用的数。
-/// 所以每拍把 `fake_soc` 写成当前 `rsoc`，图标就与驱动同口径。
+/// ⚠️ 2026-11-19 真机反馈修正：这个同步**只对小米控制字方言成立**。
+///    标准 `power_supply` 的 `charge_control_end_threshold` 按系统电量
+///    截止，同步会造成「设 90、显示 85 就停」——见后面的标准接口用例。
 #[test]
 fn 把系统显示校正成驱动真实电量() {
     // 图标显示 95（虚高），驱动真实 82
-    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+    let mut io = FakeIo::hyperos_with_display(95, 82, "-22");
 
     let mut addon = probed(enabled_config(90), &mut io);
     addon.tick(&mut io, 0);
@@ -568,7 +607,7 @@ fn 把系统显示校正成驱动真实电量() {
 /// 与实际严重脱节。
 #[test]
 fn 禁用时恢复系统电量显示() {
-    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+    let mut io = FakeIo::hyperos_with_display(95, 82, "-22");
 
     // 先启用跑一拍（写入 fake_soc = 82）
     let mut addon = probed(enabled_config(90), &mut io);
@@ -591,7 +630,7 @@ fn 禁用时恢复系统电量显示() {
 /// `rsoc` 没变时不重复写 `fake_soc`（省掉无谓的 sysfs 写）
 #[test]
 fn rsoc未变时不重复写fake_soc() {
-    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+    let mut io = FakeIo::hyperos_with_display(95, 82, "-22");
 
     let mut addon = probed(enabled_config(90), &mut io);
     addon.tick(&mut io, 0);
@@ -609,7 +648,7 @@ fn rsoc未变时不重复写fake_soc() {
 /// 没有 `fake_soc` 节点时不写任何东西（不影响既有行为）
 #[test]
 fn 没有fake_soc节点时不写() {
-    let mut io = FakeIo::k70pro_with_rsoc(95, 82);
+    let mut io = FakeIo::hyperos_with_rsoc(95, 82);
 
     let mut addon = probed(enabled_config(90), &mut io);
     addon.tick(&mut io, 0);
@@ -628,7 +667,7 @@ fn 没有fake_soc节点时不写() {
 /// 关闭同步后**不写** `fake_soc`（保持系统自己的算法）
 #[test]
 fn 关闭同步时不写fake_soc() {
-    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+    let mut io = FakeIo::hyperos_with_display(95, 82, "-22");
 
     let mut cfg = enabled_config(90);
     cfg.sync_display = false;
@@ -656,7 +695,7 @@ fn 关闭同步时不写fake_soc() {
 /// ⇒ 必须显式写回原值（本机原值是负数，表示"不覆盖"）。
 #[test]
 fn 关闭同步时恢复系统电量显示() {
-    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+    let mut io = FakeIo::hyperos_with_display(95, 82, "-22");
 
     let mut addon = probed(enabled_config(90), &mut io);
     addon.tick(&mut io, 0);
@@ -685,7 +724,7 @@ fn 关闭同步时恢复系统电量显示() {
 #[test]
 fn 状态里报告同步能力() {
     // 有 `fg1_rsoc` + 可写 `fake_soc` ⇒ 具备条件，跑过一拍后处于改写中
-    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+    let mut io = FakeIo::hyperos_with_display(95, 82, "-22");
     let mut addon = probed(enabled_config(90), &mut io);
     addon.tick(&mut io, 0);
 
@@ -697,7 +736,7 @@ fn 状态里报告同步能力() {
     assert_eq!(s.detail["node_fake_soc"], FAKE_SOC);
 
     // 没有 `fake_soc` 的机型：可用性必须如实报 `false`（界面置灰开关）
-    let mut io2 = FakeIo::k70pro_with_rsoc(95, 82);
+    let mut io2 = FakeIo::hyperos_with_rsoc(95, 82);
     let mut addon2 = probed(enabled_config(90), &mut io2);
     addon2.tick(&mut io2, 0);
 
@@ -709,6 +748,23 @@ fn 状态里报告同步能力() {
         serde_json::Value::Null,
         "没探测到时应当是 null 而不是空串"
     );
+
+    // 标准接口：节点齐全，但方言不支持 ⇒ 必须如实报 false + 原因
+    let mut io3 = FakeIo::k70pro_with_display(95, 82, "-22");
+    let mut addon3 = probed(enabled_config(90), &mut io3);
+    addon3.tick(&mut io3, 0);
+
+    let s3 = addon3.status();
+    assert_eq!(s3.detail["sync_supported"], false);
+    assert_eq!(s3.detail["sync_available"], false);
+    assert_eq!(s3.detail["sync_engaged"], false, "标准接口一个字都不写");
+    assert!(
+        s3.detail["sync_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("标准充电接口")),
+        "必须给出人话原因，实得：{}",
+        s3.detail["sync_reason"]
+    );
 }
 
 /// 同步开着但**写不进去** ⇒ 状态必须如实报错（不许静默）
@@ -717,7 +773,7 @@ fn 状态里报告同步能力() {
 /// 或节点被别的程序占着。界面看不到这个标记时，用户只知道"开关开了没用"。
 #[test]
 fn 同步写入失败被如实上报() {
-    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+    let mut io = FakeIo::hyperos_with_display(95, 82, "-22");
     let mut addon = probed(enabled_config(90), &mut io);
 
     // 模拟探测之后节点失去可写权限（SELinux / 被占用）
@@ -738,6 +794,310 @@ fn 同步写入失败被如实上报() {
     let s2 = addon.status();
     assert_eq!(s2.detail["sync_error"], false, "写成功后错误应清除");
     assert_eq!(s2.detail["sync_engaged"], true);
+}
+
+// ============================================================
+//  ②.7 标准接口：按系统电量截止（2026-11-19 真机反馈）
+// ============================================================
+
+/// 标准接口**不写** `fake_soc`：驱动按系统电量截止，同步会骗人
+///
+/// 2026-11-19 真机反馈：设 90、同步开，图标被改成 rsoc 85 ⇒
+/// 看起来「85 就停」；设 100 时系统电量已 100 ⇒ 直接不充。
+#[test]
+fn 标准接口不写fake_soc() {
+    let mut io = FakeIo::k70pro_with_display(95, 82, "-22");
+
+    let mut addon = probed(enabled_config(90), &mut io);
+    addon.tick(&mut io, 0);
+
+    assert_eq!(
+        io.write_log.iter().filter(|(p, _)| p == FAKE_SOC).count(),
+        0,
+        "标准接口按系统电量截止，绝不能改写图标"
+    );
+    assert_eq!(
+        io.files.get(FAKE_SOC).map(String::as_str),
+        Some("-22"),
+        "原值不得被改动"
+    );
+
+    let s = addon.status();
+    assert_eq!(s.detail["sync_supported"], false);
+    assert_eq!(s.detail["sync_available"], false);
+    assert!(
+        s.detail["sync_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("标准充电接口")),
+        "必须给出人话原因，实得：{}",
+        s.detail["sync_reason"]
+    );
+}
+
+/// 标准接口目标 100% = 不限：不写 100，也不开使能位
+#[test]
+fn 标准接口目标一百视为不限() {
+    let mut io = FakeIo::k70pro();
+    let mut addon = probed(enabled_config(100), &mut io);
+
+    let outcome = addon.tick(&mut io, 0);
+
+    assert!(!outcome.wrote, "目标 100% 不应写任何节点");
+    assert_eq!(io.writes(), 0, "一次写入都不该发生：{:?}", io.write_log);
+    assert_eq!(
+        io.files.get(STD_CTRL).map(String::as_str),
+        Some("0"),
+        "阈值节点应保持原样（0 = 驱动未启用）"
+    );
+
+    let s = addon.status();
+    assert_eq!(s.detail["soc_unlimited"], true);
+    assert_eq!(s.detail["soc_in_effect"], false, "不限没有「生效中的上限」");
+    assert_eq!(s.detail["soc_active"], serde_json::Value::Null);
+}
+
+/// 标准接口从 90 改到 100：必须把使能位释放掉，否则还是不充
+#[test]
+fn 标准接口目标一百释放使能位() {
+    let mut io = FakeIo::k70pro();
+
+    // 先设 90 跑一拍：写 en=1 + threshold=90
+    let mut addon = probed(enabled_config(90), &mut io);
+    addon.tick(&mut io, 0);
+    assert_eq!(io.files.get(STD_EN).map(String::as_str), Some("1"));
+    assert_eq!(io.files.get(STD_CTRL).map(String::as_str), Some("90"));
+
+    // 改成 100：应只写 en=0，不写 threshold=100
+    addon.set_config(enabled_config(100));
+    addon.tick(&mut io, 1);
+
+    assert_eq!(
+        io.files.get(STD_EN).map(String::as_str),
+        Some("0"),
+        "目标 100% 必须释放使能位，否则驱动仍按 90 停充"
+    );
+    assert_eq!(
+        io.files.get(STD_CTRL).map(String::as_str),
+        Some("90"),
+        "不能写 100 —— 系统电量已 100 时写 100 会直接不充"
+    );
+
+    let s = addon.status();
+    assert_eq!(s.detail["soc_unlimited"], true);
+    assert_eq!(s.detail["soc_in_effect"], false);
+}
+
+/// 小米控制字方言的目标 100% 仍然写控制字（不是"不限"）
+#[test]
+fn 小米控制字目标一百仍然写控制字() {
+    let mut io = FakeIo::hyperos();
+    let mut addon = probed(enabled_config(100), &mut io);
+
+    addon.tick(&mut io, 0);
+
+    let last = io
+        .write_log
+        .iter()
+        .find(|(p, _)| p == CTRL)
+        .map(|(_, v)| v.clone());
+    assert_eq!(last.as_deref(), Some("0x640011"));
+    assert_eq!(io.files.get(READ).map(String::as_str), Some("100"));
+    assert_eq!(addon.status().detail["soc_unlimited"], false);
+}
+
+// ============================================================
+//  ②.8 跟随 SOC（`limit.follow_soc`，2026-11-20）
+// ============================================================
+
+/// 标准接口按 `capacity - rsoc` 平移阈值，并同步图标
+#[test]
+fn 跟随soc按偏差平移阈值() {
+    // capacity 97 / rsoc 92 ⇒ offset 5；目标 95 ⇒ 阈值 100
+    let mut io = FakeIo::k70pro_follow(97, 92, "Charging");
+    let mut cfg = enabled_config(95);
+    cfg.follow_soc = true;
+    let mut addon = probed(cfg, &mut io);
+
+    addon.tick(&mut io, 0);
+
+    assert_eq!(io.files.get(STD_EN).map(String::as_str), Some("1"));
+    assert_eq!(
+        io.files.get(STD_CTRL).map(String::as_str),
+        Some("100"),
+        "阈值应为 95 + (97-92) = 100"
+    );
+    assert_eq!(
+        io.files.get(FAKE_SOC).map(String::as_str),
+        Some("92"),
+        "跟随模式必须把图标同步成 rsoc"
+    );
+
+    let s = addon.status();
+    assert_eq!(s.detail["follow_soc"], true);
+    assert_eq!(s.detail["follow_soc_supported"], true);
+    assert_eq!(s.detail["follow_offset"], 5);
+    assert_eq!(s.detail["soc_threshold"], 100);
+    assert_eq!(s.detail["soc_active"], 95);
+    assert_eq!(s.detail["soc_in_effect"], true);
+    assert_eq!(s.detail["sync_supported"], true);
+}
+
+/// 跟随模式必须读**原始** capacity：`fake_soc` 会把 capacity 也覆盖成 SOC
+#[test]
+fn 跟随soc读取原始容量而不是fake_soc() {
+    let mut io = FakeIo::k70pro_follow(97, 92, "Charging");
+    let mut cfg = enabled_config(95);
+    cfg.follow_soc = true;
+    let mut addon = probed(cfg, &mut io);
+
+    addon.tick(&mut io, 0);
+
+    // 同步已写 fake_soc=92；若直接读 capacity 会得到 92，偏差变 0。
+    // 正确实现会临时恢复原值读 97，再写回 92。
+    let s = addon.status();
+    assert_eq!(s.detail["follow_offset"], 5, "偏差应为 97-92=5，而不是 0");
+    assert_eq!(s.detail["soc_threshold"], 100, "95 + 5 = 100");
+    assert_eq!(io.files.get(FAKE_SOC).map(String::as_str), Some("92"));
+}
+
+/// 已到目标：写入平移阈值，驱动在 capacity 到阈值时停
+#[test]
+fn 跟随soc到目标后写入平移阈值() {
+    // capacity 98 / rsoc 95 ⇒ offset 3；目标 95 ⇒ 阈值 98
+    let mut io = FakeIo::k70pro_follow(98, 95, "Charging");
+    let mut cfg = enabled_config(95);
+    cfg.follow_soc = true;
+    let mut addon = probed(cfg, &mut io);
+
+    addon.tick(&mut io, 0);
+
+    assert_eq!(io.files.get(STD_EN).map(String::as_str), Some("1"));
+    assert_eq!(io.files.get(STD_CTRL).map(String::as_str), Some("98"));
+    assert_eq!(io.files.get(FAKE_SOC).map(String::as_str), Some("95"));
+    assert_eq!(addon.status().detail["soc_in_effect"], true);
+}
+
+/// 停充后 rsoc 回落到「目标 - 回差」以下 ⇒ 先释放 en，再恢复
+#[test]
+fn 跟随soc低于回差时释放使能位再恢复() {
+    let mut io = FakeIo::k70pro_follow(95, 87, "Full");
+    // 模拟上一拍已开 en、阈值 92（90 + 2）
+    io.files.insert(STD_EN.to_string(), "1".to_string());
+    io.files.insert(STD_CTRL.to_string(), "92".to_string());
+
+    let mut cfg = enabled_config(90);
+    cfg.follow_soc = true;
+    let mut addon = probed(cfg, &mut io);
+
+    // 第一拍：rsoc 87 < 90-2，且已停 ⇒ 释放 en
+    addon.tick(&mut io, 0);
+    assert_eq!(
+        io.files.get(STD_EN).map(String::as_str),
+        Some("0"),
+        "低于回差且已停时必须释放 en 才能恢复充电"
+    );
+    assert_eq!(
+        addon.status().detail["soc_in_effect"],
+        true,
+        "恢复等待期也算生效"
+    );
+
+    // 第二拍：驱动已开始充 ⇒ en=1 + 新阈值 98（90 + (95-87)）
+    io.files.insert(STATUS.to_string(), "Charging".to_string());
+    addon.tick(&mut io, 1);
+    assert_eq!(io.files.get(STD_EN).map(String::as_str), Some("1"));
+    assert_eq!(io.files.get(STD_CTRL).map(String::as_str), Some("98"));
+}
+
+/// 0 回差：停在 89、目标 90 时下一拍应恢复补充
+#[test]
+fn 跟随soc停充后低于目标即恢复() {
+    let mut io = FakeIo::k70pro_follow(97, 89, "Full");
+    io.files.insert(STD_EN.to_string(), "1".to_string());
+    io.files.insert(STD_CTRL.to_string(), "97".to_string());
+
+    let mut cfg = enabled_config(90);
+    cfg.follow_soc = true;
+    let mut addon = probed(cfg, &mut io);
+
+    addon.tick(&mut io, 0);
+    assert_eq!(
+        io.files.get(STD_EN).map(String::as_str),
+        Some("0"),
+        "rsoc 89 < 目标 90 ⇒ 应释放 en 补充，不能卡在 89"
+    );
+}
+
+/// 系统电量已满、rsoc 仍低于目标 ⇒ 物理不可达，释放 en 并报状态
+#[test]
+fn 跟随soc系统满电不可达() {
+    let mut io = FakeIo::k70pro_follow(100, 85, "Full");
+    io.files.insert(STD_EN.to_string(), "1".to_string());
+    io.files.insert(STD_CTRL.to_string(), "100".to_string());
+
+    let mut cfg = enabled_config(90);
+    cfg.follow_soc = true;
+    let mut addon = probed(cfg, &mut io);
+    addon.tick(&mut io, 0);
+
+    assert_eq!(
+        io.files.get(STD_EN).map(String::as_str),
+        Some("0"),
+        "目标物理不可达时应释放 en，不再空转"
+    );
+    let s = addon.status();
+    assert_eq!(s.detail["soc_unreachable"], true);
+    assert_eq!(s.detail["soc_threshold"], 100);
+    assert_eq!(s.detail["soc_in_effect"], false);
+}
+
+/// 跟随模式的目标 100% 仍然是「不限」：释放 en，图标照常同步
+#[test]
+fn 跟随soc目标一百仍为不限() {
+    let mut io = FakeIo::k70pro_follow(97, 92, "Charging");
+    io.files.insert(STD_EN.to_string(), "1".to_string());
+    io.files.insert(STD_CTRL.to_string(), "90".to_string());
+
+    let mut cfg = enabled_config(100);
+    cfg.follow_soc = true;
+    let mut addon = probed(cfg, &mut io);
+    addon.tick(&mut io, 0);
+
+    assert_eq!(io.files.get(STD_EN).map(String::as_str), Some("0"));
+    assert_eq!(io.files.get(FAKE_SOC).map(String::as_str), Some("92"));
+    let s = addon.status();
+    assert_eq!(s.detail["soc_unlimited"], true);
+    assert_eq!(s.detail["soc_in_effect"], false);
+}
+
+/// 跟随 SOC 所需节点不全 ⇒ 退回按系统电量，并说明缺什么
+#[test]
+fn 跟随soc缺节点时退回系统电量() {
+    // 没有 fake_soc / status ⇒ 不能跟随
+    let mut io = FakeIo::k70pro_with_rsoc(97, 92);
+    let mut cfg = enabled_config(90);
+    cfg.follow_soc = true;
+    let mut addon = probed(cfg, &mut io);
+
+    addon.tick(&mut io, 0);
+
+    assert_eq!(io.files.get(STD_EN).map(String::as_str), Some("1"));
+    assert_eq!(
+        io.files.get(STD_CTRL).map(String::as_str),
+        Some("90"),
+        "跟随不可用时退回按系统电量写目标"
+    );
+    let s = addon.status();
+    assert_eq!(s.detail["follow_soc"], true);
+    assert_eq!(s.detail["follow_soc_supported"], false);
+    assert_eq!(s.detail["sync_supported"], false);
+    assert!(
+        s.detail["sync_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("缺少跟随 SOC")),
+        "必须说明缺什么节点，实得：{}",
+        s.detail["sync_reason"]
+    );
 }
 
 #[test]

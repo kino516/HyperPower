@@ -1588,8 +1588,10 @@ function mockLimit(): AddonStatus {
       last_written: "0x550011",
       node_ctrl: "/sys/class/xm_power/charger/smart_charge/smart_chg",
       node_read: "/sys/class/xm_power/charger/smart_charge/soc_limit",
-      soc_active: demo.limitEnabled ? demo.soc : null,
+      soc_active: demo.limitEnabled && demo.soc < 100 ? demo.soc : null,
       soc_target: demo.soc,
+      // 标准接口的目标 100% = 不限（演示数据仍按小米方言，这里只用于展示徽标）
+      soc_unlimited: demo.limitEnabled && demo.soc >= 100,
       verify_s: 15,
       warn_on_conflict: true,
       conflict_suspected: false,
@@ -1614,6 +1616,15 @@ function mockLimit(): AddonStatus {
       // 让浏览器里能看到开关可点、两个电量并列的样子。
       sync_display: demo.syncDisplay,
       sync_available: true,
+      // 演示数据按小米控制字方言：标准接口机型会报 false + 原因
+      sync_supported: true,
+      sync_reason: null,
+      // 演示数据按小米控制字方言：不展示「按 SOC 限制」（标准接口专属）
+      follow_soc: false,
+      follow_soc_supported: false,
+      follow_offset: null,
+      soc_threshold: null,
+      soc_unreachable: false,
       sync_engaged: demo.limitEnabled && demo.syncDisplay,
       sync_error: false,
       node_rsoc: "/sys/class/power_supply/battery/fg1_rsoc",

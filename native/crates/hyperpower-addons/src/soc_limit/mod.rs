@@ -14,10 +14,31 @@
 //! |---|---|
 //! | 写节点 | `smart_chg`（控制字） |
 //! | 读节点 | 同目录 `soc_limit`（生效值） |
-//! | 额外写 | 电量显示 `fake_soc`（仅当 `limit.sync_display` 开启，默认开） |
+//! | 额外写 | 电量显示 `fake_soc`（**仅小米控制字方言** + `limit.sync_display`；标准接口不写） |
 //! | **不碰** | 档位 / 电流 / 温度阈值 / 任何温控节点 |
 //! | 周期 | 启用时 15 秒；未启用时 60 秒（只为响应配置变更） |
 //! | 失败后果 | 最多"没限制住"，不会伤害设备 |
+//!
+//! # ⚠️ 2026-11-19 真机反馈修正：标准接口按「系统电量」截止
+//!
+//! 群友反馈（K70 Pro 一类标准 `power_supply` 机型）：
+//!
+//! | 操作 | 现象 |
+//! |---|---|
+//! | 设上限 90、同步开 | 图标停在 85 就不充了 |
+//! | 设 100 | 还是不充 |
+//! | 关掉上限 | 图标跳到 100，又能继续充 |
+//!
+//! 三个现象只能由同一个解释串起来：`charge_control_end_threshold`
+//! 是拿**系统电量**（`battery/capacity`，即电池图标那个数）比较的，
+//! **不是** `fg1_rsoc`。同步把图标改写成 `rsoc`（85）后：
+//!
+//! 1. 系统电量到 90 时驱动已经停充，图标却显示 85 ⇒「85 就停」；
+//! 2. 设 100 时系统电量已经是 100 ⇒ 驱动直接判定到点，不充；
+//! 3. 关掉上限（`en=0`）后驱动不再执行阈值 ⇒ 恢复充电，图标也回到 100。
+//!
+//! ⇒ 标准接口下**禁止**改写系统显示；目标 100% 也**不能写 100**，
+//!    而是释放使能位（见 [`SocLimit::is_unlimited_target`]）。
 
 pub mod config;
 pub mod logic;
@@ -78,7 +99,13 @@ pub const SOC_ENABLE_CANDIDATES: &[&str] = &[
     "/sys/class/power_supply/battery/charge_control_en",
 ];
 
-/// **驱动真实电量**节点候选（%）—— 充电上限实际比较的那个数
+/// **电量计口径** SOC 节点候选（%）
+///
+/// 用于满充计数与界面诊断。
+///
+/// ⚠️ 2026-11-19 真机反馈修正：标准 `power_supply` 的
+///    `charge_control_end_threshold` 按**系统电量**（`capacity`）截止，
+///    不按这个值。只有小米控制字方言才可能按它比较。
 const RSOC_CANDIDATES: &[&str] = &[
     "/sys/class/qcom-battery/fg1_rsoc",
     "/sys/class/power_supply/battery/fg1_rsoc",
@@ -110,6 +137,10 @@ const RSOC_CANDIDATES: &[&str] = &[
 ///    唯一覆盖入口（实测：写 85 → 图标 85；恢复 -22 → 回到真实值）。
 /// ⚠️ **必须记录原值**并在禁用时恢复 —— 否则模块卸载后图标会一直
 ///    停在最后写入的假电量上，那是很糟的用户体验。
+///
+/// ⚠️ 2026-11-19：只在**小米控制字方言**下使用。标准接口按系统电量
+///    截止，改写图标会造成「设 90、显示 85 就停」的假象
+///    （见 [`SocLimit::sync_supported`]）。
 const FAKE_SOC_CANDIDATES: &[&str] = &[
     "/sys/class/qcom-battery/fake_soc",
     "/sys/class/power_supply/battery/fake_soc",
@@ -316,8 +347,8 @@ pub struct SocLimit {
     verify_fail_streak: u32,
     /// 本拍**实际写入的阈值**
     ///
-    /// 恒等于 `config.soc` —— 因为系统显示已经由 `fake_soc` 校正到
-    /// 驱动口径，两边同一个数，不需要任何换算。
+    /// 恒等于 `config.soc` —— 标准接口按系统电量截止，小米控制字
+    /// 也按控制字里的百分比，两边都不需要换算。
     last_target: Option<u8>,
     /// **驱动真实电量**节点（`fg1_rsoc`，%）
     node_rsoc: Option<String>,
@@ -342,6 +373,20 @@ pub struct SocLimit {
     ///
     /// ⚠️ 只在**状态翻转**时打日志，否则每拍一次 warn 会刷屏。
     sync_error: bool,
+    /// 跟随 SOC 的偏差（`capacity - rsoc`），诊断用
+    follow_offset: Option<i16>,
+    /// 跟随 SOC 最近写入的阈值（**capacity 口径**）
+    follow_threshold: Option<u8>,
+    /// 跟随 SOC 时目标在系统满电下不可达（`capacity` 已封顶、`rsoc` 仍低于目标）
+    follow_unreachable: bool,
+    /// 跟随 SOC 刚写了 `en=0`，等待下一拍恢复 `en=1`
+    follow_resume: bool,
+    /// 跟随 SOC 的刷新计数
+    ///
+    /// `fake_soc` 会把 `battery/capacity` 也覆盖成 SOC，导致读不到
+    /// 「驱动实际比较的原始容量」。每 4 拍（约 60 秒）临时恢复一次
+    /// `fake_soc` 原值读原始容量，再写回 SOC；其余拍用缓存的偏差。
+    follow_tick: u32,
     /// **定期满充**的运行状态（首次巡检时从宿主加载）
     ///
     /// 与配置分开：这是记账（充了多少、上次何时满充），不是用户意图。
@@ -383,6 +428,11 @@ impl SocLimit {
             fake_soc_orig: None,
             fake_soc_last: None,
             sync_error: false,
+            follow_offset: None,
+            follow_threshold: None,
+            follow_unreachable: false,
+            follow_resume: false,
+            follow_tick: 0,
             state: FullChargeState::default(),
             state_loaded: false,
             state_dirty: false,
@@ -407,7 +457,86 @@ impl SocLimit {
             .unwrap_or((config::SOC_FALLBACK_MIN, config::SOC_FALLBACK_MAX))
     }
 
+    /// 本机是否支持把系统电量显示改成驱动 SOC
+    ///
+    /// # 为什么标准接口不支持（2026-11-19 真机反馈）
+    ///
+    /// 标准 `power_supply` 的 `charge_control_end_threshold` 由驱动按
+    /// **系统电量**（`battery/capacity`，即电池图标那个数）比较，
+    /// 不是按 `fg1_rsoc`：
+    ///
+    /// | 操作 | 现象 |
+    /// |---|---|
+    /// | 设 90、同步开 | 图标被改成 `rsoc`（85）⇒ 看起来「85 就停」 |
+    /// | 设 100 | 系统电量已 100 ⇒ 驱动直接不充 |
+    /// | 关掉上限 | 图标恢复系统值 100，又能继续充 |
+    ///
+    /// ⇒ 标准接口下**不能**改写图标：显示必须与截止口径同一个数。
+    fn sync_supported(&self) -> bool {
+        self.node_ctrl.is_some() && (self.dialect == Dialect::ControlWord || self.follow_mode())
+    }
+
+    /// 本机是否**具备**同步条件（方言支持 + 能读 `rsoc` + 能写 `fake_soc`）
+    fn sync_available(&self) -> bool {
+        self.sync_supported() && self.node_rsoc.is_some() && self.node_fake_soc.is_some()
+    }
+
+    /// 跟随 SOC 的节点是否齐全（标准接口闭环所需）
+    ///
+    /// 需要：控制节点、`en`、`capacity`、`fg1_rsoc`、`fake_soc`、`status`。
+    /// 少任何一个都无法「按 SOC 停 + 同步显示」，此时退回按系统电量。
+    fn follow_supported(&self) -> bool {
+        self.node_ctrl.is_some()
+            && self.dialect == Dialect::Percent
+            && self.node_enable.is_some()
+            && self.node_rsoc.is_some()
+            && self.node_fake_soc.is_some()
+            && self.fake_soc_orig.is_some()
+            && self.node_soc.is_some()
+            && self.node_status.is_some()
+    }
+
+    /// 本拍是否走「跟随 SOC」闭环
+    fn follow_mode(&self) -> bool {
+        self.config.follow_soc && self.follow_supported()
+    }
+
+    /// 同步不可用的原因（界面直接展示；可用时为 `None`）
+    fn sync_reason(&self) -> Option<&'static str> {
+        if !self.supported() {
+            return None;
+        }
+        if self.dialect == Dialect::Percent && !self.follow_mode() {
+            if self.config.follow_soc {
+                return Some(
+                    "本机缺少跟随 SOC 所需的节点（capacity / fg1_rsoc / fake_soc / en / status），\
+                     无法开启「按 SOC 限制」。",
+                );
+            }
+            return Some(
+                "本机走标准充电接口：驱动按系统电量（电池图标）截止，SOC 只是电量计读数。\
+                 把图标改成 SOC 会让显示与截止口径不一致（设 90 却像在 85 停下）；\
+                 如需按 SOC 限制，请开启「按 SOC 限制」。",
+            );
+        }
+        if self.node_rsoc.is_none() || self.node_fake_soc.is_none() {
+            return Some("本机缺少电量计节点（fg1_rsoc）或可写的显示节点（fake_soc），无法同步。");
+        }
+        None
+    }
+
+    /// 目标 100% 在标准接口上等价于「不限制」
+    ///
+    /// 标准接口按系统电量截止；系统电量到 100 时驱动就停充，哪怕
+    /// 电池实际还没充满（真机反馈：设 100 也不充，关掉上限反而继续充）。
+    /// ⇒ 不写 100，而是把使能位关回 0，交回系统自己的充电逻辑。
+    fn is_unlimited_target(&self, target: u8) -> bool {
+        self.dialect == Dialect::Percent && target >= config::FULL_SOC
+    }
+
     /// 把**系统显示电量校正成驱动真实电量**（写 `fake_soc`）
+    ///
+    /// ⚠️ 仅小米控制字方言可用；标准接口见 [`Self::sync_supported`]。
     ///
     /// # 用户要求（2026-10-20）
     ///
@@ -496,6 +625,210 @@ impl SocLimit {
             self.fake_soc_last = None;
             self.sync_error = false;
             log::info!("[soc_limit] 已恢复系统电量显示（fake_soc={orig}）");
+        }
+    }
+
+    /// 读**原始** `capacity`
+    ///
+    /// `fake_soc` 会把 `battery/capacity` 也覆盖成 SOC，而驱动截止用的是
+    /// 原始容量。⇒ 先写回 `fake_soc` 原值、读容量、再写回 SOC。
+    /// 只在跟随模式每 4 拍做一次（显示会闪一下，窗口是毫秒级）。
+    fn read_raw_capacity(
+        &mut self,
+        io: &mut dyn AddonIo,
+        rsoc: u8,
+        cap_path: &str,
+        fake_path: &str,
+    ) -> Result<u8, String> {
+        let orig = self
+            .fake_soc_orig
+            .clone()
+            .ok_or_else(|| "缺少 fake_soc 原值，无法读原始 capacity".to_string())?;
+        let restore_needed = self.fake_soc_last.is_some();
+        if restore_needed {
+            io.write(fake_path, &orig)
+                .map_err(|e| format!("临时恢复 {fake_path} 失败：{e}"))?;
+        }
+        let raw = io.read(cap_path).ok().and_then(|r| logic::parse_active(&r));
+        if restore_needed {
+            io.write(fake_path, &rsoc.to_string())
+                .map_err(|e| format!("写回 {fake_path}={rsoc} 失败：{e}"))?;
+            self.fake_soc_last = Some(rsoc);
+        }
+        raw.ok_or_else(|| "读不到原始 capacity".to_string())
+    }
+
+    /// **跟随 SOC** 的一拍（标准接口闭环，2026-11-20）
+    ///
+    /// # 为什么不能只写一个百分比
+    ///
+    /// 驱动的 `charge_control_end_threshold` 只认 `capacity`。要让停充点
+    /// 落在用户设定的 `rsoc` 上，必须用实时偏差平移阈值：
+    ///
+    /// ```text
+    /// threshold = clamp(target + (capacity - rsoc), 本机下限, 100)
+    /// ```
+    ///
+    /// 驱动在 `capacity` 到 `threshold` 时停，此时 `rsoc ≈ target`；
+    /// 图标由 ①-0 同步成 `rsoc`，三者对齐。
+    ///
+    /// # 停充后的恢复
+    ///
+    /// 驱动停住后不会因为「阈值被抬高」自动恢复。检测到
+    /// `status = Full / Not charging` 且 `rsoc` 低于 `目标 - 回差` 时，
+    /// 先写一拍 `en=0` 重置，下一拍再写 `en=1 + 新阈值`。
+    ///
+    /// # 物理上限
+    ///
+    /// `capacity` 封顶 100。若系统电量已满、`rsoc` 仍低于目标（电量计
+    /// 校准偏差），目标**到不了**：置 `follow_unreachable` 并释放 `en`，
+    /// 不再空转。
+    fn tick_follow(&mut self, io: &mut dyn AddonIo, target: u8, interval: u32) -> TickOutcome {
+        let (Some(cap_path), Some(rsoc_path), Some(en_path), Some(ctrl), Some(fake_path)) = (
+            self.node_soc.clone(),
+            self.node_rsoc.clone(),
+            self.node_enable.clone(),
+            self.node_ctrl.clone(),
+            self.node_fake_soc.clone(),
+        ) else {
+            return TickOutcome::failed(
+                AddonError::node_missing(
+                    "跟随 SOC 缺少 capacity / fg1_rsoc / fake_soc / en / ctrl 节点",
+                ),
+                interval,
+            );
+        };
+        let Some(rsoc) = io
+            .read(&rsoc_path)
+            .ok()
+            .and_then(|r| logic::parse_active(&r))
+        else {
+            return TickOutcome::failed(
+                AddonError::bad_cond("跟随 SOC 需要读到 fg1_rsoc"),
+                interval,
+            );
+        };
+
+        // fake_soc 会覆盖 capacity，必须周期性恢复原值读原始容量。
+        // 接近目标时每拍刷新（偏差在尾段会跳 1~2%），其余拍 4 拍一次；
+        // 中间拍用缓存偏差估算（capacity ≈ rsoc + offset）。
+        self.follow_tick = self.follow_tick.wrapping_add(1);
+        let near_target = rsoc.saturating_add(5) >= target;
+        let refresh = self.follow_offset.is_none() || near_target || self.follow_tick % 4 == 0;
+        let cap = if refresh {
+            match self.read_raw_capacity(io, rsoc, &cap_path, &fake_path) {
+                Ok(c) => c,
+                Err(e) => return TickOutcome::failed(AddonError::bad_cond(e), interval),
+            }
+        } else {
+            let off = self.follow_offset.unwrap_or(0);
+            (i16::from(rsoc) + off).clamp(0, 100) as u8
+        };
+
+        let offset = i16::from(cap) - i16::from(rsoc);
+        self.follow_offset = Some(offset);
+        let (min, max) = self.effective_range();
+        let shifted = i16::from(target) + offset;
+        let threshold = shifted.clamp(i16::from(min), i16::from(max)) as u8;
+        self.follow_threshold = Some(threshold);
+        self.last_target = Some(target);
+
+        let en_on = io
+            .read(&en_path)
+            .ok()
+            .map(|v| v.trim() != "0")
+            .unwrap_or(false);
+        let status = self
+            .node_status
+            .clone()
+            .and_then(|p| io.read(&p).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let stopped = matches!(status.as_str(), "Full" | "Not charging");
+        let need_charge = rsoc < target;
+        let below_hyst = rsoc.saturating_add(config::FOLLOW_HYSTERESIS) < target;
+
+        // ① 系统电量已满、目标仍高于 rsoc，且平移阈值已顶到上限：
+        //    物理上到不了（电量计校准限制）⇒ 释放 en，不再空转。
+        if cap >= max && need_charge && shifted > i16::from(max) {
+            self.follow_unreachable = true;
+            self.follow_resume = false;
+            if en_on {
+                let _ = io.write(&en_path, "0");
+                self.enable_engaged = false;
+                self.last_written = None;
+                return TickOutcome::wrote(interval);
+            }
+            self.enable_engaged = false;
+            return TickOutcome::idle(interval);
+        }
+        self.follow_unreachable = false;
+
+        // ② 已停、en 还开着、rsoc 已低于「目标 - 回差」：释放一拍恢复充电
+        if need_charge && stopped && en_on && below_hyst && io.write(&en_path, "0").is_ok() {
+            self.enable_engaged = false;
+            self.follow_resume = true;
+            self.last_written = None;
+            log::info!("[soc_limit] 跟随 SOC：rsoc {rsoc}% 低于目标 {target}%，释放 en 以恢复充电");
+            return TickOutcome::wrote(interval);
+        }
+
+        // ③ 已停在回差区间内（目标-回差 <= rsoc < 目标）：保持，不反复开关
+        if need_charge && stopped && !below_hyst && en_on {
+            self.follow_resume = false;
+            return TickOutcome::idle(interval);
+        }
+        // ④ 已到目标且已停、en/阈值都正确：保持
+        if !need_charge && stopped && en_on && self.last_seen == Some(threshold) {
+            self.follow_resume = false;
+            return TickOutcome::idle(interval);
+        }
+
+        // ⑤ 其余：en=1 + 平移阈值（低于目标时 threshold > capacity，
+        //    驱动会继续充；到目标时 capacity >= threshold，驱动停）
+        let mut wrote = false;
+        let en_was_off = !en_on;
+        if en_was_off {
+            if let Err(e) = io.write(&en_path, "1") {
+                return TickOutcome::failed(
+                    AddonError::bad_cond(format!("打开 {en_path} 失败：{e}")),
+                    interval,
+                );
+            }
+            self.enable_engaged = true;
+            self.follow_resume = false;
+            wrote = true;
+        }
+        if en_was_off || self.last_seen != Some(threshold) {
+            if let Err(e) = io.write(&ctrl, &threshold.to_string()) {
+                return TickOutcome::failed(
+                    AddonError::bad_cond(format!("写入 {ctrl} 失败：{e}")),
+                    interval,
+                );
+            }
+            self.last_written = Some(threshold);
+            self.write_count = self.write_count.saturating_add(1);
+            wrote = true;
+        }
+        let seen = io.read(&ctrl).ok().and_then(|r| logic::parse_active(&r));
+        self.last_seen = seen;
+        if seen != Some(threshold) {
+            self.verify_fail_streak = self.verify_fail_streak.saturating_add(1);
+            return TickOutcome {
+                wrote: true,
+                changed: true,
+                error: Some(AddonError::bad_cond(format!(
+                    "跟随 SOC 写入后回读不符：期望阈值 {threshold}%，实得 {}",
+                    seen.map_or_else(|| "读不到".to_string(), |v| format!("{v}%"))
+                ))),
+                next_interval_s: interval,
+            };
+        }
+        self.verify_fail_streak = 0;
+        if wrote {
+            TickOutcome::wrote(interval)
+        } else {
+            TickOutcome::idle(interval)
         }
     }
 
@@ -1066,6 +1399,9 @@ impl Addon for SocLimit {
             }
             self.enable_engaged = false;
             self.last_written = None;
+            self.follow_resume = false;
+            self.follow_threshold = None;
+            self.follow_unreachable = false;
             return if wrote {
                 TickOutcome::wrote(interval)
             } else {
@@ -1083,7 +1419,11 @@ impl Addon for SocLimit {
         // ⚠️ 关闭时必须 `restore_display`，不能只是"不写" ——
         //    否则图标会停在**上一次同步的结果**上（一个过期的假值），
         //    与系统自己的算法脱节。这与"关闭功能"走的是同一条恢复路径。
-        if self.config.sync_display {
+        // ⚠️ 标准接口默认**不写** fake_soc：驱动按系统电量截止，改写图标
+        //    会让显示与截止口径打架（见 `sync_supported` 的文档）。
+        //    开启「跟随 SOC」后必须同步，否则显示的又不是截止口径。
+        let want_sync = self.sync_supported() && (self.config.sync_display || self.follow_mode());
+        if want_sync {
             self.sync_display_to_driver(io);
         } else {
             self.restore_display(io);
@@ -1187,6 +1527,49 @@ impl Addon for SocLimit {
             return TickOutcome::failed(AddonError::out_of_range(e), interval);
         }
 
+        // ③-b 目标 100% = 不限（标准接口，2026-11-19 真机反馈）
+        //
+        // 标准接口的阈值按**系统电量**比较：系统电量到 100 时驱动就停充，
+        // 哪怕电池实际还没充满。用户设 100 的本意是「充满 / 不限制」，
+        // 因此不能写 100，而是把使能位关回 0，交回系统自己的充电逻辑。
+        //
+        // ⚠️ 与「关闭功能」一样要释放 en，否则用户设 100 后仍然充不进。
+        // ⚠️ 只对标准百分比方言生效：小米控制字写 100|0x11 就是正常满充。
+        let target = self.effective_target();
+        if self.is_unlimited_target(target) {
+            self.last_target = Some(target);
+            self.last_written = None;
+            let mut wrote = false;
+            if let Some(en) = self.node_enable.clone() {
+                let en_on = io.read(&en).ok().map(|v| v.trim() != "0").unwrap_or(false);
+                if en_on && io.write(&en, "0").is_ok() {
+                    wrote = true;
+                    log::info!("[soc_limit] 上限 {target}% 视为不限，已释放使能位 {en}");
+                }
+            }
+            self.enable_engaged = false;
+            // 读一次生效值供界面诊断（此时它可能是上一次的上限值）
+            if let Some(read) = self.node_read.clone() {
+                self.last_seen = io
+                    .read(&read)
+                    .ok()
+                    .and_then(|raw| logic::parse_active(&raw));
+            }
+            return if wrote {
+                TickOutcome::wrote(interval)
+            } else {
+                TickOutcome::idle(interval)
+            };
+        }
+
+        // ③-c 跟随 SOC（标准接口闭环，2026-11-20）
+        //
+        // 只在 `limit.follow_soc` 开启且节点齐全时进入；否则走下面的
+        // 「按系统电量」路径，行为与 v1.1.1 一致。
+        if self.follow_mode() {
+            return self.tick_follow(io, target, interval);
+        }
+
         // ④ 节点必须已探测到
         let (Some(ctrl), Some(read)) = (self.node_ctrl.clone(), self.node_read.clone()) else {
             return TickOutcome::failed(
@@ -1218,13 +1601,11 @@ impl Addon for SocLimit {
 
         // ⑤-1 写入值：平时 = **用户设定值，原样写**
         //
-        // 因为 `fake_soc` 已经把系统显示校正到驱动口径（见 ①-0），
-        // 用户设 90、驱动按 `rsoc=90` 停、图标那时也显示 90 ——
-        // 三者天然一致，不需要任何换算或闭环。
+        // 标准接口按系统电量截止，写进去的就是用户设定值；小米控制字
+        // 也是同一口径 —— 不需要任何换算或闭环。
         //
         // 🔋 定期满充进行中 ⇒ 临时把上限放到 100%（见 `effective_target`）：
         //    充满后 `finish_full` 复位 `pending`，下一拍自动写回用户设定值。
-        let target = self.effective_target();
         self.last_target = Some(target);
 
         // ⑥ 已一致 → 不写（这是常态：绝大多数拍什么都不做）
@@ -1364,6 +1745,9 @@ impl Addon for SocLimit {
         // 其余为决策 B：停止干预 = **零写入**。
         // 小米那套由系统自带的智能断充（默认 80%）照常工作。
         self.last_written = None;
+        self.follow_resume = false;
+        self.follow_threshold = None;
+        self.follow_unreachable = false;
 
         if wrote {
             // 有写入就必须让下一拍尽快确认状态
@@ -1390,6 +1774,10 @@ impl Addon for SocLimit {
         // 本拍实际目标：平时 = `config.soc`；定期满充中 = 100%
         let target = self.effective_target();
         let matches_target = active == Some(target);
+        // 标准接口的目标 100% 等价于「不限」：没有"生效中的上限"
+        let unlimited = self.config.enabled && self.is_unlimited_target(target);
+        // 本拍是否走「跟随 SOC」闭环
+        let follow = self.follow_mode();
 
         // 🔴 **"生效中"显示的是用户设定值**（2026-10-20 用户明确要求）
         //
@@ -1412,7 +1800,7 @@ impl Addon for SocLimit {
         // 🔋 定期满充进行中显示的是**临时放开后的目标**（通常 100%）：
         //    那一刻驱动里确实是 100，显示用户设定值反而会让界面与
         //    「正在满充」的提示自相矛盾。
-        let active_shown = if self.config.enabled {
+        let active_shown = if self.config.enabled && !unlimited {
             Some(target)
         } else {
             None
@@ -1438,9 +1826,20 @@ impl Addon for SocLimit {
         };
         // 关掉功能后不可能是"已生效"
         //
-        // 写入值恒等于 `config.soc`（fake_soc 校正后两边同口径），
-        // 所以"值匹配"就是可靠判据。
-        let in_effect = self.config.enabled && enable_ok && matches_target;
+        // 写入值恒等于 `config.soc`，所以"值匹配"就是可靠判据；
+        // 目标 100% 在标准接口上等价于「不限」，也没有"生效中的上限"。
+        //
+        // 跟随 SOC 模式写的是**平移后的阈值**（不是 target），所以改用
+        // 「en 已开 + 本拍写过阈值」判定；恢复等待期（en=0 一拍）也算，
+        // 避免界面在 15 秒窗口里闪「未生效」。
+        let in_effect = if follow {
+            self.config.enabled
+                && !unlimited
+                && (self.enable_engaged || self.follow_resume)
+                && self.follow_threshold.is_some()
+        } else {
+            self.config.enabled && !unlimited && enable_ok && matches_target
+        };
 
         AddonStatus {
             id: spec.id.to_string(),
@@ -1474,9 +1873,27 @@ impl Addon for SocLimit {
                 //
                 // 界面据此渲染「系统显示 ↔ SOC 电量」那一行与同步开关：
                 // `sync_available=false` 时开关置灰并说明原因（本机没有
-                // 可写的显示节点），而不是让用户点了没反应。
+                // 可写的显示节点，或标准接口按系统电量截止、不能同步），
+                // 而不是让用户点了没反应。
                 "sync_display": self.config.sync_display,
-                "sync_available": self.node_rsoc.is_some() && self.node_fake_soc.is_some(),
+                "sync_available": self.sync_available(),
+                // 本机方言是否支持同步（标准接口为 false；界面据此换文案）
+                "sync_supported": self.sync_supported(),
+                // 不支持时的人话原因（标准接口 / 缺节点）
+                "sync_reason": self.sync_reason(),
+                // 目标 100% 在标准接口上等价于「不限」（界面显示「不限」）
+                "soc_unlimited": unlimited,
+                // ── 跟随 SOC（2026-11-20）──
+                //
+                // 只追加字段（R8）。`follow_soc` 是用户配置；
+                // `follow_soc_supported` 是本机节点是否齐全；
+                // `soc_threshold` 是本拍写入的阈值（capacity 口径），
+                // `follow_offset = capacity - rsoc` 用于诊断。
+                "follow_soc": self.config.follow_soc,
+                "follow_soc_supported": self.follow_supported(),
+                "follow_offset": self.follow_offset,
+                "soc_threshold": self.follow_threshold,
+                "soc_unreachable": self.follow_unreachable,
                 // 是否**正在**改写系统显示（写过且未恢复）
                 "sync_engaged": self.fake_soc_last.is_some(),
                 // 同步开着但**写不进去**（SELinux / 只读 / 被占用）

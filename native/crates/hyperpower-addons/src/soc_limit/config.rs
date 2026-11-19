@@ -65,6 +65,16 @@ pub const SOC_FALLBACK_MAX: u8 = 100;
 /// 模块功能关闭时，系统就按这个值工作；开启后若不指定，也默认用它。
 pub const SYS_DEFAULT_SOC: u8 = 80;
 
+/// **跟随 SOC** 的回差（%）
+///
+/// `0` = 停充后只要 `rsoc < 目标` 就补一充，确保能到目标。
+/// 代价是目标附近会有 **1% 的维持循环**（`rsoc` 掉 1% 就补回），
+/// 对长期插电场景是正常的充电维持行为。
+///
+/// 2026-11-20 真机：2% 回差会让目标 90 停在 89（偏差在最后一拍跳 1%，
+/// 驱动先按旧阈值停，回差又不允许补充）⇒ 改为 0。
+pub const FOLLOW_HYSTERESIS: u8 = 0;
+
 /// 校验间隔下限（秒）
 pub const VERIFY_MIN_S: u32 = 5;
 /// 校验间隔上限（秒）
@@ -171,19 +181,15 @@ pub struct SocLimitConfig {
     pub warn_on_conflict: bool,
     /// 是否把**系统显示电量同步成驱动口径的 SOC**（写 `fake_soc`）
     ///
-    /// # 为什么要做成开关（2026-11-18 用户要求）
+    /// # 标准接口的真实语义（2026-11-19 真机反馈修正）
     ///
-    /// 采用标准 Linux `power_supply` 的机型上，系统显示的电量
-    /// （`battery/capacity`）与电量计内部的 SOC（`fg1_rsoc`）可以差
-    /// 6~20%，而充电截止阈值按**后者**比较：
+    /// 标准 `power_supply` 的 `charge_control_end_threshold` 按**系统电量**
+    /// （`battery/capacity`）截止，**不按** `fg1_rsoc`。所以：
     ///
-    /// ```text
-    /// 设 80%  →  驱动按 rsoc=80 停充  →  图标那时才 74%（虚低）
-    /// 反过来（本机 K70 Pro）capacity 虚高 ⇒ 图标 80 时 rsoc 才 72，还得继续充
-    /// ```
-    ///
-    /// 开启同步后每拍写 `fake_soc = rsoc`，电池图标与驱动**同一口径**，
-    /// 用户看到的数就是停止充电的那个数。
+    /// - `follow_soc=false`（默认）：图标保持系统电量，截止也按系统电量，
+    ///   两者同口径；此时同步**不会生效**（后端不写 `fake_soc`）。
+    /// - `follow_soc=true`：模块做闭环，让截止跟随 `rsoc`，并把图标同步成
+    ///   `rsoc`（见 [`Self::follow_soc`]）。
     ///
     /// # 什么时候该关掉它
     ///
@@ -196,6 +202,30 @@ pub struct SocLimitConfig {
     ///    （那时是"只要启用就同步"）。改成 `false` 会让老用户升级后
     ///    突然发现图标又虚高了 —— 那不是用户要的。
     pub sync_display: bool,
+    /// **按 SOC 限制**（跟随电量计，2026-11-20）
+    ///
+    /// # 为什么需要它
+    ///
+    /// 标准接口只认系统电量，用户却可能想「按 SOC 充到 90 就停」。
+    /// 开启后模块每拍用 `offset = capacity - rsoc` 平移阈值：
+    ///
+    /// ```text
+    /// threshold = clamp(target + (capacity - rsoc), 本机下限, 100)
+    /// ```
+    ///
+    /// 驱动在 `capacity` 到 `threshold` 时停，此时 `rsoc ≈ target`；
+    /// 同时把图标同步成 `rsoc`，三者（设定/显示/停充）对齐。
+    ///
+    /// # 限制
+    ///
+    /// - `offset` 不是常数（实测 5~15，停充后还会跳），每拍重算；
+    /// - `threshold` 被钳到 100 时，若系统电量已满而 `rsoc` 仍低于目标，
+    ///   目标**物理上到不了**（电量计校准限制），状态会报 `soc_unreachable`；
+    /// - 驱动停充后未必会因抬高阈值自动恢复，需要 `en=0` 一拍再 `en=1`
+    ///   重置（模块自动做，见 `follow_resume`）。
+    ///
+    /// 默认 `false`：不改变 v1.1.1 的「按系统电量」行为。
+    pub follow_soc: bool,
     /// 是否启用**定期满充**（电池校准）
     ///
     /// 出厂默认 `false`：不启用时行为与旧版完全一致（零额外写入）。
@@ -226,6 +256,8 @@ impl Default for SocLimitConfig {
             warn_on_conflict: true,
             // 与既有行为一致：启用上限时把系统显示校正成驱动口径
             sync_display: true,
+            // 按 SOC 限制默认关闭：v1.1.1 行为不变
+            follow_soc: false,
             // 定期满充默认关闭：出厂行为与旧版完全一致
             full_enabled: false,
             // 用户需求里的两个默认值：10 个完整循环 / 7 天
