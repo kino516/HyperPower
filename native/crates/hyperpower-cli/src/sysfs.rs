@@ -527,7 +527,9 @@ pub const REMOVE_NAMES: &[&str] = &["wired_thermal_remove", "thermal_remove"];
 /// 小米封装层的机型把 `board_temp` 放在 `smart_charge/` 同目录（见
 /// `detect` 里的拼接逻辑）；而标准框架下它在 `qcom-battery` 扩展里。
 ///
-/// 单位 `0.1℃`（与 `battery/temp` 一致，换算见 [`board_temp_to_c`]）。
+/// 单位**不统一**：多数机型是 `0.1℃`（与 `battery/temp` 一致），
+/// 少数 MediaTek 机型是**毫摄氏度**（如 `usb/board_temp` 实测 `43452`）。
+/// 换算统一走 [`board_temp_to_c`]（按量级判定，不按路径分支）。
 pub const BOARD_TEMP_CANDIDATES: &[&str] = &[
     "/sys/class/qcom-battery/thermal_board_temp",
     "/sys/class/power_supply/battery/board_temp",
@@ -2336,7 +2338,10 @@ algo_type\tmonitor
     fn chagall_机身温度候选与单位() {
         const P: &str = "/sys/class/power_supply/usb/board_temp";
         assert!(BOARD_TEMP_CANDIDATES.contains(&P), "候选表应包含 {P}");
-        let c = board_temp_to_c(43_452).expect("43.452℃ 应在合理区间");
+        // ⚠️ 本模块的测试里刻意不用 `unwrap`/`expect`（workspace lint 是 deny，
+        //    且 `sysfs::tests` 没有像其它模块那样加 `#![allow(...)]`）。
+        //    `unwrap_or(NaN)` 让 None 变成 NaN，下面的区间断言自然失败。
+        let c = board_temp_to_c(43_452).unwrap_or(f32::NAN);
         assert!((c - 43.452).abs() < 0.001, "实得 {c}");
     }
 
