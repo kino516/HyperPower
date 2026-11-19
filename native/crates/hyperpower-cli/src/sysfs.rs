@@ -531,6 +531,9 @@ pub const REMOVE_NAMES: &[&str] = &["wired_thermal_remove", "thermal_remove"];
 pub const BOARD_TEMP_CANDIDATES: &[&str] = &[
     "/sys/class/qcom-battery/thermal_board_temp",
     "/sys/class/power_supply/battery/board_temp",
+    // MediaTek / 小米 17T（chagall）把机身温度放在 USB 供电节点下。
+    // 单位实测为毫摄氏度（43452 ⇒ 43.452℃），由 `board_temp_to_c` 按量级换算。
+    "/sys/class/power_supply/usb/board_temp",
 ];
 
 /// 电池观测节点所在目录的候选
@@ -717,6 +720,9 @@ pub const HW_MAX_TEMP_CANDIDATES: &[&str] = &[
     //    不要加入 `connector_temp`（那是接口温度，语义不同）。
     "/sys/class/qcom-battery/max_life_temp",
     "/sys/class/qcom-battery/fg1_temp_max",
+    // 标准 Linux `power_supply` / MediaTek 机型（实测小米 17T / chagall=58℃）
+    // 的电池最高工作温度节点。语义同为"电池能承受多热"。
+    "/sys/class/power_supply/battery/max_life_temp",
 ];
 
 /// 硬件温度候选表里**允许出现**的非设备树路径（白名单）
@@ -744,6 +750,8 @@ pub const HW_MAX_TEMP_SYSFS_OK: &[&str] = &[
     "/sys/class/qcom-battery/max_life_temp",
     // 电量计侧的同义节点（实测同为 44℃）。
     "/sys/class/qcom-battery/fg1_temp_max",
+    // 标准 power_supply 的电池最高工作温度（小米 17T / chagall，实测 58℃）。
+    "/sys/class/power_supply/battery/max_life_temp",
 ];
 
 /// ⚠️ **不要**把这些用作兜底（曾经列在候选表里，2026-10-14 移除）
@@ -2306,6 +2314,30 @@ algo_type\tmonitor
                 "语义不符的属性不得作为候选（{why}）：{bad}"
             );
         }
+    }
+
+    /// 小米 17T / chagall（MT6899）的硬件温度节点必须进入标准候选表
+    ///
+    /// 真机只读 dump：`/sys/class/power_supply/battery/max_life_temp = 58`。
+    /// 该节点属于标准 `power_supply` 框架，语义是"电池允许的最高工作温度"，
+    /// 与 `qcom-battery/max_life_temp` 同义；不加入候选表会退回 45℃ 兜底。
+    #[test]
+    fn chagall_硬件温度候选包含标准节点() {
+        const P: &str = "/sys/class/power_supply/battery/max_life_temp";
+        assert!(HW_MAX_TEMP_CANDIDATES.contains(&P), "候选表应包含 {P}");
+        assert!(HW_MAX_TEMP_SYSFS_OK.contains(&P), "白名单应登记 {P}");
+    }
+
+    /// 小米 17T / chagall 的机身温度节点必须进入候选表
+    ///
+    /// 真机只读 dump：`/sys/class/power_supply/usb/board_temp = 43452`，
+    /// 单位毫摄氏度；`board_temp_to_c` 应换算为 43.452℃。
+    #[test]
+    fn chagall_机身温度候选与单位() {
+        const P: &str = "/sys/class/power_supply/usb/board_temp";
+        assert!(BOARD_TEMP_CANDIDATES.contains(&P), "候选表应包含 {P}");
+        let c = board_temp_to_c(43_452).expect("43.452℃ 应在合理区间");
+        assert!((c - 43.452).abs() < 0.001, "实得 {c}");
     }
 
     /// 🔴 官方表**不得**再被用作硬件保护温度的兜底

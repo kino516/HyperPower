@@ -2427,6 +2427,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 小米 17T / chagall：机身温度在 `usb/board_temp`，不在 battery 下
+    ///
+    /// 真机只读 dump：`/sys/class/power_supply/usb/board_temp = 43452`（毫摄氏度）。
+    /// 这条测试用假节点树锁住候选表 + 单位换算，不需要真机。
+    #[test]
+    fn chagall_usb_board_temp_candidate_hits() {
+        let root = make_standard_power_supply_tree("chagall_board");
+        std::fs::create_dir_all(root.join("sys/class/power_supply/usb")).unwrap();
+        std::fs::write(root.join("sys/class/power_supply/usb/board_temp"), b"43452").unwrap();
+        with_fake_root(&root, || {
+            let nodes = Nodes::detect(None);
+            let p = nodes
+                .board_temp
+                .as_ref()
+                .map(crate::sysfs::Node::path_str)
+                .unwrap_or_default();
+            assert!(
+                p.ends_with("power_supply/usb/board_temp"),
+                "应命中 usb/board_temp，实得 {p}"
+            );
+            let raw = nodes.board_temp.as_ref().unwrap().read_i64().unwrap();
+            let c = crate::sysfs::board_temp_to_c(raw).unwrap();
+            assert!((c - 43.452).abs() < 0.001, "实得 {c}");
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 小米 17T / chagall：硬件温度上限在标准 battery/max_life_temp
+    ///
+    /// 真机只读 dump：`/sys/class/power_supply/battery/max_life_temp = 58`（℃）。
+    /// 用假节点树验证候选表命中，并确认不会退回 45℃ 兜底。
+    #[test]
+    fn chagall_battery_max_life_temp_candidate_hits() {
+        let root = make_standard_power_supply_tree("chagall_max_temp");
+        std::fs::write(
+            root.join("sys/class/power_supply/battery/max_life_temp"),
+            b"58",
+        )
+        .unwrap();
+        with_fake_root(&root, || {
+            let got = crate::detect::read_hardware_max_temp();
+            assert_eq!(got.map(|(c, _)| c), Some(58.0));
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn 端到端_延迟门禁期间不写节点() {
         let fake = FakeSysfs::new("delay");

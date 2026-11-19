@@ -894,9 +894,13 @@ fn read_battery_info() -> BatteryInfo {
 /// 于是标准 `power_supply` 框架的机型会被标成"设备树直读" —— 既说错了
 /// 出处，又让 [`ValueSource::is_authoritative`] 把它降了一档
 /// （`Devicetree` 不是权威来源，`Node` 才是）。因此这里把来源一起带回。
-fn read_hardware_max_temp() -> Option<(f32, ValueSource)> {
+pub(crate) fn read_hardware_max_temp() -> Option<(f32, ValueSource)> {
     for path in sysfs::HW_MAX_TEMP_CANDIDATES {
-        let Ok(raw) = fs::read(path) else { continue };
+        // 用 rooted() 而不是裸 fs::read()：测试时才能把候选表落到假节点树，
+        // 真机上 sysfs_root() 为 "/"，行为不变。
+        let Ok(raw) = fs::read(sysfs::rooted(path)) else {
+            continue;
+        };
 
         // 来源按**路径**判定，不按"读到了什么格式"判定
         let src = if path.contains("/firmware/devicetree/") {
