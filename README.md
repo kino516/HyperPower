@@ -665,11 +665,10 @@ $env:Path = "$ndk;$sc;$env:USERPROFILE\.cargo\bin;$env:Path"
 >
 > 1. **必须让 `default-host` 指向 GNU**：`rust-toolchain.toml` 中的 `1.99.0`
 >    会以 default host 补全；若为 msvc 则报 `linker 'link.exe' not found`。
-> 2. **避开会在本机触发 `dlltool` 的依赖**：`windows-sys 0.61`（被 `clap` /
->    `walkdir` 等引入）在**本机构建**时需用 `dlltool` 生成导入库，而 rustup 精简版在此
->    调用方式下执行失败。因此 `xtask` 刻意不用 `clap` / `walkdir`（手写参数解析 +
->    标准库遍历）。
->    注：`hyperpower-cli` 使用 `clap` 不受影响 —— 它只做交叉编译，不构建 Windows 版。
+> 2. **`dlltool` 相关依赖**：`windows-sys 0.61`（被 `clap` / `walkdir` 等引入）在
+>    **本机构建**时需用 `dlltool` 生成导入库。把上面的 `self-contained` 目录加进 PATH 后
+>    可以正常构建 —— 实测 `cargo test --workspace` 在本机跑满 **477 项**（含
+>    `hyperpower-cli`）。`xtask` 仍刻意不用 `clap` / `walkdir`，只为少一层依赖面。
 
 ### 常用命令
 

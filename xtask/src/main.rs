@@ -730,21 +730,19 @@ fn check_banned_deps(native: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 测试参数（按平台选择范围）
+/// 测试参数
 ///
-/// ⚠️ Windows 上无法 `--workspace`：`cargo test` 需要**原生**构建
-///    `hyperpower-cli`（为二进制建测试宿主），而它依赖 `clap` → `windows-sys`；
-///    后者在本机 GNU 工具链下编译失败（rustup 自带 dlltool 的 CreateProcess
-///    缺陷，详见 README「环境与工具链」）。故 Windows 上只测纯逻辑 crate，
-///    **CI（ubuntu-24.04）跑全量**。
+/// ⚠️ 2026-11-20：**不再按平台缩小范围**。
+///
+/// 旧实现认为 Windows 上无法 `--workspace`（说 `hyperpower-cli` 依赖
+/// `clap → windows-sys`，本机 GNU 工具链的 dlltool 会失败）。实测在本机
+/// （`x86_64-pc-windows-gnu`，rust 1.99.0）`cargo test --workspace` 能跑
+/// **477 项**（含 hyperpower-cli / hyperpower-addons），旧说法已不成立。
+///
+/// 保留平台差异只会让 `cargo xtask check` 与 CI 口径不一致 —— 本地绿、
+/// CI 红的情况正是这么来的。现在统一全量。
 fn test_args() -> Vec<&'static str> {
-    if cfg!(windows) {
-        println!("    注：Windows 上仅测试纯逻辑 crate（hyperpower-cli 的原生构建受");
-        println!("        dlltool 限制）；CI 会跑全量。详见 README「环境与工具链」。");
-        vec!["test", "-p", "hyperpower-core", "-p", "hyperpower-ipc"]
-    } else {
-        vec!["test", "--workspace"]
-    }
+    vec!["test", "--workspace"]
 }
 
 /// adb push

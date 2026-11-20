@@ -223,28 +223,104 @@ fn assert_no_apk(stage: &Path) -> Result<()> {
 }
 
 /// 检查 ELF 的 LOAD 段是否按 16 KB 对齐
+///
+/// # 为什么"找不到工具"不再算通过（2026-11-20）
+///
+/// 旧实现：`llvm-readelf` 不可用 ⇒ 打一行提示、`return Ok(())`。
+/// 后果是**本地 `cargo xtask pack` 全绿，却可能打出一个 4 KB 对齐的二进制**
+/// （Android 15+ 直接加载失败）—— 只有 CI 兜底。
+///
+/// 现在按 [`readelf_candidates`] 逐个尝试；全都不可用就**失败**。
+/// 本机能交叉编译出 `aarch64` 二进制就说明 NDK 在，找不到只是 PATH 没配，
+/// 报错里写清修法即可（R17：不静默）。
 fn check_alignment(bin: &Path) -> Result<()> {
-    let out = std::process::Command::new("llvm-readelf")
-        .args(["-lW", &bin.to_string_lossy()])
-        .output();
+    let mut missing: Vec<String> = Vec::new();
 
-    let out = match out {
-        Ok(o) if o.status.success() => o,
-        _ => {
-            eprintln!("    ! llvm-readelf 不可用，跳过 16 KB 对齐检查");
-            eprintln!("      （CI 上会强制执行；本地可将 NDK 的 bin 加入 PATH）");
-            return Ok(());
+    for cand in readelf_candidates() {
+        let label = cand.display().to_string();
+        let out = std::process::Command::new(&cand)
+            .args(["-lW", &bin.to_string_lossy()])
+            .output();
+
+        match out {
+            // 工具能跑、能解析 ⇒ 用它的输出做断言
+            Ok(o) if o.status.success() => return check_load_segments(&o.stdout, bin),
+            // 工具能跑但读不了这个文件 ⇒ 真实问题，别用"换下一个工具"掩盖
+            Ok(o) => anyhow::bail!(
+                "{label} 读取 {} 失败（{}）：{}",
+                bin.display(),
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            // 工具不存在 ⇒ 记下来，继续找下一个
+            Err(e) => missing.push(format!("{label}: {e}")),
         }
-    };
+    }
 
-    let text = String::from_utf8_lossy(&out.stdout);
+    anyhow::bail!(
+        "找不到可用的 ELF 读取工具（llvm-readelf / readelf）—— \
+         16 KB 对齐检查**不能跳过**。\n\
+         修法：把 NDK 的 bin 加进 PATH\
+         （例：D:\\Android\\android-ndk-r29\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin），\
+         或设 HYPERPOWER_READELF=<llvm-readelf 的绝对路径>。\n\
+         诊断：{missing:?}"
+    )
+}
+
+/// 候选的 ELF 读取工具（**顺序即优先级**）
+///
+/// | 顺序 | 来源 | 说明 |
+/// |---|---|---|
+/// | 1 | `HYPERPOWER_READELF` | 显式覆盖（CI / 特殊环境） |
+/// | 2 | `llvm-readelf`（PATH） | 与 CI 的门禁口径一致 |
+/// | 3 | `readelf`（PATH，GNU binutils） | MSYS2 / 交叉工具链常带 |
+/// | 4 | NDK 自带的 `llvm-readelf` | 按 `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT` / `ANDROID_NDK` 推导 |
+///
+/// 第 4 条是给"PATHEXT 没配好"的 Windows 环境兜底的：能交叉编译就一定有 NDK。
+fn readelf_candidates() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    if let Some(explicit) = std::env::var_os("HYPERPOWER_READELF") {
+        v.push(PathBuf::from(explicit));
+    }
+    v.push(PathBuf::from("llvm-readelf"));
+    v.push(PathBuf::from("readelf"));
+
+    let host = if cfg!(windows) {
+        "windows-x86_64"
+    } else if cfg!(target_os = "macos") {
+        "darwin-x86_64"
+    } else {
+        "linux-x86_64"
+    };
+    let exe = if cfg!(windows) {
+        "llvm-readelf.exe"
+    } else {
+        "llvm-readelf"
+    };
+    for key in ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK"] {
+        if let Some(root) = std::env::var_os(key) {
+            v.push(
+                PathBuf::from(root)
+                    .join("toolchains/llvm/prebuilt")
+                    .join(host)
+                    .join("bin")
+                    .join(exe),
+            );
+        }
+    }
+    v
+}
+
+/// 解析 `readelf -lW` 的输出，断言所有 LOAD 段都是 `0x4000`（16 KB）对齐
+fn check_load_segments(stdout: &[u8], bin: &Path) -> Result<()> {
+    let text = String::from_utf8_lossy(stdout);
     let loads: Vec<&str> = text
         .lines()
         .filter(|l| l.trim_start().starts_with("LOAD"))
         .collect();
 
     if loads.is_empty() {
-        anyhow::bail!("未能从二进制中读取 LOAD 段");
+        anyhow::bail!("未能从 {} 中读取 LOAD 段", bin.display());
     }
 
     let mut bad = Vec::new();

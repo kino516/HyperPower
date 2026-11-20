@@ -780,6 +780,12 @@ const syncAvailable = computed(() => limitDetail.value?.sync_available ?? false)
  *
  * 标准 `power_supply` 接口按系统电量截止，同步会让显示与截止口径
  * 不一致（设 90 却像在 85 停下），因此后端直接报 `false`。
+ *
+ * ⚠️ 2026-11-20：percent 方言不再只有上游标准接口 —— MTK 的 `sc_tuisoc`
+ * 也是 percent，但截止口径未经真机确认。因此本分支**不再写死**
+ * 「本机走标准充电接口」，一律优先展示后端 `sync_reason`（厂商节点
+ * 与标准接口的文案由后端按命中节点区分）。
+ *
  * 老版本后端没有这个字段 ⇒ `true`（按旧行为处理）。
  */
 const syncSupported = computed(() => limitDetail.value?.sync_supported ?? true);
@@ -2115,10 +2121,10 @@ async function applySoc(): Promise<void> {
             落在目标 SOC 上；偏差会随电量变化，所以显示与写入阈值可能不同。
           </template>
           <template v-else-if="!syncSupported">
-            本机走标准充电接口：<b>充电截止按系统电量（电池图标）比较</b>，
-            SOC 电量只是电量计读数。把图标改成 SOC 会让显示与截止口径
-            不一致（设 90 却像在 85 停下），因此本机不提供显示同步；
-            如需按 SOC 限制，请开启上方的「按 SOC 限制」。
+            {{
+              syncReason ??
+              "本机走标准充电接口：充电截止按系统电量（电池图标）比较，SOC 电量只是电量计读数。把图标改成 SOC 会让显示与截止口径不一致（设 90 却像在 85 停下），因此本机不提供显示同步；如需按 SOC 限制，请开启上方的「按 SOC 限制」。"
+            }}
           </template>
           <template v-else-if="!syncAvailable">
             {{

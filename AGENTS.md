@@ -27,7 +27,7 @@
 | 二进制 | `bin/hyperpower`（唯一）；`bin/ctl` / `bin/daemon` 是 shim |
 | 支持基线 | Android 12（API 31）+，仅 arm64-v8a |
 | 配置 | `config.json`，**60 个键 / 11 个分区**（`config_store.rs` 的 `KEYS` 是唯一真源） |
-| 测试基线 | 本机 Windows `cargo test --workspace` = **469 passed**（2026-11-20）；proptest 仅非 Windows |
+| 测试基线 | 本机 Windows `cargo test --workspace` = **477 passed**（2026-11-20）；proptest 仅非 Windows |
 | 命令面 | 24 个顶层命令名（子命令合计 50+；旧文档的 45/52 是含二级动作的口径） |
 | 许可 | GPL-3.0；模块 zip **不含 APK** |
 
@@ -436,8 +436,9 @@ $BIN/ctl status
 | Rust | `cd native && cargo xtask check`（等价 fmt + clippy + test） | 决策、I/O、配置、检测、协议 |
 | WebUI | `cargo xtask webui` 或 `cd webui && npm run build` | 类型 + 3 个自检 + 7 道源/产物门禁 |
 
-> ⚠️ Windows 上 `cargo xtask check` 的 `test_args()` 只跑 `core + ipc`，
-> 但实测 `cargo test --workspace` 能跑 **469 项**（含 cli/addons）。想跑全量就直接用 `cargo test --workspace`。
+> 2026-11-20 起 `cargo xtask check` **与 CI 口径一致**：Windows 上也跑
+> `cargo test --workspace`（实测 **477 项**，含 cli/addons）。旧版"只测 core+ipc"已废弃
+> —— 那种窄口径正是"本地绿、CI 红"的来源。
 
 ### 5.2 完成定义（DoD）
 
