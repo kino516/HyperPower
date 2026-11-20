@@ -30,6 +30,22 @@ use crate::sysfs::{GearTable, Nodes, WriteOutcome};
 /// 连续失败多少次后交回官方（fail-closed）
 pub const FAIL_LIMIT: u32 = 5;
 
+/// 夜间模式切换失败后的退避秒数（进程内，不落盘）
+///
+/// # 为什么需要它
+///
+/// 空闲休眠的定时器由 [`Engine::night_next_transition_in_s`] 决定：只要
+/// 「当前是否在窗口内」与 [`NightState::active`] 不一致，它就返回 **1 秒** ——
+/// 这是为了开机补切 / 结束点已过时立刻纠正。
+///
+/// 但 `switch_mode` 失败时状态会被回滚成 `active = false`，于是「在窗口内但
+/// 未激活」永远成立 ⇒ 若不加退避，worker 会**每秒醒一次、每秒重试一次**，
+/// 整夜如此。触发条件很窄（`night.mode` 非法，例如手改 `config.json`），
+/// 但代价是整夜不睡，必须挡住。
+///
+/// 退避期间定时器仍会在到期时醒来（不会漏掉恢复），只是不再每秒重试。
+pub const NIGHT_RETRY_BACKOFF_S: i64 = 300;
+
 /// 档位回读是否算"写入生效"
 ///
 /// # 判据是「**不松于目标**」，不是「等于目标」
@@ -256,6 +272,10 @@ pub struct Engine {
     /// 单测不能依赖真实时钟（否则只有恰好在窗口内跑才通过），因此留这个钩子；
     /// **生产路径永远是 `None`**（用系统本地时间）。
     pub night_clock: Option<u32>,
+    /// 夜间切换失败后的退避截止时刻（**仅进程内**，不落盘）
+    ///
+    /// 见 [`NIGHT_RETRY_BACKOFF_S`]。`None` = 没有待退避的失败。
+    pub night_retry_at_s: Option<i64>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -354,6 +374,7 @@ impl Engine {
             night: crate::night::load(&init.night_state_path),
             night_path: init.night_state_path,
             night_clock: None,
+            night_retry_at_s: None,
         }
     }
 
@@ -1016,6 +1037,17 @@ impl Engine {
     /// 状态变化时写 `night.json`（跨 worker 重启恢复）。切换失败时回滚状态、
     /// 本时段不再重试（避免每拍刷事件），并**只记一次**事件。
     fn tick_night(&mut self, now_s: i64) {
+        // 切换失败后的退避：到期前不再重试
+        //
+        // 没有这一条时，「在窗口内但 `active == false`」会让空闲休眠的定时器
+        // 一直算出 1 秒 ⇒ 每秒醒一次、每秒再失败一次（见 `NIGHT_RETRY_BACKOFF_S`）。
+        if let Some(at) = self.night_retry_at_s {
+            if now_s < at {
+                return;
+            }
+            self.night_retry_at_s = None;
+        }
+
         let now_min = self
             .night_clock
             .unwrap_or_else(|| crate::night::local_minutes(now_s));
@@ -1032,8 +1064,8 @@ impl Engine {
         let action = crate::night::transition(&mut self.night, in_win, &target, &current);
 
         match action {
-            NightAction::Enter => self.apply_night_mode(&target, "夜间模式开始"),
-            NightAction::Leave(mode) => self.apply_night_mode(&mode, "夜间模式结束"),
+            NightAction::Enter => self.apply_night_mode(&target, "夜间模式开始", now_s),
+            NightAction::Leave(mode) => self.apply_night_mode(&mode, "夜间模式结束", now_s),
             NightAction::Override => {
                 self.events.emit(
                     kind::CONFIG,
@@ -1053,10 +1085,11 @@ impl Engine {
     }
 
     /// 执行一次夜间模式切换（成功 / 失败都留痕）
-    fn apply_night_mode(&mut self, target: &str, why: &str) {
+    fn apply_night_mode(&mut self, target: &str, why: &str, now_s: i64) {
         let from = self.cfg.current_mode().to_string();
         match self.cfg.switch_mode(target) {
             Ok((_from, to)) => {
+                self.night_retry_at_s = None;
                 let to_label = crate::config_store::mode_label(&to);
                 let from_label = crate::config_store::mode_label(&from);
                 if let Err(e) = self.cfg.save() {
@@ -1074,12 +1107,16 @@ impl Engine {
                 }
             }
             Err(e) => {
-                // 切换失败（配置非法等）：回滚状态，本时段不再重复尝试。
-                // 只在第一次失败时记事件 —— 否则每拍一条，事件流会被刷满。
+                // 切换失败（配置非法等）：回滚状态 + 退避，事件只记一次。
+                //
+                // ⚠️ 旧注释写的是"本时段不再重复尝试"，但实现其实会把状态清空
+                //    ⇒ 下一拍仍会重试。空闲休眠下这等于每秒一次（见
+                //    `NIGHT_RETRY_BACKOFF_S`），所以现在显式退避。
                 self.night.active = false;
                 self.night.applied = false;
                 self.night.prev_mode = None;
                 self.night.user_override = false;
+                self.night_retry_at_s = Some(now_s.saturating_add(NIGHT_RETRY_BACKOFF_S));
 
                 let msg = format!("{why}切换失败：{e}");
                 if self.reported_warnings.insert(msg.clone()) {
@@ -1088,6 +1125,44 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// 夜间模式是否启用（worker 空闲休眠时据此缩短唤醒间隔）
+    pub fn night_enabled(&self) -> bool {
+        self.cfg.get_bool("night.enabled")
+    }
+
+    /// 下一次夜间模式边界还有多少秒（用于空闲休眠精确设置 `timerfd`）
+    ///
+    /// 返回 `None`：夜间模式未启用 / 时间配置非法 / 窗口长度为零 ——
+    /// 调用方退回 `worker` 的 5 分钟兜底间隔。
+    ///
+    /// ⚠️ 调用方**仍要**用兜底间隔截短返回值：兜底是"uevent 不上报"的保险丝，
+    ///    不能因为算出了边界就把它去掉（见 `worker.rs` 的 `wait_ms`）。
+    ///
+    /// 边界只算"下一次状态该翻转的时刻"，具体判断在
+    /// [`crate::night::next_boundary_s`]（纯函数，有单测）。
+    pub fn night_next_transition_in_s(&self, now_s: i64) -> Option<u64> {
+        if !self.cfg.get_bool("night.enabled") {
+            return None;
+        }
+        // 切换失败后的退避：到点再试，绝不每秒重试
+        if let Some(at) = self.night_retry_at_s {
+            if now_s < at {
+                return Some((at - now_s) as u64);
+            }
+        }
+        let start = crate::night::parse_hhmm(self.cfg.get_str("night.start"))?;
+        let end = crate::night::parse_hhmm(self.cfg.get_str("night.end"))?;
+        // 注入时钟（测试）只有"分钟"精度 ⇒ 秒按 0 算
+        let (now_min, sec_in_min) = match self.night_clock {
+            Some(m) => (m, 0),
+            None => (
+                crate::night::local_minutes(now_s),
+                now_s.rem_euclid(60) as u64,
+            ),
+        };
+        crate::night::next_boundary_s(now_min, sec_in_min, start, end, self.night.active)
     }
 
     /// 上一次采样时的充电状态（缓存值，见字段文档）

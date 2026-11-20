@@ -786,6 +786,22 @@ pub fn run() -> Result<()> {
         let due = since_step >= interval_s;
         let woke_from_sleep = woke_up && since_step >= MIN_STEP_INTERVAL_S;
 
+        // 夜间模式：**从休眠被唤醒时**先跑一次轻拍
+        //
+        // 轻拍只做 `poll_server` + `tick_night` + 推送事件，不采样、不决策、
+        // 不写充电节点 —— 未充电时调用它不会介入充电（R12 的「停止干预」
+        // 语义不变）。
+        //
+        // 为什么需要它：休眠期间没有控制拍，`tick_night` 只能在唤醒时补。
+        // 旧实现靠"5 分钟兜底唤醒 → 整拍"顺带检查，最坏晚 5 分钟；
+        // 现在定时器会优先落在边界上，这一次唤醒就靠这里准点切换。
+        //
+        // ⚠️ 不能因此去掉下面 `due || woke_from_sleep` 的整拍：插上充电器
+        //    后仍必须采样/决策，轻拍替代不了。
+        if woke_up && engine.night_enabled() {
+            let _ = engine.light_step(now);
+        }
+
         if due || woke_from_sleep {
             let report = engine.step(now);
             for e in &report.errors {
@@ -811,26 +827,36 @@ pub fn run() -> Result<()> {
         let addon_due_in = engine.addons.next_due_in_s(now);
 
         let wait_ms: libc::c_int = if sleeping {
-            // ── 深度休眠 ──
+            // 夜间模式启用时，优先把 timerfd 设到下一个边界；但**仍受 5 分钟
+            // 兜底上限截短** ⇒ 唤醒节奏还是每 ≤5 分钟一次，变化的只是
+            // 「边界前的最后一跳恰好落在边界上」，切换不再晚最多 5 分钟。
             //
-            // **不跑任何拍**，只在有意义的唤醒源上醒来：
-            //
-            // | 唤醒源 | 场景 |
-            // |---|---|
-            // | `power_supply` uevent | 插上/拔下充电器（主渠道，立即响应） |
-            // | 控制通道新连接 | 打开 WebUI / 敲命令 |
-            // | 信号 | 终止 / 重载配置 |
-            // | 本定时器 | **兜底保险丝**（见下） |
-            //
-            // 兜底间隔取 [`SLEEP_FALLBACK_S`]（5 分钟）：
-            // 正常情况**永远用不到它**（uevent 会先醒）；万一某机型
-            // uevent 不上报或订阅失败，最坏 5 分钟也能兜住。
-            //
-            // ⚠️ 与旧版的**本质区别**：旧版每 30 秒醒来跑一整拍
-            //    （因为 supervisor 强制要求心跳，不刷就误报卡死）。
-            //    现在 supervisor 只在**充电时**要求心跳，未充电时
-            //    改用进程状态判定卡死 ⇒ 这里可以真正地"什么都不做"。
-            (SLEEP_FALLBACK_S * 1000) as libc::c_int
+            // ⚠️ 不能把兜底去掉：算得再准，也挡不住 uevent 不上报 / 时钟被改。
+            if let Some(night_s) = engine.night_next_transition_in_s(now) {
+                let night_ms = (night_s * 1000) as libc::c_int;
+                night_ms.min((SLEEP_FALLBACK_S * 1000) as libc::c_int)
+            } else {
+                // ── 深度休眠 ──
+                //
+                // **不跑任何拍**，只在有意义的唤醒源上醒来：
+                //
+                // | 唤醒源 | 场景 |
+                // |---|---|
+                // | `power_supply` uevent | 插上/拔下充电器（主渠道，立即响应） |
+                // | 控制通道新连接 | 打开 WebUI / 敲命令 |
+                // | 信号 | 终止 / 重载配置 |
+                // | 本定时器 | **兜底保险丝**（见下） |
+                //
+                // 兜底间隔取 [`SLEEP_FALLBACK_S`]（5 分钟）：
+                // 正常情况**永远用不到它**（uevent 会先醒）；万一某机型
+                // uevent 不上报或订阅失败，最坏 5 分钟也能兜住。
+                //
+                // ⚠️ 与旧版的**本质区别**：旧版每 30 秒醒来跑一整拍
+                //    （因为 supervisor 强制要求心跳，不刷就误报卡死）。
+                //    现在 supervisor 只在**充电时**要求心跳，未充电时
+                //    改用进程状态判定卡死 ⇒ 这里可以真正地"什么都不做"。
+                (SLEEP_FALLBACK_S * 1000) as libc::c_int
+            }
         } else {
             let base = if charging {
                 PATROL_CHARGING_S

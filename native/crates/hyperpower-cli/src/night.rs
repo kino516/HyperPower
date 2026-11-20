@@ -34,10 +34,25 @@
 //! 不占 [`crate::config_store::KEYS`] 的键位）。它不是观测数据，因此也不进
 //! `runtime.json`（那个是"某一拍的快照"，会被覆盖）。
 //!
-//! # 只在 worker 的**全拍**里检查
+//! # 空闲休眠时也要在边界上被唤醒
 //!
-//! worker 未充电且无客户端时会深度休眠（不跑拍）。此时不检查时间是**正确的**：
-//! 不控制充电时切换模式没有意义；插上充电器（全拍开始）后第一拍就会补上。
+//! worker 未充电且无客户端时会深度休眠（不跑控制拍）。旧实现只在整拍里检查
+//! 时间，而休眠期间整拍最多 `SLEEP_FALLBACK_S`（5 分钟）才兜底跑一次 ——
+//! 症状是「22:00 到了，但可能 22:04 才切」。
+//!
+//! 现在 worker 把 `timerfd` 优先设到下一个边界（仍被同一个 5 分钟兜底上限截短，
+//! 兜底不能被去掉），并在唤醒时先跑一次轻拍（只做本状态机，
+//! 不采样、不决策、不写充电节点）：
+//!
+//! | 场景 | 行为 |
+//! |---|---|
+//! | 22:00 边界（未充电、无客户端） | 准点切到 `night.mode` |
+//! | 07:00 边界 | 准点恢复 |
+//! | 23:00 重启（开机落在窗口中间） | 立刻补切（[`next_boundary_s`] 返回 1 秒） |
+//! | 08:00 重启（结束点已过但状态仍是 active） | 立刻恢复 |
+//!
+//! ⚠️ 切换失败时按 `NIGHT_RETRY_BACKOFF_S` 退避后再试，避免
+//!    「状态与时间不一致 ⇒ 1 秒后重算」退化成每秒紧循环。
 //!
 //! # 时间来源
 //!
@@ -86,6 +101,55 @@ pub fn in_window(now_min: u32, start_min: u32, end_min: u32) -> bool {
     } else {
         now >= start_min || now < end_min
     }
+}
+
+/// 下一次「状态该翻转」还有多少秒 —— **纯函数**，供空闲休眠设置 `timerfd`
+///
+/// # 参数
+///
+/// | 参数 | 含义 |
+/// |---|---|
+/// | `now_min` | 当前本地时间（一天中的分钟） |
+/// | `sec_in_min` | 当前分钟已经过去的秒数（`0..60`） |
+/// | `start_min` / `end_min` | 夜间窗口 |
+/// | `active` | [`NightState::active`]：当前是否已经处于夜间模式 |
+///
+/// # 返回值
+///
+/// - `None`：窗口非法（`start == end`、越界）⇒ 调用方退回普通兜底间隔
+/// - `Some(1)`：**时间与状态不一致**，必须立刻跑一拍
+///   （开机落在时段中间 / 结束点已过但状态仍 active）
+/// - `Some(s)`：`s` 秒后到达下一个边界
+///
+/// # 为什么要把 `wait_min == 0` 单独处理
+///
+/// `target == now_min` 在状态一致时不可达（那一刻 `in_window` 会翻转 ⇒ 走
+/// 上面的 `Some(1)`）。但若真到了这一步，正确答案是「现在」，而不是
+/// 取模得到的「24 小时后」—— 旧实现写成 `MINUTES_PER_DAY`，靠调用方的
+/// 5 分钟兜底掩盖了它。
+pub fn next_boundary_s(
+    now_min: u32,
+    sec_in_min: u64,
+    start_min: u32,
+    end_min: u32,
+    active: bool,
+) -> Option<u64> {
+    if start_min == end_min || start_min >= MINUTES_PER_DAY || end_min >= MINUTES_PER_DAY {
+        return None;
+    }
+    let now_min = now_min.min(MINUTES_PER_DAY - 1);
+    let in_win = in_window(now_min, start_min, end_min);
+    if in_win != active {
+        return Some(1);
+    }
+    // 状态一致 ⇒ 下一个边界就是"当前状态的出口"
+    let target = if in_win { end_min } else { start_min };
+    let wait_min = (target + MINUTES_PER_DAY - now_min) % MINUTES_PER_DAY;
+    if wait_min == 0 {
+        return Some(1);
+    }
+    let sec_in_min = sec_in_min.min(59);
+    Some((u64::from(wait_min) * 60 - sec_in_min).max(1))
 }
 
 /// 本地时间：一天中的分钟数
@@ -278,6 +342,55 @@ mod tests {
     fn 零长度窗口视为关闭() {
         assert!(!in_window(12 * 60, 12 * 60, 12 * 60));
         assert!(!in_window(0, 0, 0));
+    }
+
+    /// 空闲休眠的唤醒点：状态一致 ⇒ 算到当前状态的出口
+    #[test]
+    fn 边界计算_从窗口外等到起点() {
+        let (s, e) = (22 * 60, 7 * 60);
+        // 21:00:00 未进入 ⇒ 还有 1 小时到 22:00
+        assert_eq!(next_boundary_s(21 * 60, 0, s, e, false), Some(3600));
+        // 21:00:59 ⇒ 3599 秒后（不是 3600，否则会晚 1 秒切）
+        assert_eq!(next_boundary_s(21 * 60, 59, s, e, false), Some(3541));
+        // 21:59:59 ⇒ 1 秒后
+        assert_eq!(next_boundary_s(21 * 60 + 59, 59, s, e, false), Some(1));
+        // 07:00:00 已结束且未激活 ⇒ 等下一次 22:00（15 小时）
+        assert_eq!(next_boundary_s(7 * 60, 0, s, e, false), Some(15 * 3600));
+    }
+
+    /// 状态一致 ⇒ 算到结束点；跨午夜不能算成负值
+    #[test]
+    fn 边界计算_从窗口内等到终点() {
+        let (s, e) = (22 * 60, 7 * 60);
+        // 23:00 已在夜间 ⇒ 还有 8 小时到 07:00
+        assert_eq!(next_boundary_s(23 * 60, 0, s, e, true), Some(8 * 3600));
+        // 06:59:30 ⇒ 30 秒
+        assert_eq!(next_boundary_s(6 * 60 + 59, 30, s, e, true), Some(30));
+        // 同日窗口 09:00~17:00，09:00 已进入 ⇒ 8 小时
+        assert_eq!(
+            next_boundary_s(9 * 60, 0, 9 * 60, 17 * 60, true),
+            Some(8 * 3600)
+        );
+    }
+
+    /// 时间与状态不一致 ⇒ 1 秒内必须重算（开机补切 / 结束点已过）
+    #[test]
+    fn 边界计算_状态不一致立刻重算() {
+        let (s, e) = (22 * 60, 7 * 60);
+        // 23:00 开机，还没进入 ⇒ 立刻切
+        assert_eq!(next_boundary_s(23 * 60, 0, s, e, false), Some(1));
+        // 08:00 开机，状态仍是夜间 ⇒ 立刻恢复
+        assert_eq!(next_boundary_s(8 * 60, 0, s, e, true), Some(1));
+        // 正好在起点/终点这一分钟，同样属于"不一致"
+        assert_eq!(next_boundary_s(s, 0, s, e, false), Some(1));
+        assert_eq!(next_boundary_s(e, 0, s, e, true), Some(1));
+    }
+
+    /// 窗口非法 ⇒ 返回 None，让调用方走普通兜底间隔
+    #[test]
+    fn 边界计算_窗口非法返回空() {
+        assert_eq!(next_boundary_s(12 * 60, 0, 12 * 60, 12 * 60, false), None);
+        assert_eq!(next_boundary_s(12 * 60, 0, 1500, 7 * 60, false), None);
     }
 
     /// 进入 → 退出：恢复进入前的模式
