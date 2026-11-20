@@ -1090,6 +1090,45 @@ impl Engine {
         }
     }
 
+    /// 夜间模式是否启用（worker 空闲休眠时据此缩短唤醒间隔）
+    pub fn night_enabled(&self) -> bool {
+        self.cfg.get_bool("night.enabled")
+    }
+
+    /// 下一次夜间模式边界还有多少秒（用于空闲休眠精确设置 timerfd）
+    ///
+    /// 返回 `None`：夜间模式未启用，或时间配置非法 —— 调用方退回普通兜底间隔。
+    /// 这样不需要每 30 秒轮询：只在真正的开始/结束时刻醒来一次。
+    pub fn night_next_transition_in_s(&self, now_s: i64) -> Option<u64> {
+        if !self.cfg.get_bool("night.enabled") {
+            return None;
+        }
+        let start = crate::night::parse_hhmm(self.cfg.get_str("night.start"))?;
+        let end = crate::night::parse_hhmm(self.cfg.get_str("night.end"))?;
+        if start == end {
+            return None;
+        }
+        let now_min = crate::night::local_minutes(now_s);
+        let in_win = crate::night::in_window(now_min, start, end);
+        // 状态与时间不一致时必须**立刻**跑一拍，而不是等到下一个边界：
+        //  · 窗口内但还没进入（重启/开机落在时段中间）→ 现在就要切
+        //  · 窗口外但状态仍是 active（跨过结束点时 worker 在休眠）→ 现在就要恢复
+        // 否则会把 timerfd 设到 22:00 或 07:00，中间整段时间都不处理。
+        if in_win != self.night.active {
+            return Some(1);
+        }
+        let target = if in_win { end } else { start };
+        let wait_min =
+            (target + crate::night::MINUTES_PER_DAY - now_min) % crate::night::MINUTES_PER_DAY;
+        let wait_min = if wait_min == 0 {
+            crate::night::MINUTES_PER_DAY
+        } else {
+            wait_min
+        };
+        let sec_in_min = now_s.rem_euclid(60) as u64;
+        Some((u64::from(wait_min) * 60 - sec_in_min).max(1))
+    }
+
     /// 上一次采样时的充电状态（缓存值，见字段文档）
     pub fn is_charging(&self) -> bool {
         self.last_charging

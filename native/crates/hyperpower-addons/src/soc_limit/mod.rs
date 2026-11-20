@@ -75,6 +75,10 @@ pub const SMART_CHG_CANDIDATES: &[&str] = &[
     //    （位域打包，见 `logic::encode`），这个是直白的 `0~100`。
     //    写值格式由 [`Dialect`] 决定，不要混用。
     "/sys/class/power_supply/battery/charge_control_end_threshold",
+    // MediaTek / 小米 17T（chagall）：系统「智能断充」目标百分比节点。
+    // 语义是纯百分比（实测 80 表示目标 80%），写在 usb/device 下。
+    // 只读实际值可由同目录/同级的 soc_limit 观测，但目标节点本身可回读。
+    "/sys/class/power_supply/usb/device/sc_tuisoc",
 ];
 
 /// **使能节点**候选（标准百分比方言专用）
@@ -194,7 +198,7 @@ impl Dialect {
     /// ⚠️ 用**节点名**判定而不是"目录里有 `xm_power` 就…"：
     ///    将来若某机型把标准节点放到别的目录，这里依然正确。
     fn of(ctrl: &str) -> Self {
-        if ctrl.ends_with("/charge_control_end_threshold") {
+        if ctrl.ends_with("/charge_control_end_threshold") || ctrl.ends_with("/sc_tuisoc") {
             Self::Percent
         } else {
             Self::ControlWord
@@ -1941,5 +1945,18 @@ impl Addon for SocLimit {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mtk_sc_tuisoc_是百分比方言() {
+        let p = "/sys/class/power_supply/usb/device/sc_tuisoc";
+        assert!(SMART_CHG_CANDIDATES.contains(&p), "候选表应包含 {p}");
+        assert_eq!(Dialect::of(p), Dialect::Percent);
+        assert_eq!(read_node_for(p, Dialect::Percent), p);
     }
 }
