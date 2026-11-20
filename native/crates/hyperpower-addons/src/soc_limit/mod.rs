@@ -265,13 +265,32 @@ pub const REQUIRES_BATTERY_PROTECT: &str =
 /// ⚠️ 不写"无需任何前提"：那等于替用户断言他没遇到过的问题不存在。
 ///    只说能确证的事。
 ///
-/// ⚠️ 2026-11-20 追加：percent 方言现在**不再只有上游标准接口** ——
-///    MediaTek 的 `sc_tuisoc` 也走 percent，但它是厂商节点，很可能恰恰
-///    受系统「电池保护 / 智能断充」开关控制。所以文案不能再断言
-///    "与开关无关"，改成条件式：先按标准接口说明，再给一句"不生效时查开关"。
-pub const REQUIRES_STANDARD_PSY: &str = "本机走 power_supply 百分比接口（上游标准接口或厂商同类节点），\
-                                         无需额外设置（未插充电器时看不到效果是正常的）；\
-                                         若设置后不生效，请确认系统的「电池保护 / 智能断充」开关已打开";
+/// ⚠️ 2026-11-20：percent 方言**不再只有上游标准接口** —— MediaTek 的
+///    `sc_tuisoc` 也走 percent，但它是**厂商节点**（是否受系统开关控制、
+///    写入是否被接受都未经真机确认），所以另给一条
+///    [`REQUIRES_VENDOR_PERCENT`]。
+///
+///    ⚠️ **不要**把这条改成"上游标准接口或厂商同类节点"之类的通用说法：
+///    标准接口机型（K70 Pro 等）看到的就是这一句，改措辞会波及所有
+///    percent 机型的用户可见文案，与 MTK 适配无关。
+pub const REQUIRES_STANDARD_PSY: &str =
+    "本机走标准充电接口，与系统「电池保护」开关无关，无需额外设置\
+     （未插充电器时看不到效果是正常的）";
+
+/// **厂商百分比节点**（MTK `sc_tuisoc`）的使用前提文案
+///
+/// 与 [`REQUIRES_STANDARD_PSY`] 的区别：它不是上游标准接口。
+///
+/// | 未知项 | 套标准那句的后果 | 套小米那句的后果 |
+/// |---|---|---|
+/// | 是否受系统「电池保护 / 智能断充」开关控制 | 替用户断言"无关"，可能正好说反 | 让用户去找一个未必存在的小米专属开关 |
+/// | 写入是否被驱动接受 | 无影响 | 同上 |
+///
+/// ⇒ 两条都不套，只说能确证的部分：厂商节点 + 不生效时查开关 +
+///   未插电看不到效果（这条对小米和标准框架都成立）。
+pub const REQUIRES_VENDOR_PERCENT: &str =
+    "本机走厂商充电接口（MTK sc_tuisoc）；若设置后不生效，请确认系统的\
+     「电池保护 / 智能断充」开关已打开（未插充电器时看不到效果是正常的）";
 
 /// **系统界面不同步**的说明（界面用）
 ///
@@ -521,6 +540,19 @@ impl SocLimit {
         self.config.follow_soc && self.follow_supported()
     }
 
+    /// 命中的控制节点是否是**厂商自有**的百分比节点（目前只有 MTK `sc_tuisoc`）
+    ///
+    /// 用途：同一套 [`Dialect::Percent`] 要区分"上游标准接口"和"厂商节点"，
+    /// 两者的**用户可见文案**不能共用（见 [`REQUIRES_VENDOR_PERCENT`]）。
+    /// 判据用节点名而不是方言枚举：将来若再加一个厂商节点，只需在这里补一条。
+    fn is_vendor_percent(&self) -> bool {
+        self.dialect == Dialect::Percent
+            && self
+                .node_ctrl
+                .as_deref()
+                .is_some_and(|p| p.ends_with("/sc_tuisoc"))
+    }
+
     /// 同步不可用的原因（界面直接展示；可用时为 `None`）
     fn sync_reason(&self) -> Option<&'static str> {
         if !self.supported() {
@@ -533,10 +565,17 @@ impl SocLimit {
                      无法开启「按 SOC 限制」。",
                 );
             }
+            if self.is_vendor_percent() {
+                return Some(
+                    "本机走厂商充电接口（MTK sc_tuisoc）：截止口径由驱动决定，\
+                     模块只写目标值并回读，因此不提供电量显示同步。\
+                     如需按 SOC 限制，请开启「按 SOC 限制」。",
+                );
+            }
             return Some(
-                "本机走百分比接口：在上游标准充电接口上驱动按系统电量（电池图标）截止，\
-                 SOC 只是电量计读数。把图标改成 SOC 会让显示与截止口径不一致\
-                 （设 90 却像在 85 停下）；如需按 SOC 限制，请开启「按 SOC 限制」。",
+                "本机走标准充电接口：驱动按系统电量（电池图标）截止，SOC 只是电量计读数。\
+                 把图标改成 SOC 会让显示与截止口径不一致（设 90 却像在 85 停下）；\
+                 如需按 SOC 限制，请开启「按 SOC 限制」。",
             );
         }
         if self.node_rsoc.is_none() || self.node_fake_soc.is_none() {
@@ -1232,6 +1271,9 @@ impl Addon for SocLimit {
             //    [`REQUIRES_STANDARD_PSY`] 的说明。
             requires: Some(match self.dialect {
                 Dialect::ControlWord => REQUIRES_BATTERY_PROTECT,
+                // ⚠️ 只有厂商百分比节点（目前是 MTK `sc_tuisoc`）用厂商文案；
+                //    标准 percent 机型（K70 Pro 等）保持原文案不变。
+                Dialect::Percent if self.is_vendor_percent() => REQUIRES_VENDOR_PERCENT,
                 Dialect::Percent => REQUIRES_STANDARD_PSY,
             }),
         }

@@ -32,6 +32,12 @@ const READ: &str = "/sys/class/xm_power/charger/smart_charge/soc_limit";
 /// | 生效值在哪 | 同目录的 `soc_limit` | **控制节点自己** |
 const STD_CTRL: &str = "/sys/class/power_supply/battery/charge_control_end_threshold";
 
+/// MTK 厂商百分比节点（小米 17T / chagall，MT6899）
+///
+/// 与 [`STD_CTRL`] 同为 percent 方言，但**没有** `charge_control_en` 使能位，
+/// 且写入是否被驱动接受未经真机确认（见 `SMART_CHG_CANDIDATES` 的注释）。
+const MTK_SC_TUISOC: &str = "/sys/class/power_supply/usb/device/sc_tuisoc";
+
 /// **使能节点**（高通标准框架）
 ///
 /// ⚠️ 这个节点是 2026-10-19 真机（K70 Pro）查出来的关键：
@@ -103,6 +109,23 @@ impl FakeIo {
         Self {
             files,
             writable: vec![STD_CTRL.to_string()],
+            write_ignored: false,
+            write_log: Vec::new(),
+            plugged: true,
+            states: HashMap::new(),
+        }
+    }
+
+    /// MTK 厂商百分比节点的节点树（小米 17T / chagall）
+    ///
+    /// 与 [`standard_psys`](Self::standard_psys) 的差异：节点在 `usb/device/` 下，
+    /// **没有** `charge_control_en` 使能位（`node_enable` 探测不到）。
+    fn mtk_sc_tuisoc() -> Self {
+        let mut files = HashMap::new();
+        files.insert(MTK_SC_TUISOC.to_string(), "100".to_string());
+        Self {
+            files,
+            writable: vec![MTK_SC_TUISOC.to_string()],
             write_ignored: false,
             write_log: Vec::new(),
             plugged: true,
@@ -257,6 +280,17 @@ impl AddonIo for FakeIo {
         if path.ends_with("fake_soc") {
             self.files
                 .insert(path.to_string(), value.trim().to_string());
+            return Ok(());
+        }
+
+        // ── MTK 厂商百分比节点（`sc_tuisoc`）：纯百分比，**没有使能位** ──
+        //
+        // ⚠️ 不能走下面的小米分支：`"80"` 没有 `0x` 前缀 ⇒ `parse_word`
+        //    返回 None ⇒ 静默 Ok 且不更新文件 ⇒ 测试测出假的"回读不符"。
+        if path.ends_with("sc_tuisoc") {
+            if let Ok(v) = value.trim().parse::<u8>() {
+                self.files.insert(path.to_string(), v.to_string());
+            }
             return Ok(());
         }
 
@@ -1624,6 +1658,70 @@ fn 标准框架已一致时不写() {
 
     assert!(!outcome.wrote, "已一致不该写");
     assert_eq!(io.writes(), 0);
+}
+
+// ============================================================
+//  MTK 厂商百分比节点（`sc_tuisoc`，小米 17T / chagall）
+//
+//  与标准框架**方言相同**（Percent），差异只在节点名、没有使能位、文案：
+//
+//  | # | 要求 | 弄错的后果 |
+//  |---|---|---|
+//  | 1 | 探测要能命中 | 界面报"本机不支持" |
+//  | 2 | 按纯百分比写 | 写控制字进去，驱动当成非法值 |
+//  | 3 | 文案用厂商版 | MTK 用户被告知"与开关无关"（可能说反） |
+// ============================================================
+
+/// 命中 + 纯百分比写入 + 回读（percent 方言读控制节点自己）
+#[test]
+fn mtk_sc_tuisoc_按百分比写入并回读() {
+    let mut io = FakeIo::mtk_sc_tuisoc();
+    let mut addon = probed(enabled_config(80), &mut io);
+
+    assert_eq!(addon.node_ctrl(), Some(MTK_SC_TUISOC));
+    assert_eq!(
+        addon.node_read(),
+        Some(MTK_SC_TUISOC),
+        "percent 方言下生效值就是控制节点自己"
+    );
+
+    let outcome = addon.tick(&mut io, 0);
+
+    assert!(outcome.wrote, "当前 100%，目标 80% ⇒ 应当写");
+    assert!(outcome.is_ok(), "回读应当通过：{:?}", outcome.error);
+    assert_eq!(
+        io.write_log,
+        vec![(MTK_SC_TUISOC.to_string(), "80".to_string())],
+        "必须写纯百分比，不能写小米控制字"
+    );
+    assert_eq!(io.files.get(MTK_SC_TUISOC).map(String::as_str), Some("80"));
+}
+
+/// 文案：厂商节点用自己的前提，且**不影响**标准机型的文案
+#[test]
+fn mtk_sc_tuisoc_用厂商文案且标准机型不变() {
+    let mut io = FakeIo::mtk_sc_tuisoc();
+    let addon = probed(SocLimitConfig::default(), &mut io);
+
+    let requires = addon.spec().requires.expect("必须有前提文案");
+    assert!(
+        requires.contains("厂商") && requires.contains("sc_tuisoc"),
+        "要点出这是厂商节点，实得：{requires}"
+    );
+    assert!(
+        !requires.contains("与系统「电池保护」开关无关"),
+        "不能替未经真机确认的厂商节点断言与开关无关，实得：{requires}"
+    );
+
+    // 防回归：标准 percent 机型的文案必须**一个字节都不变**
+    let mut std_io = FakeIo::standard_psys();
+    let mut std_addon = SocLimit::new(SocLimitConfig::default());
+    std_addon.probe(&mut std_io);
+    assert_eq!(
+        std_addon.spec().requires,
+        Some(hyperpower_addons::soc_limit::REQUIRES_STANDARD_PSY),
+        "MTK 适配不得改动其他机型的用户可见文案"
+    );
 }
 
 /// 标准框架的前提文案**不得**让人去找「电池健康保护」开关
