@@ -36,6 +36,7 @@ import type {
   HistoryListResult,
   HistorySession,
   ModeList,
+  ModuleInfoView,
   PowerMeasurement,
   ProbeResult,
   NightSection,
@@ -800,6 +801,20 @@ export function fetchStatus(): Promise<StatusSnapshot> {
   return run(["status"]) as Promise<StatusSnapshot>;
 }
 
+/**
+ * 读取模块信息（`ctl info`）
+ *
+ * 界面目前只用其中的 `version` —— 「更多 → 检查更新」要拿本机版本
+ * 与 GitHub Release 的 tag 比较。
+ *
+ * ⚠️ 为什么不读 `module.prop`：那需要 `ksu.exec` 跑 `grep`，等于给界面
+ * 又开一条命令执行路径；而 `info` 是**已有的**只读命令，走的是同一条
+ * 契约（`ctl`），前端零新增攻击面。
+ */
+export function fetchModuleInfo(): Promise<ModuleInfoView> {
+  return run(["info"]) as Promise<ModuleInfoView>;
+}
+
 /** 读取充电上限功能状态 */
 export function fetchLimit(): Promise<AddonStatus> {
   return run(["limit", "show"]) as Promise<AddonStatus>;
@@ -1362,6 +1377,16 @@ function mock(parts: string[]): unknown {
       if (k === "limit.sync_display") demo.syncDisplay = v === "true";
     }
     return { ok: true };
+  }
+
+  // 演示模式：`ctl info` 的版本号（用于「检查更新」卡片能显示本机版本）
+  if (head === "info") {
+    return {
+      module_id: "a_hyperpower",
+      module_name: "澎湃充控 HyperPower",
+      version: "1.1.3",
+      api_version: 1,
+    };
   }
 
   if (head === "mode") {

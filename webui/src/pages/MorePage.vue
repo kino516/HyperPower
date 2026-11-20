@@ -105,6 +105,7 @@ import { batteryCapacityMah, f0, f1 } from "../format";
 import { perfMark } from "../perf";
 import { failedLabel } from "../types";
 import type { DeviceProfileView } from "../types";
+import { compareVersions, fetchLatestRelease, RELEASES_URL } from "../update";
 
 /** 当前生效档案 */
 const device = ref<DeviceProfileView | null>(null);
@@ -278,6 +279,8 @@ async function load(): Promise<void> {
 
 onMounted(() => {
   void load();
+  // 版本号走本地 `ctl info`（UDS，不联网）—— 与「检查更新」的联网是两件事
+  void loadModuleVersion();
 });
 
 /**
@@ -343,6 +346,107 @@ async function probe(): Promise<void> {
  * 需要精确测量时可以从命令行调用；界面不再提供入口，因为状态页
  * 已经有 3 秒一刷的实时功率。
  */
+
+// ============================================================
+//  版本与更新
+// ============================================================
+
+/**
+ * 本机模块版本（来自 `ctl info`；读不到时为 `null`）
+ *
+ * ⚠️ 读不到**不算错误**：卡片显示「未知」，检查更新按钮仍然可用
+ * （此时只能报"最新版本是 X，无法比较"）。为了一个版本号弹红条不值。
+ */
+const moduleVersion = ref<string | null>(null);
+
+/** 是否正在检查更新 */
+const checkingUpdate = ref(false);
+
+/**
+ * 一次检查的结果
+ *
+ * `kind` 决定文案配色；`url` 只在"有新版本"时给（打开的是该 Release 页）。
+ */
+interface UpdateResult {
+  kind: "newer" | "latest" | "none" | "error";
+  message: string;
+  url?: string;
+}
+
+const updateResult = ref<UpdateResult | null>(null);
+
+async function loadModuleVersion(): Promise<void> {
+  try {
+    const info = await api.fetchModuleInfo();
+    moduleVersion.value = info.version;
+  } catch {
+    moduleVersion.value = null;
+  }
+}
+
+/**
+ * 检查更新 —— **本项目唯一会联网的操作**（R16 的最小例外）
+ *
+ * # 为什么是"按钮触发"而不是"打开页面就查"
+ *
+ * R16 要求模块离线可用。进页面自动联网会让"只是翻一下更多页"也产生
+ * 一次外部请求（暴露 IP、依赖网络）。现在只有用户**明确点击**才会发：
+ *
+ * | 行为 | 是否联网 |
+ * |---|---|
+ * | 打开「更多」页 | ❌（只走本地 `ctl info` 读版本） |
+ * | 点「检查更新」 | ✅ 一次 `GET releases/latest`，只读 |
+ * | 加载/刷新其他页面 | ❌ |
+ *
+ * 若日后要改成自动检查，必须先改 AGENTS 的 R16 口径，并在这里说明。
+ */
+async function checkUpdate(): Promise<void> {
+  if (checkingUpdate.value) {
+    return;
+  }
+  checkingUpdate.value = true;
+  updateResult.value = null;
+  try {
+    const latest = await fetchLatestRelease();
+    if (!latest) {
+      updateResult.value = {
+        kind: "none",
+        message: "仓库还没有正式发布的版本。",
+      };
+      return;
+    }
+
+    const current = moduleVersion.value;
+    if (!current) {
+      updateResult.value = {
+        kind: "newer",
+        message: `最新版本是 v${latest.version}（本机版本读不到，无法比较）。`,
+        url: latest.url,
+      };
+      return;
+    }
+
+    if (compareVersions(latest.version, current) > 0) {
+      updateResult.value = {
+        kind: "newer",
+        message: `发现新版本 v${latest.version}（当前 v${current}）`,
+        url: latest.url,
+      };
+    } else {
+      updateResult.value = {
+        kind: "latest",
+        message: `已是最新版本（v${current}）`,
+      };
+    }
+  } catch (e) {
+    updateResult.value = {
+      kind: "error",
+      message: e instanceof Error ? e.message : String(e),
+    };
+  } finally {
+    checkingUpdate.value = false;
+  }
+}
 </script>
 
 <template>
@@ -662,6 +766,61 @@ async function probe(): Promise<void> {
       「同时验证档位可写上限」复选框触发 —— **勾选本身即确认**，
       再弹一次对话框就成了"确认两遍"。
     -->
+    <!-- ── 版本与更新 ── -->
+    <MiuixSmallTitle text="版本与更新" />
+    <MiuixCard>
+      <div class="upd">
+        <div class="upd__row">
+          <span class="upd__label">当前版本</span>
+          <span class="upd__value">{{
+            moduleVersion ? `v${moduleVersion}` : "未知"
+          }}</span>
+        </div>
+
+        <MiuixText
+          type="footnote1"
+          color="var(--m-color-on-surface-secondary)"
+        >
+          检查更新会访问 GitHub，只读取最新版本号 —— 不下载、不上传任何信息；
+          模块的充电控制功能完全离线可用。
+        </MiuixText>
+
+        <div class="upd__actions">
+          <MiuixButton
+            class="upd__btn"
+            :disabled="checkingUpdate"
+            @click="checkUpdate()"
+          >
+            {{ checkingUpdate ? "检查中…" : "检查更新" }}
+          </MiuixButton>
+          <a
+            class="upd__link"
+            :href="RELEASES_URL"
+            target="_blank"
+            rel="noreferrer"
+          >
+            打开发布页
+          </a>
+        </div>
+
+        <div
+          v-if="updateResult"
+          class="upd__result"
+          :class="`upd__result--${updateResult.kind}`"
+        >
+          <span>{{ updateResult.message }}</span>
+          <a
+            v-if="updateResult.url"
+            class="upd__link"
+            :href="updateResult.url"
+            target="_blank"
+            rel="noreferrer"
+          >
+            查看该版本
+          </a>
+        </div>
+      </div>
+    </MiuixCard>
   </div>
 </template>
 
@@ -861,5 +1020,78 @@ async function probe(): Promise<void> {
 /* 没有名称的行（整句式，如"硬件保护温度未探测到…"）：整句占满，左对齐 */
 .notes__brief--wide {
   text-align: left;
+}
+
+/* ── 版本与更新 ── */
+
+.upd {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.upd__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.upd__label {
+  font-size: 14px;
+  color: var(--m-color-on-surface-secondary);
+}
+
+.upd__value {
+  font-size: 14px;
+  font-weight: 600;
+  /* 版本号是数字串：等宽数字，避免 1.1.10 / 1.1.3 高度跳动 */
+  font-variant-numeric: tabular-nums;
+}
+
+.upd__actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.upd__btn {
+  flex: none;
+}
+
+.upd__link {
+  font-size: 13px;
+  color: var(--m-color-primary);
+  text-decoration: none;
+}
+
+.upd__link:active {
+  opacity: 0.6;
+}
+
+.upd__result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.6;
+  background: var(--m-color-surface-container-high);
+}
+
+.upd__result--newer {
+  color: var(--m-color-primary);
+}
+
+.upd__result--latest,
+.upd__result--none {
+  color: var(--m-color-on-surface-secondary);
+}
+
+.upd__result--error {
+  color: var(--m-color-error);
+  background: var(--m-color-error-container);
 }
 </style>

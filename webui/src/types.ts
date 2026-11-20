@@ -932,3 +932,18 @@ export interface HistoryListResult {
   /** 正在记录的这一条（未充电时为 `null`） */
   current: HistoryCurrent | null;
 }
+
+/**
+ * `ctl info` 的返回（**只列 WebUI 用到的字段**）
+ *
+ * 后端还返回 `device_profile` / `gear_max` / `power_max_w` 等十余个字段；
+ * 界面目前只需要版本号（更新提示要拿它和 GitHub 的 tag 比），其余不声明，
+ * 免得每加一个后端字段都要来改类型。
+ */
+export interface ModuleInfoView {
+  module_id: string;
+  module_name: string;
+  /** 模块版本，与 `module.prop` 的 `version` 同源（`CARGO_PKG_VERSION`） */
+  version: string;
+  api_version: number;
+}
