@@ -75,9 +75,20 @@ pub const SMART_CHG_CANDIDATES: &[&str] = &[
     //    （位域打包，见 `logic::encode`），这个是直白的 `0~100`。
     //    写值格式由 [`Dialect`] 决定，不要混用。
     "/sys/class/power_supply/battery/charge_control_end_threshold",
-    // MediaTek / 小米 17T（chagall）：系统「智能断充」目标百分比节点。
-    // 语义是纯百分比（实测 80 表示目标 80%），写在 usb/device 下。
-    // 只读实际值可由同目录/同级的 soc_limit 观测，但目标节点本身可回读。
+    // MediaTek / 小米 17T（chagall，MT6899）：系统「智能断充」的目标百分比节点。
+    // 语义是纯百分比（用户实测读值为 80，即目标 80%），写在 `usb/device` 下。
+    //
+    // ⚠️ 与标准 `charge_control_end_threshold` 的**关键差异**：本节点没有
+    //    `charge_control_en` 那类使能位。percent 方言的"停用/卸载"路径只写
+    //    使能位回到 0（见 `tick` 的 `!enabled` 分支与 `release`），对本节点
+    //    ⇒ **零写入**，上次写的目标值可能留在驱动里（R12「关闭 ≠ 卸载」）。
+    //
+    // 🔴 待真机确认（2026-11-20，无机器）：
+    //    ① `ctl limit off` / 卸载后本节点是否残留？（残留则需在 `release`
+    //       里还原"探测时读到的原值"，不要猜 100）
+    //    ② 写入是否**真的改变充电行为**？若像 `qcom-battery/smart_chg` 那样
+    //       "能写但不生效"，probe 会谎报 supported，3 次后熔断。
+    //    两条都确认前，不要把这套逻辑当"已验证"写进文档。
     "/sys/class/power_supply/usb/device/sc_tuisoc",
 ];
 
@@ -253,9 +264,14 @@ pub const REQUIRES_BATTERY_PROTECT: &str =
 ///
 /// ⚠️ 不写"无需任何前提"：那等于替用户断言他没遇到过的问题不存在。
 ///    只说能确证的事。
-pub const REQUIRES_STANDARD_PSY: &str =
-    "本机走标准充电接口，与系统「电池保护」开关无关，无需额外设置\
-     （未插充电器时看不到效果是正常的）";
+///
+/// ⚠️ 2026-11-20 追加：percent 方言现在**不再只有上游标准接口** ——
+///    MediaTek 的 `sc_tuisoc` 也走 percent，但它是厂商节点，很可能恰恰
+///    受系统「电池保护 / 智能断充」开关控制。所以文案不能再断言
+///    "与开关无关"，改成条件式：先按标准接口说明，再给一句"不生效时查开关"。
+pub const REQUIRES_STANDARD_PSY: &str = "本机走 power_supply 百分比接口（上游标准接口或厂商同类节点），\
+                                         无需额外设置（未插充电器时看不到效果是正常的）；\
+                                         若设置后不生效，请确认系统的「电池保护 / 智能断充」开关已打开";
 
 /// **系统界面不同步**的说明（界面用）
 ///
@@ -518,9 +534,9 @@ impl SocLimit {
                 );
             }
             return Some(
-                "本机走标准充电接口：驱动按系统电量（电池图标）截止，SOC 只是电量计读数。\
-                 把图标改成 SOC 会让显示与截止口径不一致（设 90 却像在 85 停下）；\
-                 如需按 SOC 限制，请开启「按 SOC 限制」。",
+                "本机走百分比接口：在上游标准充电接口上驱动按系统电量（电池图标）截止，\
+                 SOC 只是电量计读数。把图标改成 SOC 会让显示与截止口径不一致\
+                 （设 90 却像在 85 停下）；如需按 SOC 限制，请开启「按 SOC 限制」。",
             );
         }
         if self.node_rsoc.is_none() || self.node_fake_soc.is_none() {

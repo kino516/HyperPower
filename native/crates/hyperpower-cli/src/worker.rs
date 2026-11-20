@@ -786,8 +786,18 @@ pub fn run() -> Result<()> {
         let due = since_step >= interval_s;
         let woke_from_sleep = woke_up && since_step >= MIN_STEP_INTERVAL_S;
 
-        // 夜间模式到点检查：空闲深度休眠时也要跑轻拍（只检查夜间状态，
-        // 不做充电控制）；否则没插充电器时永远等不到模式切换。
+        // 夜间模式：**从休眠被唤醒时**先跑一次轻拍
+        //
+        // 轻拍只做 `poll_server` + `tick_night` + 推送事件，不采样、不决策、
+        // 不写充电节点 —— 未充电时调用它不会介入充电（R12 的「停止干预」
+        // 语义不变）。
+        //
+        // 为什么需要它：休眠期间没有控制拍，`tick_night` 只能在唤醒时补。
+        // 旧实现靠"5 分钟兜底唤醒 → 整拍"顺带检查，最坏晚 5 分钟；
+        // 现在定时器会优先落在边界上，这一次唤醒就靠这里准点切换。
+        //
+        // ⚠️ 不能因此去掉下面 `due || woke_from_sleep` 的整拍：插上充电器
+        //    后仍必须采样/决策，轻拍替代不了。
         if woke_up && engine.night_enabled() {
             let _ = engine.light_step(now);
         }
@@ -817,8 +827,11 @@ pub fn run() -> Result<()> {
         let addon_due_in = engine.addons.next_due_in_s(now);
 
         let wait_ms: libc::c_int = if sleeping {
-            // 夜间模式启用时，直接把 timerfd 设到下一次开始/结束时刻；
-            // 不做 30 秒轮询，只有边界才醒。未启用则保持 5 分钟兜底。
+            // 夜间模式启用时，优先把 timerfd 设到下一个边界；但**仍受 5 分钟
+            // 兜底上限截短** ⇒ 唤醒节奏还是每 ≤5 分钟一次，变化的只是
+            // 「边界前的最后一跳恰好落在边界上」，切换不再晚最多 5 分钟。
+            //
+            // ⚠️ 不能把兜底去掉：算得再准，也挡不住 uevent 不上报 / 时钟被改。
             if let Some(night_s) = engine.night_next_transition_in_s(now) {
                 let night_ms = (night_s * 1000) as libc::c_int;
                 night_ms.min((SLEEP_FALLBACK_S * 1000) as libc::c_int)
