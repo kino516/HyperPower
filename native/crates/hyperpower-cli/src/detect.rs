@@ -693,13 +693,19 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
     let derived = profile.capabilities.gear.max;
     let how = gear_max_origin.describe(derived);
     let probe_gear = opts.mode == ProbeMode::Full && opts.allow_write_probe;
+    let wireless_now = sysfs::PowerSource::read().wireless;
 
     // 档位上限**没能真正探到**（两个来源都没有）⇒ 必须让用户知道
     if !gear_max_origin.is_measured() {
         meta.notes.push(format!("档位上限：{how}"));
     }
 
-    if probe_gear && !charging_now {
+    if probe_gear && wireless_now {
+        log::info!("[8/10] 无线充电中 —— 跳过有线档位写探（请改插有线充电器后补测）");
+        meta.pending_items.push("gear_write_probe".to_string());
+        meta.notes
+            .push("档位写探：已跳过（无线充电中）—— 插有线充电器后补测".to_string());
+    } else if probe_gear && !charging_now {
         log::info!("[8/10] 未插充电器 —— 跳过档位写探（此状态下驱动不接受写入）");
         // 归 `pending_items`（待补测）而非 `failed_items`：
         // 这不是失败，插上充电器再勾一次就能测完。

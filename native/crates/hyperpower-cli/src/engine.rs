@@ -431,10 +431,12 @@ impl Engine {
     /// `learned_curr_max == None` 时调用一次，成本可忽略。
     fn probe_allowed(&self, sample: &hyperpower_core::Sample) -> bool {
         let hw_max = self.caps().thermal.hardware_max_c;
+        let src = crate::sysfs::PowerSource::read();
         sample.temp_c < hw_max - 2.0
             && sample.soc >= 5
             && sample.voltage_uv >= 3_400_000
-            && !crate::sysfs::PowerSource::read().weak
+            && !src.weak
+            && !src.wireless
     }
 
     /// 写探请求的电流值
@@ -662,7 +664,13 @@ impl Engine {
         // 真机（Xiaomi 17T）在 1% / 3.12V 时插电，写探 30A 把电池拉到
         // 欠压 ⇒ 反复重启。⇒ 现在必须同时满足：已启用、非官方模式、
         // 非只读执行器、温度安全、电量/电压安全、充电器非弱充。
-        if self.learned_curr_max.is_none()
+        // 无线充电状态（纯只读）：`wireless/online == 1 && usb/online != 1` 时为 true。
+        // 无线充电期间有线控速节点（wired_ctrl_limit / wired_chg_curr）不适用，
+        // 须跳过有线写探与有线写入（仅观测，不影响 soc_limit 附加功能）。
+        let wireless_now = crate::sysfs::PowerSource::read().wireless;
+
+        if !wireless_now
+            && self.learned_curr_max.is_none()
             && sample.status == hyperpower_core::ChargingStatus::Charging
             && self.profile.profile.capabilities.detected
             && cfg.enabled
@@ -721,6 +729,12 @@ impl Engine {
             decision.should_write = false;
         }
         self.soc_hold_active = soc_hold;
+
+        // 无线充电安全旁路：有线节点在无线充期间无效，跳过一切有线写入（避免误写与误熔断）；
+        // 电池采样、充电历史与 soc_limit 附加功能仍照常运行。
+        if wireless_now {
+            decision.should_write = false;
+        }
 
         // 若已离开官方模式，清除「官方模式已释放」标记，确保下次再切回官方时能再释放一次（R12）。
         if decision.reason != Reason::Official {
@@ -4630,6 +4644,157 @@ mod tests {
             // 下一拍再次静默
             let rep_idle = engine.step(1021);
             assert!(!rep_idle.wrote, "再次释放后的下一拍不得重复写入");
+        });
+    }
+
+    /// 无线充电安全旁路：`wireless/online == 1 && usb/online != 1` 时跳过有线控速写入、
+    /// 有线写探与有线档位写探，同时 `soc_limit` 附加功能照常运行。
+    #[test]
+    fn 端到端_无线充电旁路有线控速且充电上限正常运行() {
+        const CTRL: &str = "sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit";
+        const CURR: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+        const SMART_CHG: &str = "sys/class/xm_power/charger/smart_charge/smart_chg";
+        const SOC_LIMIT: &str = "sys/class/xm_power/charger/smart_charge/soc_limit";
+
+        let fake = FakeSysfs::new("wireless_bypass");
+        std::fs::create_dir_all(fake.path("sys/class/power_supply/wireless")).unwrap();
+        fake.write("sys/class/power_supply/wireless/online", "1");
+        fake.write("sys/class/power_supply/usb/online", "0");
+        // 高温（触发硬保护温区）+ Charging：有线分支若未旁路必然会写 wired_chg_curr
+        fake.write("sys/class/power_supply/battery/temp", "452");
+        fake.write("sys/class/power_supply/battery/status", "Charging");
+        fake.write(CTRL, "0");
+        fake.write(CURR, "18400000");
+        fake.write(SMART_CHG, "80");
+        fake.write(SOC_LIMIT, "80");
+
+        with_fake_root(&fake.root, || {
+            let ps = crate::sysfs::PowerSource::read();
+            assert!(
+                ps.wireless,
+                "wireless/online=1 且 usb/online=0 应判为无线充"
+            );
+            assert!(!ps.weak, "无线充不应被误判成弱 USB 电源");
+
+            // ① 引擎：跳过有线控速与写探，同时 soc_limit 照常运行
+            let mut engine = engine_on(&fake);
+            engine.cfg.set("limit.enabled", "true").unwrap();
+            engine.cfg.set("limit.soc", "90").unwrap();
+            crate::addon_host::reload_config(&mut engine.addons, &engine.cfg);
+            let _ = engine.addons.probe_all(&mut engine.addon_io);
+
+            for i in 0..5 {
+                let rep = engine.step(1000 + i * 20);
+                assert!(rep.sampled);
+                assert!(!rep.wrote, "第 {i} 拍无线充电期间不得写有线控速节点");
+                assert!(rep.errors.is_empty());
+                assert_eq!(engine.write_failures, 0);
+                assert!(!engine.released);
+            }
+            assert_eq!(fake.read(CTRL), "0", "无线充期间有线档位节点不得被改写");
+            assert_eq!(
+                fake.read(CURR),
+                "18400000",
+                "无线充期间有线电流节点不得被改写"
+            );
+            assert!(
+                engine.learned_curr_max.is_none(),
+                "无线充期间不得触发有线电流写探"
+            );
+            assert_eq!(
+                fake.read(SMART_CHG),
+                "0x5A0011",
+                "无线充期间 soc_limit 充电上限（90% → 0x5A0011）仍应正常运行"
+            );
+
+            // ② 检测：完整模式写探在无线充电期间应跳过进 pending_items，不动 wired_ctrl_limit
+            let probed = crate::detect::run(crate::detect::ProbeOptions {
+                mode: crate::detect::ProbeMode::Full,
+                allow_write_probe: true,
+            })
+            .expect("无线充期间检测应正常完成");
+            assert!(
+                probed
+                    .probe_meta
+                    .pending_items
+                    .iter()
+                    .any(|x| x == "gear_write_probe"),
+                "无线充期间有线档位写探应归入 pending_items：{:?}",
+                probed.probe_meta.pending_items
+            );
+            assert_eq!(
+                probed.capabilities.sources.gear_max,
+                hyperpower_ipc::device::ValueSource::Devicetree,
+                "跳过写探后不应误把 sources.gear_max 提升为 Node"
+            );
+            assert_eq!(fake.read(CTRL), "0");
+        });
+    }
+
+    /// 电量计 `xm_power/fg_master/rsoc` 探测命中与 `status` 中 `cp_die_temp_c=0 → null` / `charger.wireless` 契约端到端验证
+    #[test]
+    fn nezha_xm_power_fg_master_rsoc与status电荷泵滤零端到端() {
+        let fake = FakeSysfs::new("nezha_rsoc_status");
+        std::fs::create_dir_all(fake.path("sys/class/xm_power/fg_master")).unwrap();
+        std::fs::create_dir_all(fake.path("sys/class/power_supply/wireless")).unwrap();
+        fake.write("sys/class/xm_power/fg_master/rsoc", "50");
+        fake.write("sys/class/xm_power/cp_master/tdie", "0");
+        fake.write("sys/class/power_supply/wireless/online", "1");
+        fake.write("sys/class/power_supply/usb/online", "0");
+
+        with_fake_root(&fake.root, || {
+            let engine = engine_on(&fake);
+            let p = engine
+                .nodes
+                .battery_rsoc
+                .as_ref()
+                .map(crate::sysfs::Node::path_str)
+                .unwrap_or_default();
+            assert!(
+                p.ends_with("xm_power/fg_master/rsoc"),
+                "无 qcom-battery/fg1_rsoc 时应命中 xm_power/fg_master/rsoc，实得 {p}"
+            );
+            assert_eq!(engine.nodes.read_soc_driver(), Some(50));
+
+            let ctx = crate::commands::Ctx {
+                cfg: &engine.cfg,
+                profile: &engine.profile,
+                nodes: &engine.nodes,
+                gear_table: engine.gear_table.as_ref(),
+                state: &engine.state,
+                ticks: 1,
+                started_at_s: 1000,
+                released: false,
+                addons: &engine.addons,
+                history: &engine.history,
+                pending: std::cell::RefCell::new(Vec::new()),
+                now_s: 1001,
+            };
+
+            // ① tdie == 0（ADC 关闭期）⇒ cp_die_temp_c 必须是 null，且 soc_driver=50、charger.wireless=true
+            let (resp0, _) = crate::commands::dispatch(&ctx, "status", &json!([]), false);
+            match resp0 {
+                hyperpower_ipc::Response::Ok { data: Some(d), .. } => {
+                    assert!(
+                        d["thermal"]["cp_die_temp_c"].is_null(),
+                        "tdie=0 时必须返回 null，实得 {:?}",
+                        d["thermal"]["cp_die_temp_c"]
+                    );
+                    assert_eq!(d["battery"]["soc_driver"], json!(50));
+                    assert_eq!(d["charger"]["wireless"], json!(true));
+                }
+                other => panic!("status 应返回数据，实际：{other:?}"),
+            }
+
+            // ② 正常读数 tdie == 295 ⇒ cp_die_temp_c == 29.5
+            fake.write("sys/class/xm_power/cp_master/tdie", "295");
+            let (resp1, _) = crate::commands::dispatch(&ctx, "status", &json!([]), false);
+            match resp1 {
+                hyperpower_ipc::Response::Ok { data: Some(d), .. } => {
+                    assert_eq!(d["thermal"]["cp_die_temp_c"], json!(29.5));
+                }
+                other => panic!("status 应返回数据，实际：{other:?}"),
+            }
         });
     }
 }

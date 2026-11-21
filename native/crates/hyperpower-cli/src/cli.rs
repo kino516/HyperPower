@@ -761,11 +761,14 @@ pub fn run_verify(json: bool) -> Result<()> {
     // 电荷泵温度：可选观测，缺了不算问题（很多机型没有）
     match &nodes.cp_die_temp {
         Some(n) => {
-            let v = n
-                .read_i64()
-                .map(|x| format!("{:.1}℃", x as f64 / 10.0))
-                .unwrap_or_else(|_| "读取失败".to_string());
-            checks.push(Check::ok("电荷泵温度", format!("{v}（仅观测）")));
+            let v = match n.read_i64() {
+                Ok(x) => match crate::sysfs::cp_die_temp_to_c(x) {
+                    Some(c) => format!("{c:.1}℃（仅观测）"),
+                    None => "未采集（ADC 未开启，仅观测）".to_string(),
+                },
+                Err(_) => "读取失败（仅观测）".to_string(),
+            };
+            checks.push(Check::ok("电荷泵温度", v));
         }
         None => checks.push(Check::ok(
             "电荷泵温度",
@@ -1028,6 +1031,12 @@ pub fn run_probe(official: bool, json: bool) -> Result<()> {
         Ok((t, path)) => {
             println!("路径    : {path}");
             println!("档位数  : {}（**因机型而异**）", t.len());
+            println!(
+                "内核映射: mca_charger_thermal 写入 0=不限，1..={} 对应表第 1..={} 行（下表行号 0..={}）",
+                t.len(),
+                t.len(),
+                t.len().saturating_sub(1)
+            );
             println!();
             println!("档位   电流上限(mA)   电流上限(μA)");
             for (gear, ua) in t.current_limits() {
@@ -1391,7 +1400,7 @@ fn print_official_thermal(user_tighten: f64) {
     println!();
     println!("=== 官方温控策略（系统自带）===");
 
-    let (monitor, sic) = match crate::sysfs::read_official_rules() {
+    let (monitor, sic, is_third_party) = match crate::sysfs::read_official_rules() {
         Ok(v) => v,
         Err(e) => {
             // ⚠️ 用**具体原因**，不能笼统说"读不到文件"
@@ -1401,19 +1410,37 @@ fn print_official_thermal(user_tighten: f64) {
             // 笼统提示会把排查引向错误方向（查权限/查机型）。
             println!("  {}", e.message());
             // 把真实节名列出来 —— 这正是排查"节名不同"的场合
-            print_section_names();
+            print_section_names(None);
             return;
         }
     };
+
+    if is_third_party {
+        println!();
+        println!(
+            "  ⚠️ 检测到第三方温控模块节名 [{}]（未找到官方 [MONITOR-BAT]）：",
+            monitor.name
+        );
+        println!("     该节同样经 mi_thermald 写入 wired_ctrl_limit，非官方模式下");
+        println!("     可能与 HyperPower 争写档位导致限速抖动或回读告警，请注意二选一。");
+    }
 
     println!();
     println!("  ⚠️ 官方与模块是两层并联，但两个通道的作用方式不同：");
     println!("     · 档位：**双方都在写**，后写的覆盖先写的（竞争，不是取更严）");
     println!("     · 电流：驱动把模块写入与官方 SIC-BAT **取较小值**");
 
-    // ── MONITOR-BAT：官方按电池温度写档位 ──
+    // ── MONITOR-BAT（或第三方 *-CHARGE-BAT）：按电池温度写档位 ──
     println!();
-    println!("  [MONITOR-BAT] 官方写入的限速档位");
+    println!(
+        "  [{}] {}写入的限速档位",
+        monitor.name,
+        if is_third_party {
+            "第三方温控"
+        } else {
+            "官方"
+        }
+    );
     println!("    触发温度    解除温度    官方档位");
     for (i, t) in monitor.trig.iter().enumerate() {
         let clr = monitor.clr.get(i).copied().unwrap_or(0);
@@ -1488,7 +1515,7 @@ fn print_official_thermal(user_tighten: f64) {
     }
 
     // 最后列出文件里**全部**节名（换机型时的诊断依据）
-    print_section_names();
+    print_section_names(is_third_party.then_some(monitor.name.as_str()));
 }
 
 /// 列出 `decrypt.txt` 里全部节名（**换机型的诊断依据**）
@@ -1508,7 +1535,7 @@ fn print_official_thermal(user_tighten: f64) {
 ///
 /// ⇒ **不猜**，而是把真实存在的节名全部列出来，
 /// 让维护者遇到新机型时一眼看到该用什么名字，再决定是否补候选。
-fn print_section_names() {
+fn print_section_names(extra_matched: Option<&str>) {
     let Some(names) = crate::sysfs::read_section_names() else {
         return;
     };
@@ -1522,11 +1549,11 @@ fn print_section_names() {
         names.len()
     );
 
-    // 标出本模块**实际使用**的两个
+    // 标出本模块**实际使用**的两个（及识别到的第三方 *-CHARGE-BAT 节）
     const USED: &[&str] = &["MONITOR-BAT", "SIC-BAT"];
     let mut line = String::from("    ");
     for (i, n) in names.iter().enumerate() {
-        let mark = if USED.contains(&n.as_str()) {
+        let mark = if USED.contains(&n.as_str()) || extra_matched == Some(n.as_str()) {
             "★"
         } else {
             " "
