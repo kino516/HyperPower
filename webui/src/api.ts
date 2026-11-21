@@ -28,6 +28,9 @@
 
 import { exec } from "kernelsu";
 
+import { EXTERNAL_PAGES } from "./update";
+import type { ExternalPage } from "./update";
+
 import type {
   AddonStatus,
   ControlSection,
@@ -789,6 +792,79 @@ async function runBinary(
     return JSON.parse(out);
   } catch {
     throw new ApiError("E_INTERNAL", `响应不是合法 JSON：${out.slice(0, 120)}`);
+  }
+}
+
+// ============================================================
+//  外部页面（交给**系统浏览器**，不在 WebView 内嵌）
+// ============================================================
+
+/** 打开外部页面的超时（毫秒）—— `am` 是本地命令，正常毫秒级返回 */
+const TIMEOUT_OPEN_MS = 8_000;
+
+/**
+ * 打开**固定**的外部页面 —— 交给系统默认浏览器
+ *
+ * # 为什么要绕这一道（2026-11-21 用户反馈）
+ *
+ * 原来是 `<a href target="_blank">`。在 KernelSU 管理器的 WebView 里
+ * `target="_blank"` **不会**唤起系统浏览器，而是被 WebView 自己接管 ——
+ * 用户看到的是"打开了一个内置网页"。GitHub 在这种内嵌环境里更容易
+ * 加载失败（证书 / 重定向 / 脚本限制），于是"打不开发布页"被放大成
+ * "拿不到下载地址"。
+ *
+ * # 为什么是 `am start`
+ *
+ * | 方式 | KernelSU WebView 里的行为 |
+ * |---|---|
+ * | `<a target="_blank">` / `window.open` | 内嵌或被拦截 |
+ * | `ksu.exec("am start -a android.intent.action.VIEW -d …")` | 交给系统，按用户默认浏览器打开 |
+ *
+ * `--user 0` 是必需的：root 域下 `am` 默认作用域不是当前用户，
+ * 不带它会出现"命令成功但界面没反应"。
+ *
+ * # 🔴 安全：URL 只能来自 [`EXTERNAL_PAGES`] 查表，不接受调用方传字符串
+ *
+ * `ksu.exec` 以 **root** 执行 `sh -c "<字符串>"`。若允许界面把任意 URL
+ * 拼进这条命令，一个带 `"; rm -rf /"` 的链接就是提权通道。
+ * 因此参数是**枚举键**（`"releases"` / `"mirror"`），URL 在本文件内查表 ——
+ * 与 [`run`] 只接受内部 `parts` 的纪律一致。
+ *
+ * # 失败降级
+ *
+ * `am` 不存在 / SELinux 拒绝 / 超时 ⇒ 退回 `window.open`（内嵌打开）。
+ * 内嵌不理想，但比"点了没反应"好。
+ */
+export async function openExternalPage(which: ExternalPage): Promise<void> {
+  const url = EXTERNAL_PAGES[which];
+
+  const fallback = () => {
+    window.open(url, "_blank", "noopener,noreferrer");
+  };
+
+  if (!hasBridge()) {
+    fallback();
+    return;
+  }
+
+  let errno = 1;
+  try {
+    // ⚠️ 用**绝对路径** `/system/bin/am`：`ksu.exec` 的 PATH 取决于管理器
+    //    实现，不保证含 `/system/bin`。一旦 `am` 找不到就是 errno 127，
+    //    会静默降级成"内嵌打开"—— 用户又回到原来那个问题。
+    const r = await execGuarded(
+      `/system/bin/am start -a android.intent.action.VIEW -d "${url}" --user 0`,
+      TIMEOUT_OPEN_MS,
+      "打开外部页面",
+    );
+    errno = r.errno;
+  } catch {
+    errno = 1;
+  }
+
+  // `errno === 0` ⇒ 已交给系统；否则退回内嵌
+  if (errno !== 0) {
+    fallback();
   }
 }
 

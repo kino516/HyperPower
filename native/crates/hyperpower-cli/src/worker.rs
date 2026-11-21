@@ -88,6 +88,23 @@ fn install_signal_handlers() -> Result<()> {
 /// 温控闭环的响应速度由它决定：温度变化后最多 3 秒开始降速。
 const PATROL_CHARGING_S: u64 = 3;
 
+/// **收紧态**的巡检间隔（秒）—— 比常规充电快，用于抢写
+///
+/// # 为什么需要（2026-11-21 真机实测，K90 Pro Max）
+///
+/// 官方 `mca_strategy_buckchg` 在高温档**每约 2 秒**把 `wired_chg_curr`
+/// 抬回 `SIC-BAT` 的下限（42.2℃ 档最低 3 A ≈ 12 W）。模块若仍按 3 秒一拍，
+/// 覆写窗口里实际功率就是官方的值 —— 用户看到的正是
+/// 「设了 3W，功率在 3W / 12W 之间来回跳」。
+///
+/// 压到 1 秒后，模块平均每 2 拍就有 1 拍能赶在官方覆写之后重新压低，
+/// 用户感知到的平均功率从约 (3+12)/2 ≈ 7.5W 降到接近 3~6W。
+///
+/// ⚠️ 只在**收紧态**生效（`Engine::is_tightening`）：正常充电仍用
+///    [`PATROL_CHARGING_S`]。加密采样只是为了抢写，不是为了全局提速 ——
+///    每拍都要采样 + 决策 + 可能写节点，常态加密纯属浪费。
+const PATROL_TIGHTEN_S: u64 = 1;
+
 /// 空闲巡检间隔（秒）—— **仅在 uevent 不可用时**作为插拔的感知渠道
 ///
 /// 正常情况下"插上充电器"由 `power_supply` uevent 立即通知，
@@ -778,7 +795,11 @@ pub fn run() -> Result<()> {
         //    风暴只会让 poll 空转，不会刷拍。
         let charging_now = engine.is_charging();
         let interval_s = if charging_now {
-            PATROL_CHARGING_S
+            if engine.is_tightening() {
+                PATROL_TIGHTEN_S
+            } else {
+                PATROL_CHARGING_S
+            }
         } else {
             PATROL_IDLE_S
         };
@@ -859,7 +880,11 @@ pub fn run() -> Result<()> {
             }
         } else {
             let base = if charging {
-                PATROL_CHARGING_S
+                if engine.is_tightening() {
+                    PATROL_TIGHTEN_S
+                } else {
+                    PATROL_CHARGING_S
+                }
             } else {
                 PATROL_IDLE_S
             };

@@ -105,7 +105,8 @@ import { batteryCapacityMah, f0, f1 } from "../format";
 import { perfMark } from "../perf";
 import { failedLabel } from "../types";
 import type { DeviceProfileView } from "../types";
-import { compareVersions, fetchLatestRelease, RELEASES_URL } from "../update";
+import { compareVersions, fetchLatestRelease, MIRROR_URL } from "../update";
+import type { ExternalPage } from "../update";
 
 /** 当前生效档案 */
 const device = ref<DeviceProfileView | null>(null);
@@ -374,6 +375,37 @@ interface UpdateResult {
 }
 
 const updateResult = ref<UpdateResult | null>(null);
+
+/**
+ * 网盘地址（**只用于展示**）
+ *
+ * 打开时走 `api.openExternalPage("mirror")` —— URL 在 `update.ts` 里查表，
+ * 界面这层拿不到"拼命令"的能力（`ksu.exec` 是 root）。
+ */
+const mirrorUrl = MIRROR_URL;
+
+/**
+ * 用**系统浏览器**打开固定页面
+ *
+ * # 为什么不再用 `<a target="_blank">`（2026-11-21 用户反馈）
+ *
+ * 在 KernelSU 管理器的 WebView 里，`target="_blank"` 被 WebView 自己接管，
+ * 用户看到的是"应用内嵌的网页"而不是浏览器；GitHub 在内嵌环境里更容易
+ * 加载失败，于是"打不开发布页"变成"拿不到下载地址"。
+ *
+ * 现在交给 `am start`（root），由系统按默认浏览器打开；失败则退回内嵌。
+ * 参数是**枚举键**，不是 URL 字符串 —— 见 `api.openExternalPage` 的说明。
+ */
+async function openPage(which: ExternalPage): Promise<void> {
+  try {
+    await api.openExternalPage(which);
+  } catch (e) {
+    void showSnackbar({
+      message: `打开失败：${e instanceof Error ? e.message : String(e)}`,
+      duration: "long",
+    });
+  }
+}
 
 async function loadModuleVersion(): Promise<void> {
   try {
@@ -785,6 +817,14 @@ async function checkUpdate(): Promise<void> {
           模块的充电控制功能完全离线可用。
         </MiuixText>
 
+        <MiuixText
+          type="footnote1"
+          color="var(--m-color-on-surface-secondary)"
+        >
+          下面的按钮会在系统浏览器里打开（不是应用内嵌页）。GitHub
+          打不开时请用「网盘下载」。
+        </MiuixText>
+
         <div class="upd__actions">
           <MiuixButton
             class="upd__btn"
@@ -793,15 +833,20 @@ async function checkUpdate(): Promise<void> {
           >
             {{ checkingUpdate ? "检查中…" : "检查更新" }}
           </MiuixButton>
-          <a
-            class="upd__link"
-            :href="RELEASES_URL"
-            target="_blank"
-            rel="noreferrer"
-          >
+          <MiuixButton class="upd__btn" @click="openPage('releases')">
             打开发布页
-          </a>
+          </MiuixButton>
+          <MiuixButton class="upd__btn" @click="openPage('mirror')">
+            网盘下载
+          </MiuixButton>
         </div>
+
+        <MiuixText
+          type="footnote2"
+          color="var(--m-color-on-surface-secondary)"
+        >
+          网盘地址：{{ mirrorUrl }}
+        </MiuixText>
 
         <div
           v-if="updateResult"
@@ -809,15 +854,13 @@ async function checkUpdate(): Promise<void> {
           :class="`upd__result--${updateResult.kind}`"
         >
           <span>{{ updateResult.message }}</span>
-          <a
+          <MiuixButton
             v-if="updateResult.url"
-            class="upd__link"
-            :href="updateResult.url"
-            target="_blank"
-            rel="noreferrer"
+            class="upd__btn"
+            @click="openPage('releases')"
           >
             查看该版本
-          </a>
+          </MiuixButton>
         </div>
       </div>
     </MiuixCard>

@@ -16,7 +16,7 @@ use hyperpower_core::profile::{
     ThermalCapability,
 };
 use hyperpower_core::{
-    decide_with, Capabilities, ChargingStatus, Config, CoreError, Sample, State,
+    decide_with, Bounds, Capabilities, ChargingStatus, Config, CoreError, Sample, State,
 };
 
 /// 构造一份"本机档案"：最大功率 100W、电流上限 18.4A、档位 0~15
@@ -383,15 +383,36 @@ fn 默认配置下降低的电流设定必须生效() {
     );
 }
 
-/// 🔴 默认配置下，**设 0 = 停止充电**必须真的能做得到
+/// 🔴 默认配置下，**设 0 = 降到本机最低**（永远不下发 0 电流）
 ///
-/// 用户明确要求过「**达到此温度停止充电**」这个选项（2026-10-14）。
-/// 而旧的 `curve` 默认律下，无论怎么设都降不到 0（曲线末段是 0.7A）。
+/// 用户要求过「**达到此温度停止充电**」这个选项（2026-10-14）。
+///
+/// # ⚠️ 语义在 2026-11-21 被真机推翻并修正
+///
+/// 旧实现把「停止充电」实现成**向电流节点写 `0`**，本测也据此断言
+/// `curr_ua == 0`。真机实测证明那条路**在硬件层是反的**：
+///
+/// ```text
+/// printf 0 > wired_chg_curr      # 返回成功
+/// 0.2 s 后回读 : 18400000        # = 本机能力上限（18.4 A）
+/// 电池电流      : 0.74 A → 1.93 A   # 想停充，结果全速充
+/// ```
+///
+/// `0` 在该节点上的真实语义是「**解除限制**」。因此现在设 0 时下发的是
+/// **本机最小可生效电流**（`Bounds::curr_floor`，本机 ≈ 0.70 A），
+/// 本测改为锁定这条新语义：
+///
+/// | 断言 | 理由 |
+/// |---|---|
+/// | `curr_ua != 0` | 0 会被驱动反转成满速 —— 绝对不能下发 |
+/// | `curr_ua == curr_floor` | 必须是"本机能做到的最低"，而不是随便一个值 |
+///
+/// 真正"停止充电"需要另一个节点（`smart_chg` 控制字），不属于电流通道。
 #[test]
-fn 默认配置下可以设成停止充电() {
+fn 默认配置下设零等于降到本机最低而不是写零电流() {
     let caps = caps_100w();
     let mut cfg = Config::default();
-    cfg.tighten_power_w = 0; // 用户设「停止充电」
+    cfg.tighten_power_w = 0; // 用户把滑块拖到最左
     cfg.tighten_temp = 43.0;
     cfg.ramp_span = 2.0;
 
@@ -400,12 +421,38 @@ fn 默认配置下可以设成停止充电() {
         ..State::default()
     };
 
+    let b = Bounds::from_caps(&caps);
     let d45 = decide_with(&sample(45.0), &cfg, &st, &caps).unwrap();
-    assert_eq!(
+    assert_ne!(
         d45.curr_ua, 0,
-        "设 0 应真的写到 0（停止充电），实得 {}",
+        "绝不能下发 0 电流 —— 驱动会把它解释成「解除限制」并回填满档"
+    );
+    assert_eq!(
+        d45.curr_ua, b.curr_floor,
+        "设 0 应降到本机最小可生效电流，实得 {}",
         d45.curr_ua
     );
+}
+
+/// 本机电流下限**取档案实测值与物理护栏的较大者**，且不超过上限
+#[test]
+fn 电流下限夹在物理护栏与档案上限之间() {
+    let mut caps = caps_100w();
+
+    // ① 旧档案（min_ua = 0，检测从未填过）⇒ 用物理护栏
+    caps.current.min_ua = 0;
+    let b = Bounds::from_caps(&caps);
+    assert_eq!(b.curr_floor, hyperpower_core::decision::CURR_FLOOR_ABS_UA);
+
+    // ② 驱动下限更高的机型 ⇒ 用实测值
+    caps.current.min_ua = 1_500_000;
+    let b = Bounds::from_caps(&caps);
+    assert_eq!(b.curr_floor, 1_500_000);
+
+    // ③ 档案自相矛盾（min > max）⇒ floor 不得超过 cap，否则钳位区间为空
+    caps.current.min_ua = 99_000_000;
+    let b = Bounds::from_caps(&caps);
+    assert_eq!(b.curr_floor, b.curr_max, "floor 必须夹到 cap 之内");
 }
 
 /// 用户设的「收紧后降到多少」在**任何温度**都精确生效

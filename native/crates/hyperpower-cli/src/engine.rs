@@ -228,6 +228,41 @@ pub struct Engine {
     ///    「温度没到阈值却只剩十几瓦」（2026-10-22 真机报告）。
     ///    见 `apply()` 的 `curr_opened` 分支与 `Nodes::ensure_gear`。
     pub curr_opened: bool,
+    /// 本场充电是否已上报过「电流被驱动反转」警告（去重）
+    ///
+    /// # 为什么需要（2026-11-21 真机实测，K90 Pro Max）
+    ///
+    /// 向 `wired_chg_curr` 写 `0` 会被驱动解释成「**解除限制**」：
+    /// `0.2 s` 后回读变成 `18400000`（本机能力上限），电池电流从 0.74 A
+    /// 跳到 1.93 A —— 用户设「降到 0W 停止充电」，实际得到的是满速充电。
+    ///
+    /// 决策层已改成**永不下发 0**（见 `hyperpower_core::decision::CURR_FLOOR_ABS_UA`），
+    /// 但驱动/官方策略仍可能在任何时刻把节点回填成上限。这条检查是**第二道防线**：
+    /// 收紧后回读一次，若读到接近上限就上报一次（每场充电一条，不刷屏）。
+    pub backfill_warned: bool,
+    /// **功率闭环稳定期**截止拍号（消费 `control.stabilize_s`）
+    ///
+    /// # 为什么需要（2026-11-21 真机实测，K90 Pro Max，目标 18 W）
+    ///
+    /// 功率闭环每拍按 ±25% 修正，但硬件（PD_PPS 协商 + 电荷泵）的响应
+    /// 滞后 1~3 秒 —— 闭环在"还没看到上一拍效果"时就继续修，越过目标后
+    /// 再往回追，形成**极限环**。实测 17 秒内：27.8 W → 32 W → 12.4 W → 20.5 W：
+    ///
+    /// | 拍 | 写入电流 | 实际电池电流 | 实际功率 |
+    /// |---|---|---|---|
+    /// | 1 | 15.0 A | 6.59 A | 27.8 W |
+    /// | 5 | 5.1 A | 6.63 A | 28.0 W | ← 写入降了 3 倍，实际纹丝不动 |
+    /// | 11 | 2.1 A | 3.00 A | 12.4 W | ← 终于降下去，但已严重过冲 |
+    /// | 18 | 5.9 A | 3.97 A | 16.6 W |
+    ///
+    /// 这就是用户看到的「上限 18W，功率却在 12~32W 之间来回跳」。
+    ///
+    /// 稳定期内**沿用上一拍的功率目标**，让硬件有时间跑完，
+    /// 下一拍再根据新读数决定是否继续修正。
+    ///
+    /// ⚠️ 只作用于 `Reason::PowerLimit`（纯体验问题）；
+    ///    `Tighten` / 硬保护是**安全路径**，绝不延迟。
+    pub power_settle_until_s: i64,
     /// **上一次采样时的充电状态**（缓存）
     ///
     /// # 为什么需要缓存
@@ -363,6 +398,8 @@ impl Engine {
             // `None` = 还没探测过 ⇒ 第一次温度正常时会写探一次
             learned_curr_max: None,
             curr_opened: false,
+            backfill_warned: false,
+            power_settle_until_s: 0,
             // 初值为 `false`（未充电）⇒ 启动后第一轮会走"轻拍"，随后
             // 立刻由拍到的一次采样纠正。**刻意不用"启动即跑一拍"**：
             // worker 的启动路径已经显式跑过首拍了。
@@ -695,6 +732,36 @@ impl Engine {
             }
         };
         rep.reason = Some(decision.reason);
+
+        // ③-b 功率闭环**稳定期**（消费 `control.stabilize_s` —— 此前是死键）
+        //
+        // 详细理由见字段 [`Self::power_settle_until_s`] 的文档：硬件响应滞后
+        // 1~3 秒，而闭环每拍都在 ±25% 修正 ⇒ 极限环（实测 12~32W 来回跳）。
+        //
+        // 判据：
+        //
+        // | 情况 | 行为 |
+        // |---|---|
+        // | `PowerLimit` + 目标变了 + 不在稳定期 | 采用新目标，**开启**稳定期 |
+        // | `PowerLimit` + 在稳定期内 | **沿用上一拍目标**（不追） |
+        // | `Normal` / `Tighten` / 硬保护 | 原样执行（安全路径不延迟） |
+        if matches!(decision.reason, Reason::PowerLimit) {
+            // ⚠️ 上限 3 秒：再长就只是"反应迟钝"，而不是"等硬件稳定"。
+            //    实测硬件（PPS 协商 + 电荷泵）的响应在 1~2 秒内完成。
+            let settle_s = i64::from(self.cfg.get_u32("control.stabilize_s").clamp(1, 3));
+            let changed =
+                decision.power_cap_ua.is_some() && decision.power_cap_ua != self.state.power_cap_ua;
+            if changed && now_s >= self.power_settle_until_s {
+                // 新目标 ⇒ 放行，并让硬件安静 settle_s **秒**再评估
+                self.power_settle_until_s = now_s + settle_s;
+            } else if now_s < self.power_settle_until_s {
+                // 稳定期内 ⇒ 沿用上一拍的目标值，避免追着硬件跑
+                if let Some(held) = self.state.power_cap_ua {
+                    decision.curr_ua = held;
+                    decision.power_cap_ua = Some(held);
+                }
+            }
+        }
 
         // ④ 写入
         //
@@ -1170,6 +1237,21 @@ impl Engine {
         self.last_charging
     }
 
+    /// 当前是否处于**收紧态**（正在降功率）
+    ///
+    /// # 为什么需要它（2026-11-21 真机实测，K90 Pro Max）
+    ///
+    /// 官方 `mca_strategy_buckchg` 在高温档会**每约 2 秒**把 `wired_chg_curr`
+    /// 抬回 `SIC-BAT` 的下限（42.2℃ 档最低 3 A）。模块默认 3 秒一拍，
+    /// 中间约 1 秒的窗口里实际功率是官方的值（3 A ≈ 12 W），
+    /// 于是用户看到的是「设了 3W，功率在 3W / 12W 之间跳」。
+    ///
+    /// 收紧态把拍间隔压到 1 秒，目的就是抢在官方覆写之前把目标值压回去。
+    /// 只在收紧态生效 —— 正常充电路径仍用 3 秒，避免无谓的节点写入。
+    pub fn is_tightening(&self) -> bool {
+        self.last_charging && self.state.tightening
+    }
+
     /// 把待推送事件广播给 `watch` 订阅者
     ///
     /// ⚠️ 消费过慢的客户端由 [`crate::server::ControlServer`] 按背压策略断开，
@@ -1284,7 +1366,6 @@ impl Engine {
     /// 返回 `(是否写了, 是否校验通过, 错误)`
     fn apply(&mut self, sample: &Sample, decision: &Decision) -> (bool, bool, Option<String>) {
         let prev = (self.state.gear, self.state.curr_ua);
-        let _ = sample;
 
         let result = if decision.release {
             self.curr_opened = false;
@@ -1539,7 +1620,80 @@ impl Engine {
             }
         }
 
-        (true, verified, None)
+        // ④-c 电流回填检测（只观测、只上报，不参与控制）
+        //
+        // ⚠️ 必须在 `write_failures` 归零/递增**之后**：这条警告不改变
+        //    "本拍写入是否成功"的判定（R5 的判据仍是档位）。
+        let backfill = self.check_curr_backfill(sample, decision);
+
+        (true, verified, backfill)
+    }
+
+    /// 收紧后**回读电流**，识别「驱动把收紧值反转成满档」
+    ///
+    /// # 为什么需要（2026-11-21 真机实测，K90 Pro Max）
+    ///
+    /// `wired_chg_curr` 对 `0` 的解释是「**解除限制**」而不是「零电流」：
+    ///
+    /// ```text
+    /// printf 0 > wired_chg_curr   # 返回成功
+    /// 0.2 s 回读 : 18400000       # 本机能力上限
+    /// 电池电流    : 0.74 A → 1.93 A
+    /// ```
+    ///
+    /// 决策层已改为永不下发 0（`CURR_FLOOR_ABS_UA`），但**驱动与官方策略仍可能
+    /// 任何时刻回填**。这条检查是第二道防线：只观测、只上报，不参与控制，
+    /// 也不递增 `write_failures`（那种回填属官方竞争写，不该导致整场交回官方）。
+    ///
+    /// # 判据（必须同时满足，否则会误报）
+    ///
+    /// | 条件 | 理由 |
+    /// |---|---|
+    /// | 本拍**确实在收紧**（目标 < 上限 90%） | `Normal` 时目标就等于上限，回读等于上限是正常的 |
+    /// | 充电中（`is_active`） | R5：未充电时电流节点读的是**能力上限**，不能当判据 |
+    /// | 回读 ≥ 上限 90% | 被反转的特征是"回到满档"，不是"略高一点" |
+    ///
+    /// 每场充电最多上报一次（`backfill_warned`），避免刷爆事件流。
+    fn check_curr_backfill(&mut self, sample: &Sample, decision: &Decision) -> Option<String> {
+        if self.backfill_warned || decision.release {
+            return None;
+        }
+        // 未充电 ⇒ 视为会话结束，为下一场充电复位去重标记
+        if !sample.status.is_active() {
+            self.backfill_warned = false;
+            return None;
+        }
+        let cap = self.caps().current.max_ua;
+        // 只有"目标明显低于上限"才谈得上被反转
+        if i64::from(decision.curr_ua) * 10 >= i64::from(cap) * 9 {
+            return None;
+        }
+        let node = self.nodes.curr.as_ref()?;
+        let back = node.read_i64().ok()?;
+        if back * 10 < i64::from(cap) * 9 {
+            return None;
+        }
+
+        self.backfill_warned = true;
+        let msg = format!(
+            "电流收紧被驱动反转：目标 {:.3} A，回读 {:.3} A（接近本机上限 {:.3} A）。\
+             该节点把过小的值当作「解除限制」并回填满档 —— \
+             设「降到 0W」会得到满速充电，模块已改用本机最小电流",
+            f64::from(decision.curr_ua) / 1e6,
+            back as f64 / 1e6,
+            f64::from(cap) / 1e6,
+        );
+        self.events.emit(
+            kind::WRITE_FAIL,
+            &msg,
+            json!({
+                "target_ua": decision.curr_ua,
+                "read_back_ua": back,
+                "cap_ua": cap,
+                "fatal": false,
+            }),
+        );
+        Some(msg)
     }
 
     /// 复位「已交回官方」粘性标志（**充电会话边沿**调用）

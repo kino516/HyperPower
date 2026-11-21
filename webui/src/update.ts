@@ -30,6 +30,37 @@ export const REPO = "kino516/HyperPower";
 /** 发布页（引导用户自己去看 release notes / 下载） */
 export const RELEASES_URL = `https://github.com/${REPO}/releases`;
 
+/**
+ * **备用下载通道**（网盘）—— 给 GitHub 连不上的用户
+ *
+ * # 为什么需要
+ *
+ * 2026-11-21 用户反馈：部分网络环境下 GitHub 完全打不开，连"打开发布页"
+ * 都看不到 Release，而模块本身是**离线**工作的 —— 装不上的原因不该是
+ * "看不到下载地址"。
+ *
+ * # 约束（与 R16 一致）
+ *
+ * | 项 | 说明 |
+ * |---|---|
+ * | 不是联网请求 | 只把固定 URL 交给系统浏览器，前端**不发起任何 fetch** |
+ * | 常量而非用户输入 | 防止把任意 URL 拼进 root 命令（见 `api.ts::openExternalPage`） |
+ * | 失败降级 | 打不开只影响这张卡 |
+ *
+ * ⚠️ 该地址由模块作者维护；更换时**只改这一处**。
+ */
+export const MIRROR_URL =
+  "https://1815482927.share.123pan.cn/123pan/udOiVv-3kOAh?pwd=icyA#";
+
+/** 需要交给系统浏览器打开的固定页面（键名是界面用的枚举，值只来自本文件常量） */
+export const EXTERNAL_PAGES = {
+  releases: RELEASES_URL,
+  mirror: MIRROR_URL,
+} as const;
+
+/** [`EXTERNAL_PAGES`] 的键 */
+export type ExternalPage = keyof typeof EXTERNAL_PAGES;
+
 const LATEST_RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;
 
 /** 一次检查的结果（`null` = 仓库还没有正式 Release） */
@@ -130,7 +161,15 @@ export async function fetchLatestRelease(timeoutMs = 8_000): Promise<LatestRelea
     return {
       tag,
       version: normalizeVersion(tag),
-      url: typeof data.html_url === "string" ? data.html_url : RELEASES_URL,
+      // 🔴 **刻意不采信 API 返回的 `html_url`**（2026-11-21）
+      //
+      // 打开外部页面走的是 `ksu.exec("am start … -d \"<url>\"")`，即在
+      // **root shell** 里拼字符串。任何来自网络响应的字符串都不该进那条命令 ——
+      // 一旦 GitHub 响应被污染（或将来换了字段），就是一个提权面。
+      //
+      // 固定成仓库的 releases 页：用户点进去同样能看到版本列表与下载，
+      // 代价只是不能"直达某个 tag"，换来的是 URL 只来自本文件常量。
+      url: RELEASES_URL,
       publishedAt: typeof data.published_at === "string" ? data.published_at : "",
     };
   } catch (e) {

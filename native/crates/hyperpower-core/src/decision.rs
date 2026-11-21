@@ -29,6 +29,42 @@ pub const LOW_BATTERY_VOLT_ZERO_WRITE_UV: i32 = 3_300_000;
 /// 而 [`tighten_curr_ua`] 的「电压不可信 ⇒ 放行」语义只适用于普通收紧。
 pub const SAFE_HARD_CURR_UA: i32 = 700_000;
 
+/// **物理最小可生效电流**（μA）—— 收紧路径的绝对下界
+///
+/// # 为什么 0 不是合法目标值（2026-11-21 真机实测，K90 Pro Max）
+///
+/// 用户把「超温降到多少」拖到最左（`tighten_power_w == 0`，语义是"停止充电"），
+/// 模块按设计向 `wired_chg_curr` 写 `0`。真机实测驱动对该值的处理是
+/// **把它当成「解除限制」而不是「零电流」**：
+///
+/// ```text
+/// printf 0 > wired_chg_curr        # 写入返回成功（rc=0）
+/// 0.2 s 后回读 : 18400000          # 驱动直接回填到本机能力上限
+/// 电池侧电流   : -1928000 → -2972000 μA（反而全速充）
+/// ```
+///
+/// 同一组实验还给出驱动的**下限钳位**：
+///
+/// | 写入 μA | 回读 μA | 结论 |
+/// |---|---|---|
+/// | `0` | `18400000` | 0 = **解除限制**（最坏情况） |
+/// | `100000` | `742000` | 被驱动钳到下限 |
+/// | `300000` | `757000` | 被驱动钳到下限 |
+/// | `700000` | `700000` | 接受 |
+///
+/// ⇒ 收紧路径**永远不能下发 0**，否则「降到 0W 停止充电」会被硬件反转成
+///   「满功率充电」。这与用户意图完全相反，也是「功率总是降不下来」的主因。
+///
+/// # 为什么是 700 mA（而不是从档案读）
+///
+/// 这是**物理护栏**，不是机型数据（R3）：锂电在 CV 末期的最小有效充电电流
+/// 量级约 `0.1C`，`700 mA` 是保守值；它同时也是 [`SAFE_HARD_CURR_UA`] 的值，
+/// 语义一致（「仍能充、但绝不拉垮电池」）。
+///
+/// 真正的本机下限由检测写入 [`crate::profile::CurrentCapability::min_ua`]，
+/// [`Bounds::from_caps`] 会取**两者中较大者**，因此换机型后仍以实测为准。
+pub const CURR_FLOOR_ABS_UA: i32 = 700_000;
+
 /// 决策原因（用于日志与可观测性）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
@@ -129,6 +165,19 @@ impl Decision {
 pub struct Bounds {
     /// 电流上限（μA）—— 来自检测档案，而非写死常量
     pub curr_max: i32,
+    /// **电流下限**（μA）—— 收紧路径的绝对下界
+    ///
+    /// 语义是「**本机最小可生效电流**」，不是「0」。取
+    /// `max(档案 min_ua, `[`CURR_FLOOR_ABS_UA`]`)`。
+    ///
+    /// ⚠️ 收紧路径（温度 / 功率上限 / 硬保护）**一律不得低于它**。
+    /// 真机实测：向 `wired_chg_curr` 写 `0` 会被驱动解释为「解除限制」
+    /// 并回填成本机能力上限 —— 用户设「降到 0W 停止充电」得到的是
+    /// **满功率充电**。详见 [`CURR_FLOOR_ABS_UA`]。
+    ///
+    /// ⚠️ **释放路径**（`Decision::release`）不受它约束：那条路径写的是
+    /// `curr_max`，本来就远大于下限。
+    pub curr_floor: i32,
     // ⚠️ 已删除 `gear_max`（2026-11-01 审计 L-02）：
     //    它被 `from_caps` 填了值但**没有任何读取点**。档位取值一律走
     //    `gear_open`（放开）或 `gear_safe`（硬保护），`gear.max` 只在
@@ -159,8 +208,16 @@ impl Bounds {
     /// 在这里对齐一次，`Decision::release` 等**不经 `clamp_curr`** 的
     /// 路径也就自动一致了。
     pub fn from_caps(caps: &Capabilities) -> Self {
+        let curr_max = align_ma(caps.current.max_ua);
         Self {
-            curr_max: align_ma(caps.current.max_ua),
+            curr_max,
+            // 下限取「档案实测值」与「物理护栏」的较大者：
+            // - 档案没测出 min（旧版本写的 0）⇒ 用物理护栏兜底
+            // - 档案测出更大值（某些机型的驱动下限更高）⇒ 用实测值
+            // 最后再夹到 curr_max 之内，避免档案自身矛盾时出现 floor > max。
+            curr_floor: align_ma(caps.current.min_ua)
+                .max(CURR_FLOOR_ABS_UA)
+                .min(curr_max),
             gear_open: caps.gear.open.min(caps.gear.max),
             gear_safe: caps.gear.safe.min(caps.gear.max),
             hardware_max_c: caps.thermal.hardware_max_c,
@@ -189,6 +246,7 @@ impl Default for Bounds {
     fn default() -> Self {
         Self {
             curr_max: align_ma(CURR_MAX_UA),
+            curr_floor: CURR_FLOOR_ABS_UA,
             gear_open: 0,
             gear_safe: GEAR_MAX,
             hardware_max_c: ABS_MAX_TEMP_C,
@@ -225,8 +283,20 @@ impl Default for Bounds {
 ///
 /// 物理影响可忽略（<1 mA），但**记录必须诚实**。
 /// 在决策层一次对齐，下游（写入 / 状态 / 历史 / 回读校验）全部一致。
-fn clamp_curr(v: i32, b: Bounds) -> i32 {
-    align_ma(v).clamp(0, b.curr_max)
+///
+/// # 🔴 下界是 `curr_floor` 而不是 `0`（2026-11-21）
+///
+/// 真机实测（K90 Pro Max）：`printf 0 > wired_chg_curr` 返回成功，
+/// **0.2 秒后回读变成 `18400000`**（= 本机能力上限），电池电流从 0.74 A
+/// 跳到 1.93 A。即这个节点上 `0` 的语义是「**解除限制**」，不是「零电流」。
+///
+/// 同组实验：`100000` → 回读 `742000`、`300000` → 回读 `757000`，
+/// 说明该节点的**有效下界约 750 mA**，比它小的值一律被驱动钳位。
+///
+/// ⇒ 收紧路径统一钳到 `[curr_floor, curr_max]`，**永不下发 0**。
+/// 释放路径不经过本函数（它直接写 `curr_max`）。
+fn clamp_ctrl(v: i32, b: Bounds) -> i32 {
+    align_ma(v).clamp(b.curr_floor, b.curr_max)
 }
 
 /// 向下对齐到整毫安（驱动的最小有效步进）
@@ -316,6 +386,12 @@ fn power_cap_curr(sample: &Sample, config: &Config, state: &State, b: Bounds) ->
         return (b.curr_max, false);
     };
     let feedforward = feedforward.clamp(0, b.curr_max);
+    // ⚠️ 功率上限是**收紧路径** ⇒ 结果不得低于本机可生效电流
+    //
+    // 用户设「上限 1W」时 `I = 1/4.2 ≈ 0.24 A` 低于驱动下限，写下去要么被
+    // 驱动钳位、要么（更糟）被当成异常值触发重新协商。用 `clamp_ctrl` 抬到
+    // 本机最小值，并在 UI 上如实显示"已到本机最低"（见 `ControlPage`）。
+    let feedforward = clamp_ctrl(feedforward, b);
 
     // ---------- 闭环：按实测功率比例校正 ----------
     let actual = f64::from(sample.power_w());
@@ -340,18 +416,12 @@ fn power_cap_curr(sample: &Sample, config: &Config, state: &State, b: Bounds) ->
     // 改成"保持上一拍值"后，一旦停在某个值就不再动 —— 功率反馈恢复
     // （真正在充电）时闭环会自然继续校正。
     if actual <= NO_FEEDBACK_W {
-        let held = state
-            .power_cap_ua
-            .unwrap_or(feedforward)
-            .clamp(0, b.curr_max);
+        let held = clamp_ctrl(state.power_cap_ua.unwrap_or(feedforward), b);
         return (held, true);
     }
 
     // 基准：上一拍算的值；首拍用前馈
-    let base = state
-        .power_cap_ua
-        .unwrap_or(feedforward)
-        .clamp(0, b.curr_max);
+    let base = clamp_ctrl(state.power_cap_ua.unwrap_or(feedforward), b);
 
     // 比例：>1 说明实测低于目标（该放松），<1 说明超标（该收紧）
     let ratio = target / actual;
@@ -364,7 +434,7 @@ fn power_cap_curr(sample: &Sample, config: &Config, state: &State, b: Bounds) ->
     // 单拍变化幅度限 ±25%：防止测量噪声导致大幅摆动
     let bounded = ratio.clamp(0.75, 1.25);
     let next = (f64::from(base) * bounded) as i32;
-    (next.clamp(0, b.curr_max), true)
+    (clamp_ctrl(next, b), true)
 }
 
 /// 核心评估（纯函数）
@@ -511,7 +581,7 @@ pub fn evaluate_with(
             should_write: true,
             gear: b.gear_safe,
             // ⚠️ 硬保护是**安全路径**：电压读不到时必须收紧，不能回退到 curr_max
-            curr_ua: clamp_curr(hard_protect_curr(sample, config, b), b),
+            curr_ua: clamp_ctrl(hard_protect_curr(sample, config, b), b),
             release: false,
             reason: Reason::HardProtect,
             phase: Phase::HardProtect,
@@ -529,7 +599,7 @@ pub fn evaluate_with(
                     should_write: true,
                     gear: b.gear_safe,
                     // 同硬保护：安全路径，电压不可信时必须收紧
-                    curr_ua: clamp_curr(hard_protect_curr(sample, config, b), b),
+                    curr_ua: clamp_ctrl(hard_protect_curr(sample, config, b), b),
                     release: false,
                     reason: Reason::VirtGuard,
                     phase: Phase::HardProtect,
@@ -622,7 +692,7 @@ pub fn evaluate_with(
     // | 温度限制更严（温度要求 ≤2.5A，功率允许 11A） | 2.5A ← 温度生效 |
     //
     // 温度优先是安全的，且"不超过 N W"这个约束**始终成立**。
-    let final_curr = clamp_curr(target_curr.min(pcap), b);
+    let final_curr = clamp_ctrl(target_curr.min(pcap), b);
 
     // ⚠️ 档位**保持放开**，温度收紧只走电流通道
     //
@@ -681,7 +751,7 @@ pub fn evaluate_with(
 fn curve_target(sample: &Sample, temp: f32, config: &Config, b: Bounds) -> i32 {
     for p in &config.curve {
         if temp <= p.t_max {
-            return clamp_curr(p.curr, b);
+            return clamp_ctrl(p.curr, b);
         }
     }
     // 超出所有分段 → 最慢档
@@ -690,7 +760,7 @@ fn curve_target(sample: &Sample, temp: f32, config: &Config, b: Bounds) -> i32 {
     //    空曲线，所以这条分支在正常流程下到不了；留着是为了**不 panic**。
     config.curve.last().map_or_else(
         || tighten_curr_ua(sample, config, b),
-        |p| clamp_curr(p.curr, b),
+        |p| clamp_ctrl(p.curr, b),
     )
 }
 
@@ -734,13 +804,36 @@ fn ramp_end(config: &Config, b: Bounds) -> f32 {
 ///
 /// | 情况 | 处理 | 理由 |
 /// |---|---|---|
-/// | `w == 0` | 返回 `0` | **停止充电**（用户把滑块拖到最左端就是这个意图） |
+/// | `w == 0` | 返回 `b.curr_floor` | **降到本机最低**（见下） |
 /// | 电压读不到（≤0.5V） | 返回 `b.curr_max` | 无法换算时宁可**放开**，避免因读数缺失卡在低速 |
 /// | 算出的电流超上限 | 钳到 `b.curr_max` | 功率目标高于本机能力时不该越界 |
+/// | 算出的电流低于下限 | 钳到 `b.curr_floor` | 驱动不接受更小的值（见 [`CURR_FLOOR_ABS_UA`]） |
+///
+/// # 🔴 `w == 0` 从「写 0 电流」改成「写本机最小电流」（2026-11-21）
+///
+/// 旧实现的语义是「**停止充电**」：直接把电流目标设成 `0` 写进节点。
+/// 真机实测证明这条路**在硬件层是反的**：
+///
+/// ```text
+/// 用户把滑块拖到最左（0W，期望"别充了"）
+///   ⇒ 模块写 wired_chg_curr = 0
+///   ⇒ 驱动 0.2s 后回填 18400000（= 本机能力上限，18.4A）
+///   ⇒ 电池电流 0.74A → 1.93A，功率反而涨到 30W+
+/// ```
+///
+/// `0` 在这个节点上的真实语义是「**解除限制**」，与用户意图完全相反，
+/// 也是「设了 0W 却降不下来、还波动到 30W」的第一根因。
+///
+/// 现在 `0` 的语义改为「**降到本机能做到的最低**」：
+/// 用户在界面上仍然把滑块拖到最左，模块写的是本机实测/保守下限
+/// （本机 ≈ 0.70A ⇒ 约 3W），而不是会让驱动反向满速的 `0`。
+///
+/// ⚠️ 想真正「停止充电」需要另一个节点（`smart_chg` 控制字），
+///    不在本函数职责内 —— 这里只保证**不把控制量交给会反转语义的值**。
 fn tighten_curr_ua(sample: &Sample, config: &Config, b: Bounds) -> i32 {
-    // ⚠️ `0` = 停止充电（与 `target_power_w` 的 0 相反，见字段文档）
+    // ⚠️ `0` = 降到本机最低（**不是**写 0 电流，见上）
     if config.tighten_power_w == 0 {
-        return 0;
+        return b.curr_floor;
     }
 
     let u_v = f64::from(sample.voltage_uv) / 1e6;
@@ -752,7 +845,9 @@ fn tighten_curr_ua(sample: &Sample, config: &Config, b: Bounds) -> i32 {
     let curr = (f64::from(config.tighten_power_w) / u_v) * 1e6;
     // `as i32` 前先钳到合法区间：f64 → i32 在越界时是**饱和**转换，
     // 但显式钳更清楚，也避免负数进入后续 `clamp_curr`
-    curr.clamp(0.0, f64::from(b.curr_max)) as i32
+    //
+    // ⚠️ 下界用 `curr_floor` 而不是 `0`：驱动对 0 的解释是"解除限制"。
+    curr.clamp(f64::from(b.curr_floor), f64::from(b.curr_max)) as i32
 }
 
 /// 硬保护 / 虚拟守卫的电流
@@ -826,16 +921,16 @@ fn ramp_target(sample: &Sample, temp: f32, config: &Config, b: Bounds, ceiling: 
     let hi_curr = b.curr_max.min(ceiling).max(lo_curr);
 
     if temp <= start {
-        return clamp_curr(hi_curr, b);
+        return clamp_ctrl(hi_curr, b);
     }
     if temp >= end || (end - start).abs() < f32::EPSILON {
-        return clamp_curr(lo_curr, b);
+        return clamp_ctrl(lo_curr, b);
     }
     let ratio = (temp - start) / (end - start);
     let hi = hi_curr as f32;
     let lo = lo_curr as f32;
     let v = hi - (hi - lo) * ratio;
-    clamp_curr(v as i32, b)
+    clamp_ctrl(v as i32, b)
 }
 
 // 🔴 2026-10-14 删除 `gear_for_temp()`

@@ -487,6 +487,46 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
         profile.capabilities.sources.current_max = ValueSource::Profile;
     }
 
+    // ---------- ⑤-b 电流下限（收紧路径的绝对下界） ----------
+    //
+    // # 为什么需要（2026-11-21 真机实测，K90 Pro Max）
+    //
+    // 向 `wired_chg_curr` 写 `0` 会被驱动解释成「**解除限制**」并回填满档
+    // （`18400000`），而不是「零电流」；写 `100000`/`300000` 则被钳到
+    // `742000`/`757000`。⇒ 收紧路径需要一个**真实的下界**，
+    // 否则用户在界面上设的「降到 0W」会变成**满速充电**。
+    //
+    // # 来源优先级（全部是设备自带，不写死机型数据 —— R3）
+    //
+    // | 级 | 来源 | 说明 |
+    // |---|---|---|
+    // | 1 | 官方 `SIC-BAT` 表末档 `curr_min` | 设备树直读，不需要插电，最可信 |
+    // | 2 | 档案现值 | 上一轮检测或人工写入 |
+    // | 3 | 物理护栏 `CURR_FLOOR_ABS_UA`（700 mA） | 由决策层兜底，**不落进档案** |
+    //
+    // 只写 1 和 2：第 3 级是安全护栏，写进档案会让它伪装成"本机实测值"。
+    {
+        let sic_min_ua = crate::sysfs::read_official_bands()
+            .into_iter()
+            .filter(|b| b.kind == "normal")
+            .max_by_key(|b| b.hi_c)
+            .and_then(|b| b.stages.last().copied())
+            .map(|t| t.curr_min_ma)
+            .filter(|ma| *ma > 0)
+            .and_then(|ma| i32::try_from(ma.saturating_mul(1000)).ok());
+        match sic_min_ua {
+            Some(ua) => {
+                profile.capabilities.current.min_ua = ua;
+                meta.notes.push(format!(
+                    "电流下限（官方 SIC-BAT）：{ua} μA —— 收紧时不会低于它"
+                ));
+            }
+            None => meta.notes.push(
+                "电流下限：未取到官方表 —— 按物理护栏 700 mA 兜底（不会写进档案）".to_string(),
+            ),
+        }
+    }
+
     // ---------- ⑥ 硬件保护温度 ----------
     //
     // # 可信来源：设备树属性 **或** sysfs 节点

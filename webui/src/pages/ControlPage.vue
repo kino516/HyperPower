@@ -476,7 +476,7 @@ const rampEndTemp = computed(() =>
 const POWER_STEP_W = 1;
 
 
-/** 温度超过收紧点后，把充电功率压到的值（W）；0 = 停止充电 */
+/** 温度超过收紧点后，把充电功率压到的值（W）；0 = 降到本机最低（无法真正停充） */
 const power = computed(
   () => pendingPower.value ?? thermal.value?.tighten_power_w ?? 0,
 );
@@ -504,7 +504,7 @@ const powerSliderMax = computed(() =>
  */
 const powerPresets = computed(() => {
   const list = [
-    { label: "停止充电", w: 0 },
+    { label: "降到最低", w: 0 },
     { label: "3 W", w: 3 },
     { label: "10 W", w: 10 },
     { label: "28 W", w: 28 },
@@ -526,7 +526,7 @@ const powerKeyPoints = computed(() => powerPresets.value.map((p) => p.w));
 const powerLabel = computed(() => {
   const v = power.value;
   if (v <= 0) {
-    return "停止充电";
+    return "降到最低";
   }
   if (powerSliderMax.value > 0 && v >= powerSliderMax.value) {
     return "不减速";
@@ -1730,7 +1730,7 @@ async function applySoc(): Promise<void> {
               type="footnote1"
               color="var(--m-color-on-surface-secondary)"
             >
-              温度超过收紧温度后，把充电功率压到这个值；选 0 就是停止充电
+              温度超过收紧温度后，把充电功率压到这个值；选 0 = 降到本机最低（硬件不支持真正停充，约 3W）
             </MiuixText>
           </div>
           <MiuixText type="title3" color="var(--m-color-primary)">
@@ -1768,7 +1768,7 @@ async function applySoc(): Promise<void> {
             type="footnote2"
             color="var(--m-color-on-surface-secondary)"
           >
-            停止充电
+            降到最低
           </MiuixText>
           <MiuixText
             type="footnote2"
