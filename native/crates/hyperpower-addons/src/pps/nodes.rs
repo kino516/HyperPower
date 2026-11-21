@@ -33,10 +33,12 @@
 ///    非法值（`2` / `abc`）被驱动明确拒绝。因此可以放心用回读校验，
 ///    不像 `charge_control_end_threshold` 那样会"表面成功实际被吞"。
 pub const PD_VERIFIED: &[&str] = &[
-    // qcom（K70 Pro 命中）
+    // qcom（K70 Pro / K90 Pro Max / 小米 17 Ultra 优先命中）
     "/sys/class/qcom-battery/pd_verifed",
     // mtk
     "/sys/class/Charging_Adapter/pd_adapter/usbpd_verifed",
+    // 小米 xm_power 封装层兜底（nezha 等新平台实测存在；需 vendor_sysfs_xm_power 写权限）
+    "/sys/class/xm_power/typec/strategy_pd_auth/verified",
 ];
 
 /// 当前充电协议类型（只读）
@@ -210,5 +212,56 @@ mod tests {
         let joined = PD_VERIFIED.join(" ");
         assert!(joined.contains("qcom-battery"), "缺 qcom 候选");
         assert!(joined.contains("Charging_Adapter"), "缺 mtk 候选");
+        assert!(
+            joined.contains("strategy_pd_auth/verified"),
+            "缺 xm_power 兜底候选"
+        );
+        assert_eq!(
+            PD_VERIFIED[0], "/sys/class/qcom-battery/pd_verifed",
+            "qcom-battery/pd_verifed 必须保持第一优先"
+        );
+    }
+
+    /// 内存假 IO，验证 PD_VERIFIED 优先级与 xm_power 兜底
+    struct MockIo {
+        writable: Vec<&'static str>,
+    }
+
+    impl crate::io::AddonIo for MockIo {
+        fn exists(&mut self, path: &str) -> bool {
+            self.writable.contains(&path)
+        }
+        fn writable(&mut self, path: &str) -> bool {
+            self.writable.contains(&path)
+        }
+        fn read(&mut self, _path: &str) -> Result<String, String> {
+            Ok("0".to_string())
+        }
+        fn write(&mut self, _path: &str, _value: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn 认证位优先命中qcom其次兜底xm_power() {
+        let mut both = MockIo {
+            writable: vec![
+                "/sys/class/qcom-battery/pd_verifed",
+                "/sys/class/xm_power/typec/strategy_pd_auth/verified",
+            ],
+        };
+        let n1 = Nodes::detect(&mut both).expect("应命中认证位");
+        assert_eq!(n1.pd_verified, "/sys/class/qcom-battery/pd_verifed");
+        assert_eq!(n1.platform, Platform::Qcom);
+
+        let mut fallback = MockIo {
+            writable: vec!["/sys/class/xm_power/typec/strategy_pd_auth/verified"],
+        };
+        let n2 = Nodes::detect(&mut fallback).expect("无 qcom 时应命中 xm_power 兜底");
+        assert_eq!(
+            n2.pd_verified,
+            "/sys/class/xm_power/typec/strategy_pd_auth/verified"
+        );
+        assert_eq!(n2.platform, Platform::Qcom);
     }
 }

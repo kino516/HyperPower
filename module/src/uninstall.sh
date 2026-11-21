@@ -361,24 +361,40 @@ fi
 #     表现为"插上又断开"（真机结论，见 docs/03）。
 # ============================================================
 
+# fake_soc 覆盖解除：必须写回驱动的「未覆盖哨兵」，绝不能写当前 capacity
+# （写 0..=100 会让电量图标被覆盖锁死直到重启）。
+#
+# 驱动哨兵按节点路径区分（真机反汇编实证）：
+#   - /sys/class/xm_power/fuelgauge/strategy_fg/fake_soc（小米 17 Ultra / nezha，
+#     mca_strategy_fg_comp.ko::strategy_fg_set_fake_soc 只接受 -1..=100，
+#     写旧高通哨兵 -22 会被静默丢弃）：哨兵为 -1
+#   - /sys/class/qcom-battery/fake_soc、/sys/class/power_supply/battery/fake_soc（旧高通）：
+#     哨兵为 -22
 FAKE_SOC_NODE=""
-for _n in /sys/class/qcom-battery/fake_soc /sys/class/power_supply/battery/fake_soc; do
+for _n in \
+  /sys/class/qcom-battery/fake_soc \
+  /sys/class/power_supply/battery/fake_soc \
+  /sys/class/xm_power/fuelgauge/strategy_fg/fake_soc; do
   [ -e "$_n" ] && { FAKE_SOC_NODE="$_n"; break; }
 done
 
 if [ -n "$FAKE_SOC_NODE" ]; then
-  # fake_soc 是"让系统显示值跟随真实 rsoc"的覆盖节点。
-  # 卸载时把它写成真实容量即可（写成 0 会让图标掉到 0%）。
-  _rsoc=""
-  for _n in /sys/class/qcom-battery/capacity /sys/class/power_supply/battery/capacity; do
-    [ -r "$_n" ] && { _rsoc=$(tr -d ' \t\r\n' < "$_n" 2>/dev/null); break; }
-  done
-  case "$_rsoc" in
-    ''|*[!0-9]*)
-      slog "⚠️ 读不到真实电量，跳过 fake_soc 还原（重启后驱动自行恢复）"
+  _cur=""
+  [ -r "$FAKE_SOC_NODE" ] && _cur=$(tr -d ' \t\r\n' < "$FAKE_SOC_NODE" 2>/dev/null)
+  case "$FAKE_SOC_NODE" in
+    */strategy_fg/fake_soc)
+      if [ "$_cur" != "-1" ]; then
+        write_node "$FAKE_SOC_NODE" "-1" "fake_soc（解除覆盖，写回哨兵 -1）"
+      fi
       ;;
     *)
-      write_node "$FAKE_SOC_NODE" "$_rsoc" "fake_soc（还原为真实电量）"
+      case "$_cur" in
+        ''|*[!0-9]*)
+          ;;
+        *)
+          write_node "$FAKE_SOC_NODE" "-22" "fake_soc（解除覆盖，写回哨兵 -22）"
+          ;;
+      esac
       ;;
   esac
 fi
@@ -392,7 +408,10 @@ done
 
 # PPS 认证位：仅未充电时还原
 PD_NODE=""
-for _n in /sys/class/qcom-battery/pd_verifed /sys/class/power_supply/battery/pd_verifed; do
+for _n in \
+  /sys/class/qcom-battery/pd_verifed \
+  /sys/class/power_supply/battery/pd_verifed \
+  /sys/class/xm_power/typec/strategy_pd_auth/verified; do
   [ -e "$_n" ] && { PD_NODE="$_n"; break; }
 done
 if [ -n "$PD_NODE" ]; then

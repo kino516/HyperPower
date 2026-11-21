@@ -338,7 +338,7 @@ fn status(ctx: &Ctx<'_>) -> Response {
 
     let battery = match &sample {
         Some(s) => json!({
-            "temp_c": (s.temp_dc as f64) / 10.0,
+            "temp_c": tenths_to_celsius(s.temp_dc),
             "soc": s.soc,
             // 🔴 **驱动口径的 SOC**（`fg1_rsoc` / `rsoc`），与 `soc` **不是同一个数**
             //
@@ -408,6 +408,8 @@ fn status(ctx: &Ctx<'_>) -> Response {
         "power_max_w": src.power_max_w,
         // 弱电源（电脑 USB 口等）—— 界面据此提示读数的局限
         "weak": src.weak,
+        // 是否为纯无线充电（wireless/online == 1 && usb/online != 1）
+        "wireless": src.wireless,
     });
 
     // ⚠️ 这里原有「系统场景」的读取与归一化（`nodes.scene` + `describe_scene`），
@@ -431,13 +433,13 @@ fn status(ctx: &Ctx<'_>) -> Response {
     //    两者物理位置不同、上限也不同，混在一起会让界面无法解释
     //    "为什么电池 34℃ 却显示 42℃"。
     //
-    // 读不到时为 `null`（机型无此节点 / 驱动未上报），前端需按可空处理。
+    // 读不到、ADC 关闭期返回 0 或超出合理区间时均为 `null`，前端按可空显示「—」。
     let cp_die = ctx
         .nodes
         .cp_die_temp
         .as_ref()
         .and_then(|n| n.read_i64().ok())
-        .map(tenths_to_celsius);
+        .and_then(crate::sysfs::cp_die_temp_to_c);
 
     // 机身温度（℃；`null` = 本机无此节点或读数不合理）
     //
@@ -2025,6 +2027,15 @@ mod tests {
             }
             other => panic!("status 应返回数据，实际：{other:?}"),
         }
+    }
+
+    /// `cp_master/tdie` 在 ADC 关闭期读到 `0` 时按未采集返回 `None`，正常读数 `295` 输出 `29.5`
+    #[test]
+    fn 电荷泵零值与越界读数映射为null() {
+        assert_eq!(crate::sysfs::cp_die_temp_to_c(0), None);
+        assert_eq!(crate::sysfs::cp_die_temp_to_c(-5), None);
+        assert_eq!(crate::sysfs::cp_die_temp_to_c(2000), None);
+        assert_eq!(crate::sysfs::cp_die_temp_to_c(295), Some(29.5));
     }
 
     // ────────────────────────────────────────────────────────────

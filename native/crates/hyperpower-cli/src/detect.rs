@@ -371,7 +371,9 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
     if profile.capabilities.gear.table.is_empty() {
         let mut picked = None;
         for p in sysfs::GEAR_MAX_CANDIDATES {
-            let Ok(raw) = fs::read(p) else { continue };
+            let Ok(raw) = fs::read(sysfs::rooted(p)) else {
+                continue;
+            };
             let Ok(s) = std::str::from_utf8(&raw) else {
                 continue;
             };
@@ -587,28 +589,13 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
         }
     }
 
-    // 取最大值（见上方说明）
-    //
-    // ⚠️ 不能直接用 `max_by_key`：**值相等时它返回最后一个**，会把
-    //    来源标成可信度最低的那个（实测踩过：100W 同时来自电池型号与
-    //    设备树时，来源被标成"设备树"）。
-    //
-    // 这里用"严格大于才替换"，使**相等时保留先出现的** ——
-    // 而数组顺序正是可信度降序（node > model > dt），因此相等时
-    // 自然取到可信度最高的来源。
-    let mut best: Option<(u16, ValueSource)> = None;
-    for (w, src) in [
-        (candidate_node, ValueSource::Node),
-        (candidate_model, ValueSource::BatteryModel),
-        (candidate_dt, ValueSource::Devicetree),
-    ] {
-        if let Some(w) = w {
-            if best.is_none_or(|(bw, _)| w > bw) {
-                best = Some((w, src));
-            }
-        }
-    }
-    let (nominal, power_source) = best.map_or((None, ValueSource::Unknown), |(w, s)| (Some(w), s));
+    // 按权威级别合并三来源（Node > BatteryModel > Devicetree）：
+    // - 可信层（`Node` / `BatteryModel`）之间取最大值（相等时 `Node` 优先），
+    //   避免插弱充电器把标称功率拉低，同时允许实测协商值高于标称值；
+    // - 设备树（`Devicetree`）仅在可信层全部缺失时作为兜底，
+    //   绝不能凭更大数值反超覆盖权威来源 `BatteryModel`（例如 nezha 电池型号
+    //   `P1_6800mah_90w` 为 90W，而设备树 `support_pps_100w=<3>` 仅代表公版 PPS 兼容开关）。
+    let (nominal, power_source) = pick_nominal_power(candidate_node, candidate_model, candidate_dt);
 
     match nominal {
         Some(w) => {
@@ -706,13 +693,19 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
     let derived = profile.capabilities.gear.max;
     let how = gear_max_origin.describe(derived);
     let probe_gear = opts.mode == ProbeMode::Full && opts.allow_write_probe;
+    let wireless_now = sysfs::PowerSource::read().wireless;
 
     // 档位上限**没能真正探到**（两个来源都没有）⇒ 必须让用户知道
     if !gear_max_origin.is_measured() {
         meta.notes.push(format!("档位上限：{how}"));
     }
 
-    if probe_gear && !charging_now {
+    if probe_gear && wireless_now {
+        log::info!("[8/10] 无线充电中 —— 跳过有线档位写探（请改插有线充电器后补测）");
+        meta.pending_items.push("gear_write_probe".to_string());
+        meta.notes
+            .push("档位写探：已跳过（无线充电中）—— 插有线充电器后补测".to_string());
+    } else if probe_gear && !charging_now {
         log::info!("[8/10] 未插充电器 —— 跳过档位写探（此状态下驱动不接受写入）");
         // 归 `pending_items`（待补测）而非 `failed_items`：
         // 这不是失败，插上充电器再勾一次就能测完。
@@ -731,6 +724,15 @@ pub fn run(opts: ProbeOptions) -> Result<DeviceProfile> {
                     meta.notes.push(format!(
                         "档位上限：探测值 {derived} 写不进去，已保守降为 {max} 档"
                     ));
+                } else {
+                    // 真实写通并回读确认后，将来源提升为 `ValueSource::Node`。
+                    //
+                    // 内核语义（`mca_charger_thermal.ko::handle_limit` 反汇编实证）：
+                    // `wired_thermal` 含 N 行（nezha 为 15 行）时，写 `0` 表示跳过热表不限流，
+                    // 写 `1..=15` 索引 `wired_thermal[level - 1]`（`15` 对应行 14 的 500 mA，
+                    // 是最紧有效档），写 `>= 16` 被驱动以 `thermal level invalid` 拒绝。
+                    // 写探真实写通 `derived` 说明 `gear.safe` 已获节点直证，硬保护可安全写档位。
+                    profile.capabilities.sources.gear_max = ValueSource::Node;
                 }
                 // 验证通过 ⇒ **不写**（用户要求：正常情况不占记录）
                 profile.capabilities.gear.max = max;
@@ -1068,6 +1070,39 @@ fn nominal_power_from_battery_model(model: &str) -> Option<u16> {
 /// `usb/voltage_now × usb/current_now` 是**输入侧瞬时值** ——
 /// 它表示"此刻从充电器取了多少"，受协议协商与负载影响，
 /// 比 `power_max` 波动大得多，不适合作为能力上限。
+/// 合并三个功率上限候选来源，返回 `(功率上限 W, 来源)`
+///
+/// 权威级别：`Node > BatteryModel > Devicetree`。
+///
+/// - **可信层**（`Node` 与 `BatteryModel`）：取最大值（相等时保留优先级更高的 `Node`），
+///   既避免弱充电器把机型标称功率拉低，又允许更高实测协商值生效；
+/// - **兜底层**（`Devicetree`）：仅当 `Node` 与 `BatteryModel` 都缺失时采用，
+///   严禁低可信设备树凭更大数值反超权威来源（如 nezha 电池型号 `P1_6800mah_90w` 为 90W，
+///   而设备树 `support_pps_100w = <3>` 仅代表公版 PPS 兼容开关）。
+fn pick_nominal_power(
+    node: Option<u16>,
+    model: Option<u16>,
+    dt: Option<u16>,
+) -> (Option<u16>, ValueSource) {
+    let mut trusted: Option<(u16, ValueSource)> = None;
+    for (w, src) in [
+        (node, ValueSource::Node),
+        (model, ValueSource::BatteryModel),
+    ] {
+        if let Some(w) = w {
+            if trusted.is_none_or(|(bw, _)| w > bw) {
+                trusted = Some((w, src));
+            }
+        }
+    }
+    if let Some((w, s)) = trusted {
+        return (Some(w), s);
+    }
+    dt.map_or((None, ValueSource::Unknown), |w| {
+        (Some(w), ValueSource::Devicetree)
+    })
+}
+
 fn read_power_max_node() -> Option<u16> {
     const CANDIDATES: &[&str] = &[
         "/sys/class/xm_power/charger/charger_common/power_max",
@@ -1077,7 +1112,7 @@ fn read_power_max_node() -> Option<u16> {
     let mut best: Option<u16> = None;
 
     for path in CANDIDATES {
-        let Ok(text) = fs::read_to_string(path) else {
+        let Ok(text) = fs::read_to_string(sysfs::rooted(path)) else {
             continue;
         };
         let Ok(v) = text.trim().parse::<i64>() else {
@@ -1102,28 +1137,40 @@ fn read_power_max_node() -> Option<u16> {
     best
 }
 
-/// 从设备树节点名解析功率（兜底来源）
+/// 从设备树解析标称功率（兜底来源，优先级低于协商节点与电池型号）
 ///
-/// # 依据
+/// # 优先级（2026-11-21 真机实证修正：小米 17 Ultra / nezha）
 ///
-/// 本机存在 `/sys/firmware/devicetree/base/soc/mca_strategy_buckchg_class/support_pps_100w`。
-/// 节点名末尾的 `100w` 就是**有线快充支持的最高档位功率**。
-/// 它的**值**是布尔（本机为 `3`），但**名字**携带了功率信息。
-///
-/// # 为什么只是兜底
-///
-/// 该约定不如电池型号可靠：
-///
-/// | 风险 | 说明 |
-/// |---|---|
-/// | 命名不统一 | 他机型可能叫 `support_pps` 或干脆没这个节点 |
-/// | 语义漂移 | `support_pps_100w` 可能指"支持 100W 协议"，未必是本机标称 |
-///
-/// 因此它是三个来源里优先级最低的一个。
+/// 1. **显式额定功率属性**（4 字节大端 `u32`，合理区间 `10..=300` W）：
+///    - `/sys/firmware/devicetree/base/soc/strategy-fg/adapt_power`（nezha 实测 `90`）
+///    - `/sys/firmware/devicetree/base/soc/mca_protocol_pd_class/max_power`（nezha 实测 `90`）
+/// 2. **协议兼容名兜底**（`/sys/firmware/devicetree/base/soc/mca_strategy_buckchg_class/support_*_<N>w`）：
+///    仅当上述显式节点均不存在时回退，且要求属性二进制内容非零（全零表示未启用）。
+///    注意：`support_pps_100w = <3>` 在部分机型仅表示公版 PPS 兼容开关，未必等于机身标称功率。
 fn nominal_power_from_devicetree() -> Option<u16> {
-    const DIR: &str = "/sys/firmware/devicetree/base/soc/mca_strategy_buckchg_class";
+    nominal_power_from_devicetree_at(&sysfs::rooted("/"))
+}
 
-    let entries = fs::read_dir(DIR).ok()?;
+fn nominal_power_from_devicetree_at(root: &std::path::Path) -> Option<u16> {
+    const RATED_PATHS: &[&str] = &[
+        "sys/firmware/devicetree/base/soc/strategy-fg/adapt_power",
+        "sys/firmware/devicetree/base/soc/mca_protocol_pd_class/max_power",
+    ];
+
+    for rel in RATED_PATHS {
+        let Ok(raw) = fs::read(root.join(rel)) else {
+            continue;
+        };
+        if raw.len() >= 4 {
+            let v = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            if (10..=300).contains(&v) {
+                return u16::try_from(v).ok();
+            }
+        }
+    }
+
+    const BUCKCHG_DIR: &str = "sys/firmware/devicetree/base/soc/mca_strategy_buckchg_class";
+    let entries = fs::read_dir(root.join(BUCKCHG_DIR)).ok()?;
     let mut found: Option<u16> = None;
 
     for e in entries.flatten() {
@@ -1145,6 +1192,13 @@ fn nominal_power_from_devicetree() -> Option<u16> {
             continue;
         };
         if !(5..=500).contains(&watts) {
+            continue;
+        }
+        // 要求属性二进制值非零（全零代表未开启该协议档位）
+        let Ok(raw) = fs::read(e.path()) else {
+            continue;
+        };
+        if raw.is_empty() || !raw.iter().any(|&b| b != 0) {
             continue;
         }
         // 取最大值（可能同时存在多个档位节点）
@@ -1416,27 +1470,85 @@ mod tests {
     //  ⇒ 取最大值才能在"插着电脑"时仍记录正确的机型能力
     // ────────────────────────────────────────────────────────────
 
-    /// 复刻 detect.rs 第 ⑦ 步的取最大值逻辑
-    ///
-    /// ⚠️ 与实现保持同一套语义：**值相等时保留先出现的**（即可信度最高的）。
+    /// 直接调用生产实现的 `pick_nominal_power`（避免测试与生产代码分叉）
     fn pick_power(
         node: Option<u16>,
         model: Option<u16>,
         dt: Option<u16>,
     ) -> (Option<u16>, ValueSource) {
-        let mut best: Option<(u16, ValueSource)> = None;
-        for (w, src) in [
-            (node, ValueSource::Node),
-            (model, ValueSource::BatteryModel),
-            (dt, ValueSource::Devicetree),
-        ] {
-            if let Some(w) = w {
-                if best.is_none_or(|(bw, _)| w > bw) {
-                    best = Some((w, src));
-                }
-            }
-        }
-        best.map_or((None, ValueSource::Unknown), |(w, s)| (Some(w), s))
+        pick_nominal_power(node, model, dt)
+    }
+
+    #[test]
+    fn nezha电池型号90w不被support_pps_100w反超覆盖() {
+        let model = nominal_power_from_battery_model("P1_6800mah_90w");
+        assert_eq!(model, Some(90));
+
+        // 构造只有 support_pps_100w = <3> 的设备树
+        let tmp =
+            std::env::temp_dir().join(format!("hyperpower_dt_nezha_model_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let dir = tmp.join("sys/firmware/devicetree/base/soc/mca_strategy_buckchg_class");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("support_pps_100w"), 3u32.to_be_bytes()).unwrap();
+
+        let dt = nominal_power_from_devicetree_at(&tmp);
+        assert_eq!(dt, Some(100), "无显式额定节点时回退非零 support_pps_100w");
+
+        let (w, src) = pick_nominal_power(None, model, dt);
+        assert_eq!(
+            w,
+            Some(90),
+            "低可信 Devicetree 100W 不得覆盖 BatteryModel 90W"
+        );
+        assert_eq!(src, ValueSource::BatteryModel);
+
+        // 对照：P11U_7560mah_100w 仍得 100W
+        let k90 = nominal_power_from_battery_model("P11U_7560mah_100w");
+        let (w_k90, src_k90) = pick_nominal_power(None, k90, dt);
+        assert_eq!(w_k90, Some(100));
+        assert_eq!(src_k90, ValueSource::BatteryModel);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn 设备树显式adapt_power优先于support_pps_100w且过滤零值() {
+        let tmp =
+            std::env::temp_dir().join(format!("hyperpower_dt_adapt_power_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+
+        let buck_dir = tmp.join("sys/firmware/devicetree/base/soc/mca_strategy_buckchg_class");
+        fs::create_dir_all(&buck_dir).unwrap();
+        // 二进制全零的 support_pps_100w 必须被忽略
+        fs::write(buck_dir.join("support_pps_100w"), 0u32.to_be_bytes()).unwrap();
+        assert_eq!(
+            nominal_power_from_devicetree_at(&tmp),
+            None,
+            "全零属性不得被当成有效功率"
+        );
+
+        // 同时存在 adapt_power=90 与非零 support_pps_100w=3 ⇒ 显式 adapt_power 90W 优先
+        fs::write(buck_dir.join("support_pps_100w"), 3u32.to_be_bytes()).unwrap();
+        let fg_dir = tmp.join("sys/firmware/devicetree/base/soc/strategy-fg");
+        fs::create_dir_all(&fg_dir).unwrap();
+        fs::write(fg_dir.join("adapt_power"), 90u32.to_be_bytes()).unwrap();
+
+        let dt = nominal_power_from_devicetree_at(&tmp);
+        assert_eq!(dt, Some(90), "adapt_power=90 应优先于 support_pps_100w=3");
+
+        let (w, src) = pick_nominal_power(None, None, dt);
+        assert_eq!(w, Some(90));
+        assert_eq!(src, ValueSource::Devicetree);
+
+        // 删除 adapt_power，写入 mca_protocol_pd_class/max_power=90 也应命中 90W
+        fs::remove_file(fg_dir.join("adapt_power")).unwrap();
+        let pd_dir = tmp.join("sys/firmware/devicetree/base/soc/mca_protocol_pd_class");
+        fs::create_dir_all(&pd_dir).unwrap();
+        fs::write(pd_dir.join("max_power"), 90u32.to_be_bytes()).unwrap();
+        assert_eq!(nominal_power_from_devicetree_at(&tmp), Some(90));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

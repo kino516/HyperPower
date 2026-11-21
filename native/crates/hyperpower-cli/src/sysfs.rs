@@ -179,6 +179,23 @@ pub fn board_temp_to_c(raw: i64) -> Option<f32> {
     (0.0..=120.0).contains(&c).then_some(c)
 }
 
+/// 把电荷泵芯片温度（`cp_master/tdie`，单位 `0.1℃`）转成摄氏度
+///
+/// # 为什么要过滤 `<= 0`（2026-11-21 真机实证：小米 17 Ultra / nezha）
+///
+/// 单颗电荷泵（`sc8581.ko`）在快充未开启 / ADC 关闭期（`REG_15=0`），
+/// 驱动返回字面值 **`0`**，并非"芯片结温 0℃"。直接展示会让前端
+/// （判据 `!== null`）误显 `0.0℃`。
+///
+/// 合理区间 `(0.0, 150.0]`℃（芯片 `die_temp_max` 通常为 125℃）：
+/// `<= 0` 或 `> 1500`（150.0℃）按未采集返回 `None`（JSON 为 `null`，前端显示「—」）。
+pub fn cp_die_temp_to_c(raw: i64) -> Option<f64> {
+    if raw <= 0 || raw > 1500 {
+        return None;
+    }
+    Some(crate::observability::round_json(raw as f64 / 10.0, 1))
+}
+
 // ⚠️ 这里原有 `ReadOnlyNode` 类型（一个"编译期无法写入"的只读节点句柄），
 //    已随「系统场景」一起删除（2026-10-17 用户要求）。
 //
@@ -578,6 +595,9 @@ pub const RSOC_CANDIDATES: &[&str] = &[
     "/sys/class/qcom-battery/fg1_rsoc",
     "/sys/class/power_supply/battery/fg1_rsoc",
     "/sys/class/power_supply/battery/rsoc",
+    // 小米 17 Ultra（nezha / SM8850）等新平台电量计真实 SOC（0~100 整数）；
+    // 绝不可误用 `strategy_fg/raw_soc`（0.01% 量纲 0~10000）。
+    "/sys/class/xm_power/fg_master/rsoc",
 ];
 
 /// SOC 上限控制节点候选（**路径因机型而异，必须探测**）
@@ -1262,7 +1282,8 @@ impl Nodes {
             release_curr_node(c, curr_max_ua, "第二路电流", &mut out);
         }
         if let Some(r) = &self.remove {
-            if let Err(e) = r.write_i64(0) {
+            // 值已是 0 时跳过写入，避免反复触发内核 `[mca_thermal] set wired thermal remove: 0`
+            if let Err(e) = write_if_different(r, 0) {
                 // 移除标记是"锦上添花"：档位已经放开，它写不进去不影响安全
                 out.warn(format!("移除限流标记失败（已跳过）：{e:#}"));
             }
@@ -1697,21 +1718,53 @@ impl OfficialTableError {
     }
 }
 
+/// 在 `decrypt.txt` 中查找第三方温控模块的充电温控节（如 `[ECLIPSE-CHARGE-BAT]`）
+///
+/// 仅匹配以 `-CHARGE-BAT` 结尾且含有效 `trig` 表的节；只用于 `probe --official`
+/// 只读诊断展示与冲突提醒，**绝不参与控制决策**。
+pub fn find_third_party_charge_rule(text: &str) -> Option<OfficialRule> {
+    for name in list_section_names(text) {
+        if name.ends_with("-CHARGE-BAT") {
+            if let Some(rule) = parse_official_rule(text, &name) {
+                return Some(rule);
+            }
+        }
+    }
+    None
+}
+
+/// 从 `decrypt.txt` 文本解析充电温控规则与可选 `SIC-BAT`（**纯函数，可离线测试**）
+///
+/// 返回 `(档位规则, SIC限流规则, 是否为第三方温控节名)`：
+/// - 优先匹配官方 `[MONITOR-BAT]`（第 3 项为 `false`）
+/// - 若缺失 `[MONITOR-BAT]` 但存在 `*-CHARGE-BAT`（如 `[ECLIPSE-CHARGE-BAT]`），
+///   识别之并标记第 3 项为 `true`，供诊断提示可能与 HyperPower 争写 `wired_ctrl_limit`
+pub fn parse_official_rules_text(
+    text: &str,
+) -> Result<(OfficialRule, OfficialRule, bool), OfficialTableError> {
+    let (monitor, third_party) = if let Some(rule) = parse_official_rule(text, "MONITOR-BAT") {
+        (rule, false)
+    } else if let Some(rule) = find_third_party_charge_rule(text) {
+        (rule, true)
+    } else {
+        return Err(OfficialTableError::NoSection {
+            want: "MONITOR-BAT",
+            total: list_section_names(text).len(),
+        });
+    };
+
+    // `SIC-BAT` 缺失时仍返回 —— 有些机型或第三方温控只有前者
+    let sic = parse_official_rule(text, "SIC-BAT").unwrap_or_default();
+    Ok((monitor, sic, third_party))
+}
+
 /// 读取官方温控策略表（**只读，零副作用**）
 ///
 /// 失败时返回**具体原因**（见 [`OfficialTableError`]）。
-pub fn read_official_rules() -> Result<(OfficialRule, OfficialRule), OfficialTableError> {
-    let text = std::fs::read_to_string(DECRYPT_TXT).map_err(|_| OfficialTableError::NoFile)?;
-
-    let monitor =
-        parse_official_rule(&text, "MONITOR-BAT").ok_or_else(|| OfficialTableError::NoSection {
-            want: "MONITOR-BAT",
-            total: list_section_names(&text).len(),
-        })?;
-
-    // `SIC-BAT` 缺失时仍返回 —— 有些机型只有前者
-    let sic = parse_official_rule(&text, "SIC-BAT").unwrap_or_default();
-    Ok((monitor, sic))
+pub fn read_official_rules() -> Result<(OfficialRule, OfficialRule, bool), OfficialTableError> {
+    let text =
+        std::fs::read_to_string(with_root(DECRYPT_TXT)).map_err(|_| OfficialTableError::NoFile)?;
+    parse_official_rules_text(&text)
 }
 
 /// 列出 `decrypt.txt` 里**全部**节名（纯字符串解析，可离线测试）
@@ -1998,6 +2051,11 @@ pub struct PowerSource {
     ///
     /// 界面据此提示"这个读数反映的是充电器能力，不是手机的"。
     pub weak: bool,
+    /// 当前是否处于**纯无线充电**（`wireless/online == 1` 且 `usb/online != 1`）
+    ///
+    /// 无线充电期间有线控速节点（`wired_ctrl_limit` / `wired_chg_curr`）不适用，
+    /// 引擎与检测据此前置旁路有线写入，避免误写与误熔断。
+    pub wireless: bool,
 }
 
 impl PowerSource {
@@ -2012,6 +2070,14 @@ impl PowerSource {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         };
+
+        // 无线充电判定：仅以 `wireless/online == 1` 且 `usb/online != 1` 为准。
+        // 注意：部分机型（如 nezha）离线时 `wireless/{voltage_now,current_now}` 会回显
+        // 电池数值，不能以电压/电流判无线；同时插有线时优先视为有线。
+        let wireless_online =
+            read_trim("/sys/class/power_supply/wireless/online").as_deref() == Some("1");
+        let usb_online = read_trim("/sys/class/power_supply/usb/online").as_deref() == Some("1");
+        let wireless = wireless_online && !usb_online;
 
         // USB 类型：标准接口 `usb/type`，部分机型只在 `qcom-battery` 扩展里
         // 提供同义节点（`USB_PD` / `USB` / `Unknown`…）。读不到就留 `None`。
@@ -2063,10 +2129,17 @@ impl PowerSource {
         //
         // 而"协议为空"也不够 —— 电脑 USB 口的 `real_type` 实测回报
         // `SDP`（Standard Downstream Port）而不是空。
+        // 无线充电时 USB 口本来离线，不算"弱 USB 电源"。
         const WEAK_PROTOCOLS: &[&str] = &["SDP", "CDP", "UNKNOWN", "NONE", "N/A", "-"];
-        let weak = match protocol.as_deref() {
-            Some(p) if !p.is_empty() => WEAK_PROTOCOLS.contains(&p.to_ascii_uppercase().as_str()),
-            _ => matches!(usb_type.as_deref(), Some("USB") | Some("Unknown") | None),
+        let weak = if wireless {
+            false
+        } else {
+            match protocol.as_deref() {
+                Some(p) if !p.is_empty() => {
+                    WEAK_PROTOCOLS.contains(&p.to_ascii_uppercase().as_str())
+                }
+                _ => matches!(usb_type.as_deref(), Some("USB") | Some("Unknown") | None),
+            }
         };
 
         Self {
@@ -2074,10 +2147,11 @@ impl PowerSource {
             protocol,
             power_max_w,
             weak,
+            wireless,
         }
     }
 
-    /// 供界面显示的**协议名**（协议优先，退回 USB 类型）
+    /// 供界面显示的**协议名**（协议优先，退回无线标记或 USB 类型）
     ///
     /// 两者都可能读不到（未插电、驱动未上报）⇒ 返回 `None`，
     /// 由调用方决定显示"未知"还是留空。
@@ -2085,6 +2159,7 @@ impl PowerSource {
         self.protocol
             .as_deref()
             .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"))
+            .or_else(|| self.wireless.then_some("Wireless"))
             .or(self.usb_type.as_deref())
     }
 }
@@ -2705,6 +2780,99 @@ algo_type\tmonitor
         let enoent =
             anyhow::Error::new(std::io::Error::from_raw_os_error(2)).context("打开（写）失败");
         assert!(!is_permission_error(&enoent), "ENOENT 不是权限问题");
+    }
+
+    /// 电荷泵 `cp_master/tdie == 0`（ADC 关闭期）或超范围读数必须返回 `None`
+    #[test]
+    fn 电荷泵温度零值与越界值过滤为none() {
+        assert_eq!(cp_die_temp_to_c(0), None, "ADC 关闭期字面 0 不得显示 0.0℃");
+        assert_eq!(cp_die_temp_to_c(-10), None, "负值视为异常读数");
+        assert_eq!(cp_die_temp_to_c(1501), None, "超出 150℃ 合理上限视为异常");
+        assert_eq!(cp_die_temp_to_c(295), Some(29.5), "nezha 实测 295 → 29.5℃");
+        assert_eq!(cp_die_temp_to_c(425), Some(42.5), "正常值按 0.1℃ 换算");
+        assert_eq!(cp_die_temp_to_c(1500), Some(150.0), "边界 150.0℃ 允许");
+    }
+
+    /// `RSOC_CANDIDATES` 末尾包含 `xm_power/fg_master/rsoc` 且绝不含 `raw_soc`（0.01% 量纲）
+    #[test]
+    fn rsoc候选含xm_power且不含raw_soc() {
+        assert_eq!(
+            RSOC_CANDIDATES.first().copied(),
+            Some("/sys/class/qcom-battery/fg1_rsoc"),
+            "qcom-battery 必须保持第一优先"
+        );
+        assert_eq!(
+            RSOC_CANDIDATES.last().copied(),
+            Some("/sys/class/xm_power/fg_master/rsoc"),
+            "末尾应追加 xm_power/fg_master/rsoc"
+        );
+        assert!(
+            !RSOC_CANDIDATES.iter().any(|p| p.contains("raw_soc")),
+            "绝不能误加 raw_soc（0~10000 量纲）"
+        );
+    }
+
+    /// 第三方温控模块（如 Eclipse 的 `[ECLIPSE-CHARGE-BAT]`）只读识别测试
+    #[test]
+    fn 官方温控表解析支持第三方charge_bat节名() {
+        // 标准官方表：命中 MONITOR-BAT，third_party == false
+        let official = parse_official_rules_text(REAL_DECRYPT);
+        assert!(official.is_ok());
+        if let Ok((rule, _sic, third_party)) = official {
+            assert_eq!(rule.name, "MONITOR-BAT");
+            assert!(!third_party);
+        }
+
+        // 真机 Eclipse v6.2（nezha）decrypt.txt 片段：无 MONITOR-BAT，有 ECLIPSE-CHARGE-BAT
+        const ECLIPSE_DECRYPT: &str = "\
+[NORMAL-MONITOR-WIRELESS]
+algo_type\tmonitor
+trig\t35000
+
+[ECLIPSE-CHARGE-BAT]
+algo_type\tmonitor
+sensor\tVIRTUAL-SENSOR-FORMULA
+device\tbattery
+polling\t2000
+trig\t37000\t40000\t41000\t42000\t43000\t44000\t45000\t46000\t47000
+clr\t35000\t39000\t40000\t41000\t42000\t43000\t44000\t45000\t46000
+target\t100\t201\t301\t402\t502\t703\t805\t1006\t1208
+";
+        let third = parse_official_rules_text(ECLIPSE_DECRYPT);
+        assert!(third.is_ok(), "应识别 [ECLIPSE-CHARGE-BAT]");
+        if let Ok((rule, sic, third_party)) = third {
+            assert!(third_party, "应标为第三方温控节");
+            assert_eq!(rule.name, "ECLIPSE-CHARGE-BAT");
+            assert_eq!(rule.trig.len(), 9);
+            assert_eq!(rule.target[0] / 100, 1);
+            assert_eq!(rule.target[8] / 100, 12);
+            assert!(!sic.is_usable());
+        }
+
+        // 既无 MONITOR-BAT 也无 *-CHARGE-BAT → 仍返回 NoSection
+        let none = parse_official_rules_text("[VIDEO-MONITOR-BAT]\ntrig\t40000\n");
+        assert!(matches!(none, Err(OfficialTableError::NoSection { .. })));
+    }
+
+    #[test]
+    fn 供电来源无线标记标签正确() {
+        let s = PowerSource {
+            usb_type: Some("Unknown".to_string()),
+            protocol: Some("Unknown".to_string()),
+            power_max_w: None,
+            weak: false,
+            wireless: true,
+        };
+        assert_eq!(s.label(), Some("Wireless"));
+
+        let wired = PowerSource {
+            usb_type: Some("USB_PD".to_string()),
+            protocol: Some("PD_PPS".to_string()),
+            power_max_w: Some(90),
+            weak: false,
+            wireless: false,
+        };
+        assert_eq!(wired.label(), Some("PD_PPS"));
     }
 
     // ────────────────────────────────────────────────────────────

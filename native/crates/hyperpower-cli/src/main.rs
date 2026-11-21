@@ -33,7 +33,7 @@
 // 此时 `worker` / `supervisor` / `server` 被 cfg 掉，它们用到的路径常量、
 // 事件类型等自然成为"未使用"。在非 Unix 上放行死代码告警，
 // 而在 Unix（含 CI 与设备）上仍保持**严格零告警**。
-#![cfg_attr(not(unix), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 
 mod addon_host;
 mod cli;
@@ -50,18 +50,18 @@ mod night;
 mod observability;
 mod paths;
 mod profile_io;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod server;
 /// ⚠️ **不要**给这个模块加 `#[cfg(unix)]`
 ///
-/// 它是纯逻辑，且带测试。worker 本身是 `#[cfg(unix)]` 的，
-/// 若把它塞回 worker，**测试在 Windows 上永远不跑**（2026-10-17 踩到）。
+/// 它是纯逻辑，且带测试。worker 本身是 `#[cfg(any(target_os = "linux", target_os = "android"))]` 的，
+/// 若把它塞回 worker，**测试在 Windows / macOS 上永远不跑**（2026-10-17 踩到）。
 /// 详见模块文档。
 mod sleep_events;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod supervisor;
 mod sysfs;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod worker;
 
 use anyhow::Result;

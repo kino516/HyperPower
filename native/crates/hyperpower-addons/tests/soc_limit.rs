@@ -2455,3 +2455,98 @@ fn 充入进度跨重启保持() {
         "重启后必须从状态文件恢复已充入的电量"
     );
 }
+
+// ============================================================
+//  新平台 xm_power 电量计与 fake_soc 哨兵（小米 17 Ultra / nezha）
+// ============================================================
+
+const XM_RSOC: &str = "/sys/class/xm_power/fg_master/rsoc";
+const XM_FAKE_SOC: &str = "/sys/class/xm_power/fuelgauge/strategy_fg/fake_soc";
+
+/// 模拟 nezha 节点树：无 `qcom-battery/{fg1_rsoc,fake_soc}`，
+/// 走 `xm_power/fg_master/rsoc`（0~100 整数）与 `strategy_fg/fake_soc`（原值 `-1`）。
+fn nezha_with_display(capacity: u8, rsoc: u8, fake_soc: &str) -> FakeIo {
+    let mut io = FakeIo::hyperos();
+    io.files.insert(CAPACITY.to_string(), capacity.to_string());
+    io.files.insert(XM_RSOC.to_string(), rsoc.to_string());
+    io.files
+        .insert(XM_FAKE_SOC.to_string(), fake_soc.to_string());
+    io.writable.push(XM_FAKE_SOC.to_string());
+    io
+}
+
+#[test]
+fn nezha_xm_power路径命中并按原值负一还原() {
+    let mut io = nezha_with_display(52, 50, "-1");
+    let mut addon = probed(enabled_config(90), &mut io);
+
+    // 启用同步：应把 strategy_fg/fake_soc 写成 rsoc=50
+    let _ = addon.tick(&mut io, 100);
+    let status = addon.status();
+    assert_eq!(status.detail["sync_supported"], true);
+    assert_eq!(status.detail["sync_engaged"], true);
+    assert_eq!(status.detail["node_fake_soc"], XM_FAKE_SOC);
+    assert_eq!(
+        io.files.get(XM_FAKE_SOC).map(String::as_str),
+        Some("50"),
+        "应把 xm_power strategy_fg/fake_soc 同步成 fg_master/rsoc(50)"
+    );
+
+    // release 必须写回原值 `-1`，绝不能写成旧高通的 `-22`
+    let _ = addon.release(&mut io);
+    assert_eq!(
+        io.files.get(XM_FAKE_SOC).map(String::as_str),
+        Some("-1"),
+        "nezha strategy_fg/fake_soc 解除覆盖必须写回 -1（驱动拒绝 -22）"
+    );
+    assert!(
+        !io.write_log.iter().any(|(_, v)| v == "-22"),
+        "nezha 路径下绝不能写入 -22"
+    );
+}
+
+#[test]
+fn nezha_重启前已覆盖的fake_soc仍回退到负一哨兵() {
+    // 模拟上次 worker 异常退出时 strategy_fg/fake_soc 停在覆盖值 `50`（非 `-1`）
+    let mut io = nezha_with_display(50, 51, "50");
+    let mut addon = probed(enabled_config(90), &mut io);
+
+    let _ = addon.tick(&mut io, 100);
+    assert_eq!(io.files.get(XM_FAKE_SOC).map(String::as_str), Some("51"));
+
+    // 关闭或释放时不得把"50"当原值写回锁死图标，必须按路径回退写回 `-1`
+    let _ = addon.release(&mut io);
+    assert_eq!(
+        io.files.get(XM_FAKE_SOC).map(String::as_str),
+        Some("-1"),
+        "原值已是覆盖态 0..=100 时，strategy_fg/fake_soc 应回退写回 -1"
+    );
+}
+
+#[test]
+fn 旧qcom_battery路径与负二十二仍优先于xm_power() {
+    // 两条路径同时存在时，既有 qcom-battery 必须保持第一优先（保护 K90PM / K70Pro）
+    let mut io = FakeIo::hyperos_with_display(95, 82, "-22");
+    io.files.insert(XM_RSOC.to_string(), "50".to_string());
+    io.files.insert(XM_FAKE_SOC.to_string(), "-1".to_string());
+    io.writable.push(XM_FAKE_SOC.to_string());
+
+    let mut addon = probed(enabled_config(90), &mut io);
+    let _ = addon.tick(&mut io, 100);
+
+    let status = addon.status();
+    assert_eq!(status.detail["node_fake_soc"], FAKE_SOC);
+    assert_eq!(io.files.get(FAKE_SOC).map(String::as_str), Some("82"));
+    assert_eq!(
+        io.files.get(XM_FAKE_SOC).map(String::as_str),
+        Some("-1"),
+        "命中 qcom-battery 后不应触碰 xm_power 节点"
+    );
+
+    let _ = addon.release(&mut io);
+    assert_eq!(
+        io.files.get(FAKE_SOC).map(String::as_str),
+        Some("-22"),
+        "旧高通路径仍必须写回 -22"
+    );
+}
