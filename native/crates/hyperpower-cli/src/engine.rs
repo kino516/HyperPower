@@ -173,6 +173,15 @@ pub struct Engine {
     /// 每拍重试会刷爆事件流并反复写节点（真机事故：档位 `==` 判定导致
     /// 整场充电失去温控）。**一个充电会话内只交回一次**是对的语义。
     pub released: bool,
+    /// 是否已在当前「官方模式」下完成过一次交回官方的释放（R12）
+    ///
+    /// `Mode::Official` 每拍决策都会返回 `Decision::release(Reason::Official)`。
+    /// 若每拍都重复调 `apply()`，不仅每 3 秒重复写 `wired_thermal_remove = 0`（内核 dmesg 刷屏），
+    /// 还会反复清空并重写 `learned_curr_max`（logcat 每 3 秒刷屏「交回官方后读回电流基准」）。
+    ///
+    /// ⇒ 切入 `Official` 后仅执行**一次**释放，后续拍完全放手；一旦切走非官方模式，
+    ///   自动复位此标记，下次切回 `Official` 时会再次执行一次释放。
+    pub official_released: bool,
     /// **学到的电流能力上限**（μA）——由"写探"得来
     ///
     /// # 为什么需要它（2026-10-20 真机实测）
@@ -360,6 +369,7 @@ impl Engine {
             read_failures: 0,
             write_failures: 0,
             released: false,
+            official_released: false,
             // `None` = 还没探测过 ⇒ 第一次温度正常时会写探一次
             learned_curr_max: None,
             curr_opened: false,
@@ -712,6 +722,11 @@ impl Engine {
         }
         self.soc_hold_active = soc_hold;
 
+        // 若已离开官方模式，清除「官方模式已释放」标记，确保下次再切回官方时能再释放一次（R12）。
+        if decision.reason != Reason::Official {
+            self.official_released = false;
+        }
+
         // 🔴 安全路径**永不受 `released` 限制**（2026-11-01 审计 H-01）
         //
         // `released` 的语义是「常规控制已交回官方，别再用控制律干预」。
@@ -719,13 +734,16 @@ impl Engine {
         // 温度已到硬件上限，必须把电流压到最小。若被 `released` 挡住，
         // 一次历史上发生过的写失败就会让整个进程**永久失去过热保护**
         // （硬保护 `should_write: true, release: false`，正好被旧判据吞掉）。
+        let official_done = decision.reason == Reason::Official && self.official_released;
         let safety_path = matches!(decision.reason, Reason::HardProtect | Reason::VirtGuard);
-        if decision.should_write && (safety_path || !self.released) {
+        if decision.should_write && !official_done && (safety_path || !self.released) {
             let (wrote, verified, err) = self.apply(&sample, &decision);
             rep.wrote = wrote;
             rep.verified = verified;
             if let Some(e) = err {
                 rep.errors.push(e);
+            } else if decision.reason == Reason::Official {
+                self.official_released = true;
             }
         }
 
@@ -1285,6 +1303,9 @@ impl Engine {
     fn apply(&mut self, sample: &Sample, decision: &Decision) -> (bool, bool, Option<String>) {
         let prev = (self.state.gear, self.state.curr_ua);
         let _ = sample;
+        // 本拍若刻意跳过写档位（如硬保护下 `!gear_safe_verified()` 只压电流），
+        // 回读阶段不得拿未写的档位节点断言 `actual >= decision.gear`。
+        let mut skip_gear_verify = false;
 
         let result = if decision.release {
             self.curr_opened = false;
@@ -1315,6 +1336,9 @@ impl Engine {
                 self.nodes
                     .apply_hard_protect(decision.gear, decision.curr_ua)
             } else {
+                // 未写档位时必须跳过本拍的档位回读校验，避免把保持原值的 `0`
+                // 误判成「期望 ≥15、实得 0」，连续 5 拍后误触发熔断（2026-11-21 真机实证）。
+                skip_gear_verify = true;
                 self.nodes.apply_hard_protect_current(decision.curr_ua)
             };
             // 硬保护只有 `Result<()>`：写入失败必须显式失败（安全路径）
@@ -1509,8 +1533,15 @@ impl Engine {
         //    官方 `MONITOR-BAT` 会把档位竞争写成更严的值（3/7/11/14），
         //    用 `==` 会把这种常态覆盖误判成写入失败 ⇒ 连续 5 拍
         //    `release_now` ⇒ 整场充电交回官方（真机事故）。
-        let read_back = self.nodes.ctrl.as_ref().and_then(|n| n.read_i64().ok());
-        let verified = read_back.is_none_or(|v| gear_verified(v, decision.gear));
+        // ⚠️ 若本拍因 `!gear_safe_verified()` 刻意跳过写档位（`skip_gear_verify == true`），
+        //    不得拿原样未动的档位节点断言 `>= decision.gear`，否则 5 拍必误熔断。
+        let (read_back, verified) = if skip_gear_verify {
+            (None, true)
+        } else {
+            let rb = self.nodes.ctrl.as_ref().and_then(|n| n.read_i64().ok());
+            let ok = rb.is_none_or(|v| gear_verified(v, decision.gear));
+            (rb, ok)
+        };
 
         if verified {
             self.write_failures = 0;
@@ -1855,6 +1886,9 @@ impl Engine {
                 Pending::SwitchMode(id) => match self.cfg.switch_mode(&id) {
                     Ok((from, to)) => {
                         config_dirty = true;
+                        if from != to {
+                            self.official_released = false;
+                        }
                         // ⚠️ 消息里用**中文模式名**，不能用 id
                         //
                         // 用户看到的原先是「模式切换：custom → conservative」——
@@ -4415,6 +4449,187 @@ mod tests {
                 "custom",
                 "重启后离开窗口仍应恢复进入前的模式"
             );
+        });
+    }
+
+    // ============================================================
+    //  小米 17 Ultra（nezha）适配与上游缺陷回归测试
+    // ============================================================
+
+    /// 🔴 **2026-11-21 真机熔断回归**：`sources.gear_max == Devicetree` 时触发
+    /// `HardProtect` 与 `VirtGuard`，只压电流不写档位，**绝不报档位回读失败、绝不熔断**。
+    #[test]
+    fn 端到端_设备树档位来源硬保护与虚拟守卫不误熔断() {
+        const CTRL: &str = "sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit";
+        const CURR: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+
+        // (a) HardProtect：电池 45.0℃ 连续 8 拍（远超 5 拍熔断阈值）
+        let fake_hp = FakeSysfs::new("nezha_hp_dt_no_trip");
+        fake_hp.write("sys/class/power_supply/battery/temp", "450");
+        with_fake_root(&fake_hp.root, || {
+            let mut engine = engine_on(&fake_hp);
+            engine.profile.profile.capabilities.sources.gear_max =
+                hyperpower_ipc::device::ValueSource::Devicetree;
+
+            for i in 0..8 {
+                let rep = engine.step(1000 + i);
+                assert!(rep.wrote, "第 {i} 拍硬保护应写电流");
+                assert!(
+                    rep.verified,
+                    "第 {i} 拍跳过写档位时不得报档位回读失败（旧实现每拍失败，5 拍必熔断）"
+                );
+                assert!(rep.errors.is_empty(), "第 {i} 拍不应报错：{:?}", rep.errors);
+                assert_eq!(engine.write_failures, 0, "第 {i} 拍不应累计写失败");
+                assert!(!engine.released, "第 {i} 拍不得误触发交回官方熔断");
+            }
+            assert_eq!(
+                fake_hp.read(CTRL),
+                "0",
+                "未验证档位时档位节点必须保持原值 0"
+            );
+            assert_eq!(
+                fake_hp.read(CURR),
+                "750000",
+                "硬保护必须照常把电流压到安全值"
+            );
+
+            let events = std::fs::read_to_string(fake_hp.path("events.jsonl")).unwrap_or_default();
+            assert!(
+                !events.contains("写入后档位比目标更松"),
+                "事件流不得出现档位回读误判：\n{events}"
+            );
+        });
+
+        // (b) VirtGuard：机身温度达 virt_hard（默认 42℃），电池 38℃（< 45℃），连续 8 拍
+        let fake_vg = FakeSysfs::new("nezha_vg_dt_no_trip");
+        fake_vg.write("sys/class/power_supply/battery/temp", "380");
+        fake_vg.write("sys/class/xm_power/charger/smart_charge/board_temp", "430");
+        with_fake_root(&fake_vg.root, || {
+            let mut engine = engine_on(&fake_vg);
+            engine.profile.profile.capabilities.sources.gear_max =
+                hyperpower_ipc::device::ValueSource::Devicetree;
+            engine.cfg.set("thermal.virt_guard", "true").unwrap();
+            engine.cfg.set("thermal.virt_hard", "42").unwrap();
+
+            for i in 0..8 {
+                let rep = engine.step(2000 + i);
+                assert_eq!(rep.reason, Some(Reason::VirtGuard));
+                assert!(rep.wrote, "第 {i} 拍虚拟守卫应写电流");
+                assert!(rep.verified, "第 {i} 拍虚拟守卫不应报档位回读失败");
+                assert_eq!(engine.write_failures, 0);
+                assert!(!engine.released, "第 {i} 拍虚拟守卫不得误熔断");
+            }
+            assert_eq!(fake_vg.read(CTRL), "0", "未验证档位时档位保持 0");
+            assert_eq!(fake_vg.read(CURR), "750000", "虚拟守卫电流仍收紧到安全值");
+        });
+    }
+
+    /// 对照：`sources.gear_max == Node`（经节点直读或完整模式写探确认）时，
+    /// 硬保护写最紧档 15 + 安全电流，且正常回读校验；同时验证 `detect::run` 完整写探
+    /// 真实写通上限档位后会把 `sources.gear_max` 提升为 `ValueSource::Node`。
+    #[test]
+    fn 端到端_节点验证档位来源硬保护写最紧档且完整写探提升来源() {
+        const CTRL: &str = "sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit";
+        const CURR: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+
+        let fake = FakeSysfs::new("nezha_hp_node_verified");
+        fake.write("sys/class/power_supply/battery/temp", "450");
+        with_fake_root(&fake.root, || {
+            // ① 完整模式 + 写探确认：15 档表真实写通 15 后，sources.gear_max 应提升为 Node
+            let probed = crate::detect::run(crate::detect::ProbeOptions {
+                mode: crate::detect::ProbeMode::Full,
+                allow_write_probe: true,
+            })
+            .expect("完整模式假节点检测应成功");
+            assert_eq!(probed.capabilities.gear.max, 15);
+            assert_eq!(probed.capabilities.gear.safe, 15);
+            assert_eq!(
+                probed.capabilities.sources.gear_max,
+                hyperpower_ipc::device::ValueSource::Node,
+                "完整写探真实写通上限档位后，sources.gear_max 应提升为 Node"
+            );
+            assert_eq!(fake.read(CTRL), "0", "写探结束后必须恢复原档位 0");
+
+            // ② 使用 Node 来源跑硬保护：应写最紧档 15 与安全电流，且回读校验通过
+            let mut engine = engine_on(&fake);
+            engine.profile.profile.capabilities.sources.gear_max =
+                probed.capabilities.sources.gear_max;
+
+            for i in 0..6 {
+                let rep = engine.step(1000 + i);
+                assert!(rep.wrote);
+                assert!(rep.verified, "Node 来源写 15 后回读应通过");
+                assert_eq!(engine.write_failures, 0);
+                assert!(!engine.released);
+            }
+            assert_eq!(fake.read(CTRL), "15", "Node 来源硬保护应写最紧档 15");
+            assert_eq!(fake.read(CURR), "750000");
+        });
+    }
+
+    /// 🔴 **官方模式去抖回归**：切入 `official` 仅释放一次，后续拍不再重复写节点；
+    /// 切走非官方模式再切回 `official` 时再次释放一次。
+    #[test]
+    fn 端到端_官方模式连续五拍只释放一次切回后再释放一次() {
+        const CTRL: &str = "sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit";
+        const CURR: &str = "sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+        const REMOVE: &str = "sys/class/xm_power/charger/charger_thermal/wired_thermal_remove";
+
+        let fake = FakeSysfs::new("official_once");
+        // 先制造"此前模块收紧过"的现场
+        fake.write(CTRL, "10");
+        fake.write(CURR, "1000000");
+        fake.write(REMOVE, "1");
+
+        with_fake_root(&fake.root, || {
+            let mut engine = engine_on(&fake);
+            engine.cfg.switch_mode("official").unwrap();
+
+            // 第 1 拍：执行一次释放（R12），归零档位与 remove、放开电流
+            let rep0 = engine.step(1000);
+            assert_eq!(rep0.reason, Some(Reason::Official));
+            assert!(rep0.wrote, "切入官方模式首拍必须执行一次释放");
+            assert!(engine.official_released);
+            assert_eq!(fake.read(CTRL), "0");
+            assert_eq!(fake.read(REMOVE), "0");
+            assert_ne!(fake.read(CURR), "1000000");
+
+            // 模拟系统官方温控接管并改写档位为 7，验证后续 4 拍模块完全不碰节点
+            fake.write(CTRL, "7");
+            for i in 1..5 {
+                let rep = engine.step(1000 + i);
+                assert_eq!(rep.reason, Some(Reason::Official));
+                assert!(!rep.wrote, "官方模式第 {i} 拍不得重复释放写节点");
+                assert_eq!(
+                    fake.read(CTRL),
+                    "7",
+                    "官方模式后续拍不得覆盖系统官方温控写入的档位"
+                );
+            }
+
+            // 切到非官方模式（custom）并跑一拍：应复位 official_released
+            engine.cfg.switch_mode("custom").unwrap();
+            let _ = engine.step(1010);
+            assert!(
+                !engine.official_released,
+                "切出官方模式后必须清除已释放标记"
+            );
+
+            // 模拟非官方期间收紧过，再切回 official：必须再执行一次释放
+            fake.write(CTRL, "9");
+            fake.write(CURR, "1000000");
+            engine.cfg.switch_mode("official").unwrap();
+
+            let rep_back = engine.step(1020);
+            assert_eq!(rep_back.reason, Some(Reason::Official));
+            assert!(rep_back.wrote, "切回官方模式首拍必须再次执行一次释放");
+            assert!(engine.official_released);
+            assert_eq!(fake.read(CTRL), "0", "切回官方模式应再次放开档位");
+            assert_ne!(fake.read(CURR), "1000000", "切回官方模式应再次放开电流");
+
+            // 下一拍再次静默
+            let rep_idle = engine.step(1021);
+            assert!(!rep_idle.wrote, "再次释放后的下一拍不得重复写入");
         });
     }
 }

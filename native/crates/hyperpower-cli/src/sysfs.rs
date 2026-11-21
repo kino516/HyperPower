@@ -1265,7 +1265,8 @@ impl Nodes {
             release_curr_node(c, curr_max_ua, "第二路电流", &mut out);
         }
         if let Some(r) = &self.remove {
-            if let Err(e) = r.write_i64(0) {
+            // 值已是 0 时跳过写入，避免反复触发内核 `[mca_thermal] set wired thermal remove: 0`
+            if let Err(e) = write_if_different(r, 0) {
                 // 移除标记是"锦上添花"：档位已经放开，它写不进去不影响安全
                 out.warn(format!("移除限流标记失败（已跳过）：{e:#}"));
             }
