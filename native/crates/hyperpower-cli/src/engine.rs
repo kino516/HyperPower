@@ -140,8 +140,8 @@ pub struct Engine {
     /// 见 [`crate::history`] 模块文档：它与 `device.json` 完全无关，
     /// 只是把每次充电的过程曲线归档供界面展示。
     pub history: crate::history::HistoryStore,
-    /// 控制通道（Unix 下才有）
-    #[cfg(unix)]
+    /// 控制通道（Linux / Android 下才有）
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub server: Option<crate::server::ControlServer>,
     /// 本次运行的起始时刻（单调秒）
     pub started_at_s: i64,
@@ -353,7 +353,7 @@ impl Engine {
             events: init.events,
             snapshot: init.snapshot,
             history,
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             server: None,
             started_at_s: init.now_s,
             ticks: 0,
@@ -1174,7 +1174,7 @@ impl Engine {
     ///
     /// ⚠️ 消费过慢的客户端由 [`crate::server::ControlServer`] 按背压策略断开，
     /// **绝不阻塞控制循环**。
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn publish_events(&mut self) {
         let events = self.events.drain_recent();
         if events.is_empty() {
@@ -1187,9 +1187,9 @@ impl Engine {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub fn publish_events(&mut self) {
-        // 非 Unix 平台没有控制通道，直接丢弃（仍会落盘）
+        // 非 Linux / Android 平台没有控制通道，直接丢弃（仍会落盘）
         let _ = self.events.drain_recent();
     }
 
@@ -1770,7 +1770,7 @@ impl Engine {
     }
 
     /// ① 控制通道轮询（返回处理的命令数）
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn poll_server(&mut self, now_s: i64) -> usize {
         // 借用拆分：先把 server 取出来，让 handler 可以借用 self 的其余字段
         let mut server = match self.server.take() {
@@ -1808,7 +1808,7 @@ impl Engine {
         handled
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn poll_server(&mut self, _now_s: i64) -> usize {
         0
     }

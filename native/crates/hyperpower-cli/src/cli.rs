@@ -235,19 +235,19 @@ pub enum DeviceAction {
 
 /// `hyperpower supervisor`
 pub fn run_supervisor() -> Result<()> {
-    #[cfg(not(unix))]
-    anyhow::bail!("supervisor 仅在 Unix 平台（Android / Linux）可用");
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    anyhow::bail!("supervisor 仅在 Android / Linux 平台可用");
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     crate::supervisor::run()
 }
 
 /// `hyperpower worker`
 pub fn run_worker() -> Result<()> {
-    #[cfg(not(unix))]
-    anyhow::bail!("worker 仅在 Unix 平台（Android / Linux）可用");
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    anyhow::bail!("worker 仅在 Android / Linux 平台可用");
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     crate::worker::run()
 }
 
@@ -534,7 +534,7 @@ impl Check {
 /// | 僵尸进程（`[hyperpower]`） | `cmdline` 为空，直接跳过；且状态为 `Z` 也跳过 |
 /// | 普通的 `grep hyperpower` | `cmdline` 里没有角色名 |
 /// | 本命令自己 | 自己是 `hyperpower verify`，不含 `worker`/`supervisor` |
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn find_hyperpower_process(role: &str) -> Option<i32> {
     let entries = std::fs::read_dir("/proc").ok()?;
 
@@ -632,7 +632,7 @@ pub fn run_verify(json: bool) -> Result<()> {
     //
     // ⇒ 判据改为**直接扫 `/proc`**（进程存在即事实，不受文件清理影响）。
     //    pidfile 仍会被读取，但**只作为补充信息**，不作为判据。
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let worker_pid = find_hyperpower_process("worker");
         let supervisor_pid = find_hyperpower_process("supervisor");
@@ -686,7 +686,7 @@ pub fn run_verify(json: bool) -> Result<()> {
             _ => {}
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     checks.push(Check::warn(
         "进程",
         "本平台不支持（仅 Android / Linux）".to_string(),

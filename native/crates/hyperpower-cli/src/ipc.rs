@@ -42,7 +42,7 @@ pub fn send(command: &str, args: &[String], plain: bool, pretty: bool) -> Result
 /// socket 不存在。详见 [`crate::supervisor::ensure_running`]。
 ///
 /// 自愈只**拉起进程**，不写任何充电节点（R1）；拉起后仍由 worker 决策。
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn connect_client() -> Result<std::os::unix::net::UnixStream> {
     use std::os::unix::net::UnixStream;
 
@@ -67,10 +67,10 @@ fn connect_client() -> Result<std::os::unix::net::UnixStream> {
 
 /// 订阅事件流（长连接）
 pub fn watch() -> Result<()> {
-    #[cfg(not(unix))]
-    anyhow::bail!("watch 仅在 Unix 平台（Android / Linux）可用");
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    anyhow::bail!("watch 仅在 Android / Linux 平台可用");
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use std::io::{BufRead, BufReader, Write};
 
@@ -110,7 +110,7 @@ pub fn watch() -> Result<()> {
 }
 
 /// 一次往返：发请求、读一行响应
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn roundtrip(command: &str, args: &[String], want_stream: bool) -> Result<String> {
     use std::io::{BufReader, Read, Write};
     use std::time::{Duration, Instant};
@@ -191,9 +191,9 @@ fn roundtrip(command: &str, args: &[String], want_stream: bool) -> Result<String
     Ok(String::from_utf8_lossy(&resp).into_owned())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn roundtrip(_command: &str, _args: &[String], _want_stream: bool) -> Result<String> {
-    anyhow::bail!("ctl 仅在 Unix 平台（Android / Linux）可用")
+    anyhow::bail!("ctl 仅在 Android / Linux 平台可用")
 }
 
 /// 按输出模式渲染响应
