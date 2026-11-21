@@ -578,6 +578,9 @@ pub const RSOC_CANDIDATES: &[&str] = &[
     "/sys/class/qcom-battery/fg1_rsoc",
     "/sys/class/power_supply/battery/fg1_rsoc",
     "/sys/class/power_supply/battery/rsoc",
+    // 小米 17 Ultra（nezha / SM8850）等新平台电量计真实 SOC（0~100 整数）；
+    // 绝不可误用 `strategy_fg/raw_soc`（0.01% 量纲 0~10000）。
+    "/sys/class/xm_power/fg_master/rsoc",
 ];
 
 /// SOC 上限控制节点候选（**路径因机型而异，必须探测**）
@@ -2705,6 +2708,25 @@ algo_type\tmonitor
         let enoent =
             anyhow::Error::new(std::io::Error::from_raw_os_error(2)).context("打开（写）失败");
         assert!(!is_permission_error(&enoent), "ENOENT 不是权限问题");
+    }
+
+    /// `RSOC_CANDIDATES` 末尾包含 `xm_power/fg_master/rsoc` 且绝不含 `raw_soc`（0.01% 量纲）
+    #[test]
+    fn rsoc候选含xm_power且不含raw_soc() {
+        assert_eq!(
+            RSOC_CANDIDATES.first().copied(),
+            Some("/sys/class/qcom-battery/fg1_rsoc"),
+            "qcom-battery 必须保持第一优先"
+        );
+        assert_eq!(
+            RSOC_CANDIDATES.last().copied(),
+            Some("/sys/class/xm_power/fg_master/rsoc"),
+            "末尾应追加 xm_power/fg_master/rsoc"
+        );
+        assert!(
+            !RSOC_CANDIDATES.iter().any(|p| p.contains("raw_soc")),
+            "绝不能误加 raw_soc（0~10000 量纲）"
+        );
     }
 
     // ────────────────────────────────────────────────────────────

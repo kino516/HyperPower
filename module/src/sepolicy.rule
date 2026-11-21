@@ -74,10 +74,12 @@ allow ksu sysfs_charger:file { open read write getattr };
 
 # 小米封装层（`xm_power/*`）
 #
-# ⚠️ 本模块对 `xm_power` 下的 **PPS 观测节点**（`typec/adapter_svid`、
-#    `apdo_max`）只读不写，但控制节点（档位/电流/上限）另见下面的
-#    真机实测结论 —— 它们用的**不是**这个类型。
-allow ksu vendor_sysfs_xm_power:file { open read getattr };
+# 覆盖 PPS 观测/兜底节点（`typec/adapter_svid`、`apdo_max`、`strategy_pd_auth/verified`）
+# 以及新平台电量计覆盖节点：小米 17 Ultra（nezha / SM8850）实测
+# `/sys/class/xm_power/fuelgauge/strategy_fg/fake_soc` 的 SELinux 标签为
+# `vendor_sysfs_xm_power`，开启电量显示同步及退出还原 `-1` 均需 `write` 权限。
+# （档位/电流/上限主控制节点仍为下面的 `sysfs_thermal` / `sysfs`；改动本规则后须重启生效，R13）
+allow ksu vendor_sysfs_xm_power:file { open read write getattr };
 
 # ────────────────────────────────────────────────────────────
 #  🔴 真机实测修正（2026-11-01，REDMI K90 Pro Max / myron）

@@ -125,6 +125,9 @@ const RSOC_CANDIDATES: &[&str] = &[
     "/sys/class/qcom-battery/fg1_rsoc",
     "/sys/class/power_supply/battery/fg1_rsoc",
     "/sys/class/power_supply/battery/rsoc",
+    // 小米 17 Ultra（nezha / SM8850）等新平台电量计真实 SOC（0~100 整数）；
+    // 绝不可误用 `strategy_fg/raw_soc`（0.01% 量纲 0~10000）。
+    "/sys/class/xm_power/fg_master/rsoc",
 ];
 
 /// **系统电量覆盖**节点候选 —— 可写，用来把显示校正成驱动真实值
@@ -159,7 +162,25 @@ const RSOC_CANDIDATES: &[&str] = &[
 const FAKE_SOC_CANDIDATES: &[&str] = &[
     "/sys/class/qcom-battery/fake_soc",
     "/sys/class/power_supply/battery/fake_soc",
+    // 小米 17 Ultra（nezha / mca_strategy_fg_comp.ko）新平台显示覆盖节点：
+    // 驱动只接受 `-1..=100`（`-1` 解除覆盖，写 `-22` 会被静默丢弃），且需
+    // `vendor_sysfs_xm_power:file write` 放行。
+    "/sys/class/xm_power/fuelgauge/strategy_fg/fake_soc",
 ];
+
+/// 按 `fake_soc` 节点路径返回驱动的「解除覆盖」默认哨兵值（仅作无原值或原值已被覆盖时的兜底）
+///
+/// - `mca_strategy_fg_comp.ko::strategy_fg_set_fake_soc`（nezha 反汇编实证）：
+///   `add w8, w20, #1; cmp w8, #0x65; b.hi ret` —— 只接受 `-1..=100`，`-1` 表示恢复未覆盖，
+///   写旧高通哨兵 `-22` 会被直接丢弃。
+/// - 旧高通 `qcom-battery/fake_soc` / `battery/fake_soc`：实测 `-22`（`-EINVAL`）解除覆盖。
+fn default_fake_soc_sentinel(path: &str) -> &'static str {
+    if path.ends_with("/strategy_fg/fake_soc") {
+        "-1"
+    } else {
+        "-22"
+    }
+}
 
 /// **系统电量**节点候选（%）—— 定期满充的充入量累计用
 ///
@@ -672,14 +693,16 @@ impl SocLimit {
     /// ⚠️ 不恢复的后果：模块停用后电池图标会一直显示模块最后写入的
     ///    假电量，与实际严重脱节 —— 必须还原成驱动自己的行为。
     fn restore_display(&mut self, io: &mut dyn AddonIo) {
-        let (Some(fake_path), Some(orig)) =
-            (self.node_fake_soc.clone(), self.fake_soc_orig.clone())
-        else {
+        let Some(fake_path) = self.node_fake_soc.clone() else {
             return;
         };
         if self.fake_soc_last.is_none() {
             return;
         }
+        let orig = self
+            .fake_soc_orig
+            .clone()
+            .unwrap_or_else(|| default_fake_soc_sentinel(&fake_path).to_string());
         if io.write(&fake_path, &orig).is_ok() {
             self.fake_soc_last = None;
             self.sync_error = false;
@@ -702,7 +725,7 @@ impl SocLimit {
         let orig = self
             .fake_soc_orig
             .clone()
-            .ok_or_else(|| "缺少 fake_soc 原值，无法读原始 capacity".to_string())?;
+            .unwrap_or_else(|| default_fake_soc_sentinel(fake_path).to_string());
         let restore_needed = self.fake_soc_last.is_some();
         if restore_needed {
             io.write(fake_path, &orig)
@@ -1343,11 +1366,21 @@ impl Addon for SocLimit {
                 } else {
                     None
                 };
-                self.fake_soc_orig = self
-                    .node_fake_soc
-                    .as_ref()
-                    .and_then(|p| io.read(p).ok())
-                    .map(|s| s.trim().to_string());
+                // 优先保存首次覆写前读到的驱动原值哨兵（如 nezha 为 `-1`、高通为 `-22`）；
+                // 若节点读不到，或读到 `0..=100`（多为上次进程异常退出残留的覆盖值），
+                // 则按节点路径回退到对应的驱动解除哨兵，避免把假电量误当"原值"锁死图标。
+                self.fake_soc_orig = self.node_fake_soc.as_ref().map(|p| {
+                    match io
+                        .read(p)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(raw) if raw.parse::<i32>().is_ok_and(|v| v < 0) => raw,
+                        Some(raw) if raw.parse::<i32>().is_err() => raw,
+                        _ => default_fake_soc_sentinel(p).to_string(),
+                    }
+                });
                 self.fake_soc_last = None;
                 self.sync_error = false;
 
